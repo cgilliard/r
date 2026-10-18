@@ -7,6 +7,8 @@ use crate::poseidon2::{self, WIDTH};
 /// Field elements per hash (~248 bits).
 pub const HASH_LEN: usize = 8;
 pub type Hash = [BabyBear; HASH_LEN];
+/// Bytes in a serialized hash: each element as a little-endian canonical `u32`.
+pub const HASH_BYTES: usize = HASH_LEN * 4;
 
 /// Sponge rate. The capacity holds a parameter, the domain tag and the input length.
 const RATE: usize = HASH_LEN;
@@ -28,6 +30,7 @@ pub mod domain {
     pub const WOTS_PARAMETER: u32 = 6;
     pub const PUBLIC_KEY_HASH: u32 = 7;
     pub const OUTPUT: u32 = 8;
+    pub const TX_BODY: u32 = 9;
 
     #[cfg(test)]
     pub const ALL: &[u32] = &[
@@ -39,6 +42,7 @@ pub mod domain {
         WOTS_PARAMETER,
         PUBLIC_KEY_HASH,
         OUTPUT,
+        TX_BODY,
     ];
 }
 
@@ -78,6 +82,28 @@ pub fn sponge(domain: u32, param: &[BabyBear], inputs: &[&[BabyBear]]) -> Hash {
     core::array::from_fn(|i| state[i])
 }
 
+/// Serializes a hash as little-endian canonical `u32`s.
+pub fn to_bytes(hash: &Hash) -> [u8; HASH_BYTES] {
+    let mut bytes = [0u8; HASH_BYTES];
+    for (chunk, x) in bytes.chunks_exact_mut(4).zip(hash) {
+        chunk.copy_from_slice(&x.as_u32().to_le_bytes());
+    }
+    bytes
+}
+
+/// Hashes a byte string: its length, then 3 bytes per field element.
+pub fn hash_bytes(domain: u32, bytes: &[u8]) -> Hash {
+    assert!(bytes.len() < P as usize, "byte string too long");
+    let mut elems = Vec::with_capacity(1 + bytes.len().div_ceil(3));
+    elems.push(BabyBear::new(bytes.len() as u32));
+    elems.extend(bytes.chunks(3).map(|c| {
+        let mut word = [0u8; 4];
+        word[..c.len()].copy_from_slice(c);
+        BabyBear::new(u32::from_le_bytes(word))
+    }));
+    sponge(domain, &[], &[&elems])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,5 +126,13 @@ mod tests {
         assert_ne!(sponge(1, &[], &[]), sponge(1, &[], &[&[BabyBear::ZERO]]));
         // How the input is split across slices doesn't matter.
         assert_eq!(sponge(1, &[], &[&x[..3], &x[3..]]), sponge(1, &[], &[&x]));
+    }
+
+    #[test]
+    fn hash_bytes_separates_trailing_zeros() {
+        assert_ne!(hash_bytes(1, &[]), hash_bytes(1, &[0]));
+        assert_ne!(hash_bytes(1, &[1]), hash_bytes(1, &[1, 0]));
+        assert_ne!(hash_bytes(1, &[1, 0]), hash_bytes(1, &[1, 0, 0]));
+        assert_ne!(hash_bytes(1, &[1, 2, 3]), hash_bytes(2, &[1, 2, 3]));
     }
 }
