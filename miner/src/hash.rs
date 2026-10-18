@@ -31,6 +31,8 @@ pub mod domain {
     pub const PUBLIC_KEY_HASH: u32 = 7;
     pub const OUTPUT: u32 = 8;
     pub const TX_BODY: u32 = 9;
+    pub const STATE_LEAF: u32 = 10;
+    pub const STATE: u32 = 11;
 
     #[cfg(test)]
     pub const ALL: &[u32] = &[
@@ -43,6 +45,8 @@ pub mod domain {
         PUBLIC_KEY_HASH,
         OUTPUT,
         TX_BODY,
+        STATE_LEAF,
+        STATE,
     ];
 }
 
@@ -91,6 +95,20 @@ pub fn to_bytes(hash: &Hash) -> [u8; HASH_BYTES] {
     bytes
 }
 
+/// Parses bytes written by [`to_bytes`]. Returns `None` if any element is not
+/// canonical (`>= p`).
+pub fn from_bytes(bytes: &[u8; HASH_BYTES]) -> Option<Hash> {
+    let mut hash = [BabyBear::ZERO; HASH_LEN];
+    for (x, chunk) in hash.iter_mut().zip(bytes.chunks_exact(4)) {
+        let v = u32::from_le_bytes(chunk.try_into().unwrap());
+        if v >= P {
+            return None;
+        }
+        *x = BabyBear::new(v);
+    }
+    Some(hash)
+}
+
 /// Hashes a byte string: its length, then 3 bytes per field element.
 pub fn hash_bytes(domain: u32, bytes: &[u8]) -> Hash {
     assert!(bytes.len() < P as usize, "byte string too long");
@@ -126,6 +144,15 @@ mod tests {
         assert_ne!(sponge(1, &[], &[]), sponge(1, &[], &[&[BabyBear::ZERO]]));
         // How the input is split across slices doesn't matter.
         assert_eq!(sponge(1, &[], &[&x[..3], &x[3..]]), sponge(1, &[], &[&x]));
+    }
+
+    #[test]
+    fn bytes_roundtrip() {
+        let h = BabyBear::new_array([0, 1, 2, P - 1, 5, 6, 7, 8]);
+        assert_eq!(from_bytes(&to_bytes(&h)), Some(h));
+        let mut bad = to_bytes(&h);
+        bad[..4].copy_from_slice(&P.to_le_bytes());
+        assert_eq!(from_bytes(&bad), None);
     }
 
     #[test]

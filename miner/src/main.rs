@@ -1,6 +1,7 @@
 use std::process::ExitCode;
 
 use r::args::{Args, Command, USAGE};
+use r::{db, state::StateTree};
 
 fn main() -> ExitCode {
     let args = match Args::from_env() {
@@ -18,6 +19,19 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let _ = args;
-    ExitCode::SUCCESS
+    match run(&args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let env = db::open_env(&args.data_dir)?;
+    let tree = StateTree::open(&env)?;
+    let state = tree.state(&env.read_txn()?)?;
+    println!("state: {} outputs", state.size - 1);
+    Ok(())
 }
