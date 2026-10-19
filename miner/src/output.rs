@@ -7,12 +7,13 @@
 //! which wallets scan to find their own outputs.
 
 use crate::babybear::BabyBear;
-use crate::hash::{HASH_BYTES, domain, sponge, to_bytes};
+use crate::hash::{self, HASH_BYTES, HASH_LEN, Hash, domain, sponge};
 
 pub type Amount = u64;
 
-pub const OUTPUT_HASH_LEN: usize = 32;
-/// Spend condition of an output, e.g. a public key hash.
+pub const OUTPUT_HASH_LEN: usize = HASH_BYTES;
+/// Spend condition of an output, e.g. a public key hash: 8 field elements as
+/// little-endian `u32`s (see [`hash::to_bytes`]), each below `p`.
 pub type OutputHash = [u8; OUTPUT_HASH_LEN];
 
 pub const NONCE_LEN: usize = 16;
@@ -24,22 +25,23 @@ pub type Nonce = [u8; NONCE_LEN];
 
 pub const COMMITMENT_LEN: usize = HASH_BYTES;
 
-/// `hash || amount || nonce` is packed little-endian into 30-bit limbs.
-/// `2^30 < p`, so each limb is a distinct field element and the packing is
-/// injective.
-const LIMB_BITS: usize = 30;
-const AMOUNT_LEN: usize = Amount::BITS as usize / 8;
-const PACKED_LEN: usize = OUTPUT_HASH_LEN + AMOUNT_LEN + NONCE_LEN;
-const LIMBS: usize = (PACKED_LEN * 8).div_ceil(LIMB_BITS);
-
-const _: () = {
-    assert!(COMMITMENT_LEN == 32);
-    assert!(1 << LIMB_BITS < crate::babybear::P);
-};
+/// Amounts and nonces are hashed as 16-bit limbs, little-endian, which a
+/// circuit can range-check and sum without overflowing the field.
+pub const LIMB_BITS: u32 = 16;
+pub const AMOUNT_LIMBS: usize = (Amount::BITS / LIMB_BITS) as usize;
+pub const NONCE_LIMBS: usize = NONCE_LEN / 2;
 
 /// `H(hash || amount || nonce)`, as stored on chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Commitment(pub [u8; COMMITMENT_LEN]);
+
+impl Commitment {
+    /// The commitment as field elements, or `None` if its bytes are not a
+    /// canonical encoding (no commitment computed by [`commit`] is).
+    pub fn to_field(&self) -> Option<Hash> {
+        hash::from_bytes(&self.0)
+    }
+}
 
 /// What the chain stores for an output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -56,75 +58,86 @@ pub struct Output {
 }
 
 impl Output {
-    pub fn commitment(&self) -> Commitment {
+    /// `None` if `hash` is not a canonical encoding of 8 field elements.
+    pub fn commitment(&self) -> Option<Commitment> {
         commit(&self.hash, self.amount, &self.nonce)
     }
 
-    pub fn record(&self) -> OutputRecord {
-        OutputRecord {
-            commitment: self.commitment(),
+    pub fn record(&self) -> Option<OutputRecord> {
+        Some(OutputRecord {
+            commitment: self.commitment()?,
             nonce: self.nonce,
-        }
+        })
     }
 
     /// Returns `true` if this output opens `commitment`.
     pub fn opens(&self, commitment: &Commitment) -> bool {
-        self.commitment() == *commitment
+        self.commitment() == Some(*commitment)
     }
 }
 
-/// Computes `H(hash || amount || nonce)`: 15 limbs, so a two-permutation sponge.
-pub fn commit(hash: &OutputHash, amount: Amount, nonce: &Nonce) -> Commitment {
-    let mut packed = [0u8; PACKED_LEN];
-    let (h, rest) = packed.split_at_mut(OUTPUT_HASH_LEN);
-    let (a, n) = rest.split_at_mut(AMOUNT_LEN);
-    h.copy_from_slice(hash);
-    a.copy_from_slice(&amount.to_le_bytes());
-    n.copy_from_slice(nonce);
-    Commitment(to_bytes(&sponge(domain::OUTPUT, &[], &[&pack(&packed)])))
+/// `H(hash || amount || nonce)`: a sponge over the hash's 8 elements, the
+/// amount's 4 limbs and the nonce's 8 limbs, 20 elements in all. `None` if
+/// `hash` is not a canonical encoding.
+pub fn commit(hash: &OutputHash, amount: Amount, nonce: &Nonce) -> Option<Commitment> {
+    let hash = hash::from_bytes(hash)?;
+    Some(commit_field(&hash, amount, nonce))
 }
 
-/// Splits `bytes`, read as a little-endian integer, into `LIMB_BITS`-bit limbs.
-fn pack(bytes: &[u8; PACKED_LEN]) -> [BabyBear; LIMBS] {
-    let mut limbs = [BabyBear::ZERO; LIMBS];
-    let (mut acc, mut bits, mut i) = (0u64, 0, 0);
-    for &b in bytes {
-        acc |= (b as u64) << bits;
-        bits += 8;
-        if bits >= LIMB_BITS {
-            limbs[i] = BabyBear::new((acc & ((1 << LIMB_BITS) - 1)) as u32);
-            acc >>= LIMB_BITS;
-            bits -= LIMB_BITS;
-            i += 1;
-        }
-    }
-    if bits > 0 {
-        limbs[i] = BabyBear::new(acc as u32);
-    }
-    limbs
+/// [`commit`] with the hash already as field elements.
+pub fn commit_field(hash: &Hash, amount: Amount, nonce: &Nonce) -> Commitment {
+    let digest = sponge(
+        domain::OUTPUT,
+        &[],
+        &[hash, &amount_limbs(amount), &nonce_limbs(nonce)],
+    );
+    Commitment(hash::to_bytes(&digest))
 }
+
+/// `amount` as 16-bit limbs, least significant first.
+pub fn amount_limbs(amount: Amount) -> [BabyBear; AMOUNT_LIMBS] {
+    core::array::from_fn(|i| BabyBear::new((amount >> (LIMB_BITS as usize * i)) as u16 as u32))
+}
+
+/// `nonce` as 16-bit limbs: byte pairs, little-endian.
+pub fn nonce_limbs(nonce: &Nonce) -> [BabyBear; NONCE_LIMBS] {
+    core::array::from_fn(|i| {
+        BabyBear::new(u16::from_le_bytes([nonce[2 * i], nonce[2 * i + 1]]) as u32)
+    })
+}
+
+const _: () = assert!(HASH_LEN * 4 == OUTPUT_HASH_LEN);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::babybear::P;
 
     const NONCE: Nonce = *b"0123456789abcdef";
 
-    fn hash(n: u8) -> OutputHash {
-        core::array::from_fn(|i| n.wrapping_mul(31).wrapping_add(i as u8))
+    /// A canonical hash.
+    fn hash(n: u32) -> OutputHash {
+        hash::to_bytes(&BabyBear::new_array(core::array::from_fn(|i| {
+            n * 1000 + i as u32
+        })))
+    }
+
+    fn out(h: OutputHash, amount: Amount, nonce: Nonce) -> Output {
+        Output {
+            hash: h,
+            amount,
+            nonce,
+        }
     }
 
     #[test]
     fn record_holds_commitment_and_nonce() {
-        let out = Output {
-            hash: hash(1),
-            amount: 42,
-            nonce: NONCE,
-        };
-        let record = out.record();
-        assert_eq!(record.commitment, commit(&hash(1), 42, &NONCE));
+        let o = out(hash(1), 42, NONCE);
+        let record = o.record().unwrap();
+        assert_eq!(Some(record.commitment), commit(&hash(1), 42, &NONCE));
         assert_eq!(record.nonce, NONCE);
-        assert!(out.opens(&record.commitment));
+        assert!(o.opens(&record.commitment));
+        assert!(record.commitment.to_field().is_some());
     }
 
     #[test]
@@ -140,12 +153,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_hash_amount_or_nonce() {
-        let c = commit(&hash(1), 7, &NONCE);
-        let out = |h, amount, nonce| Output {
-            hash: h,
-            amount,
-            nonce,
-        };
+        let c = commit(&hash(1), 7, &NONCE).unwrap();
         assert!(out(hash(1), 7, NONCE).opens(&c));
         assert!(!out(hash(2), 7, NONCE).opens(&c));
         assert!(!out(hash(1), 8, NONCE).opens(&c));
@@ -159,6 +167,7 @@ mod tests {
         for bit in 0..OUTPUT_HASH_LEN * 8 {
             let mut h2 = h;
             h2[bit / 8] ^= 1 << (bit % 8);
+            // Either no longer canonical, or a different commitment.
             assert_ne!(commit(&h2, amount, &NONCE), c);
         }
         for bit in 0..Amount::BITS {
@@ -172,27 +181,32 @@ mod tests {
     }
 
     #[test]
-    fn pack_splits_into_30_bit_limbs() {
-        let limbs = pack(&[0xff; PACKED_LEN]);
-        assert_eq!(LIMBS, 15);
-        for x in &limbs[..LIMBS - 1] {
-            assert_eq!(x.as_u32(), (1 << 30) - 1);
-        }
-        // 448 bits = 14 * 30 + 28.
-        assert_eq!(limbs[LIMBS - 1].as_u32(), (1 << 28) - 1);
-
-        let mut bytes = [0u8; PACKED_LEN];
-        bytes[3] = 0x40; // bit 30: the first bit of the second limb
-        let limbs = pack(&bytes);
-        assert_eq!((limbs[0].as_u32(), limbs[1].as_u32()), (0, 1));
+    fn rejects_non_canonical_hashes() {
+        let mut h = hash(1);
+        h[..4].copy_from_slice(&P.to_le_bytes());
+        assert_eq!(commit(&h, 1, &NONCE), None);
+        assert_eq!(out(h, 1, NONCE).record(), None);
+        assert_eq!(Commitment(h).to_field(), None);
     }
 
     #[test]
-    fn commitment_bytes_are_canonical_le() {
-        let c = commit(&hash(3), 0, &[0; NONCE_LEN]);
-        for chunk in c.0.chunks_exact(4) {
-            let x = u32::from_le_bytes(chunk.try_into().unwrap());
-            assert!(x < crate::babybear::P);
-        }
+    fn limbs_roundtrip() {
+        let amount = 0xfedc_ba98_7654_3210u64;
+        let limbs = amount_limbs(amount);
+        let back = limbs
+            .iter()
+            .rev()
+            .fold(0u64, |acc, l| (acc << 16) | l.as_u32() as u64);
+        assert_eq!(back, amount);
+        assert!(limbs.iter().all(|l| l.as_u32() < 1 << 16));
+        let n = nonce_limbs(&NONCE);
+        assert_eq!(n[0].as_u32(), u16::from_le_bytes(*b"01") as u32);
+    }
+
+    #[test]
+    fn commitment_matches_field_form() {
+        let h = hash(3);
+        let field = hash::from_bytes(&h).unwrap();
+        assert_eq!(commit(&h, 9, &NONCE), Some(commit_field(&field, 9, &NONCE)));
     }
 }

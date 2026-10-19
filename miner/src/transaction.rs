@@ -13,7 +13,8 @@
 
 use std::fmt;
 
-use crate::hash::{self, Hash, domain};
+use crate::babybear::BabyBear;
+use crate::hash::{self, HASH_LEN, Hash, domain};
 use crate::output::{self, Amount, Commitment, Nonce, Output, OutputHash};
 use crate::wots::{self, PublicKey, SecretKey, Signature};
 
@@ -34,7 +35,7 @@ pub struct Input {
 impl Input {
     /// Returns `true` if the revealed pubkey, amount and nonce open `commitment`.
     pub fn opens_commitment(&self) -> bool {
-        output::commit(&pubkey_hash(&self.pubkey), self.amount, &self.nonce) == self.commitment
+        output::commit_field(&self.pubkey.hash(), self.amount, &self.nonce) == self.commitment
     }
 }
 
@@ -46,38 +47,35 @@ pub struct TxBody {
 }
 
 impl TxBody {
-    /// Canonical encoding, all integers little-endian:
-    /// `n_inputs: u32`, then per input `commitment | param | root | amount | nonce`;
-    /// `n_outputs: u32`, then per output `hash | amount | nonce`.
-    /// Field elements are written as canonical `u32`s.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&count(self.inputs.len()).to_le_bytes());
+    /// The message every input signs:
+    /// `sponge(TX_BODY, [n_in, n_out], [input commitments, output commitments])`.
+    /// Each commitment binds its amount, nonce and hash (for an input,
+    /// `H(pubkey)`), and the signature checks the pubkey itself, so this
+    /// covers every field. `None` if a commitment or output hash is not a
+    /// canonical encoding.
+    pub fn digest(&self) -> Option<Hash> {
+        let mut items = Vec::with_capacity(HASH_LEN * (self.inputs.len() + self.outputs.len()));
         for input in &self.inputs {
-            out.extend_from_slice(&input.commitment.0);
-            for x in input.pubkey.param.iter().chain(&input.pubkey.root) {
-                out.extend_from_slice(&x.as_u32().to_le_bytes());
-            }
-            out.extend_from_slice(&input.amount.to_le_bytes());
-            out.extend_from_slice(&input.nonce);
+            items.extend(input.commitment.to_field()?);
         }
-        out.extend_from_slice(&count(self.outputs.len()).to_le_bytes());
         for o in &self.outputs {
-            out.extend_from_slice(&o.hash);
-            out.extend_from_slice(&o.amount.to_le_bytes());
-            out.extend_from_slice(&o.nonce);
+            items.extend(o.commitment()?.to_field()?);
         }
-        out
-    }
-
-    /// The message every input signs.
-    pub fn digest(&self) -> Hash {
-        hash::hash_bytes(domain::TX_BODY, &self.encode())
+        let counts = [
+            BabyBear::new(count(self.inputs.len())),
+            BabyBear::new(count(self.outputs.len())),
+        ];
+        Some(hash::sponge(domain::TX_BODY, &counts, &[&items]))
     }
 }
 
+/// Counts must stay below `p` to be one field element each.
 fn count(n: usize) -> u32 {
-    u32::try_from(n).expect("too many inputs or outputs")
+    assert!(
+        n < crate::babybear::P as usize,
+        "too many inputs or outputs"
+    );
+    n as u32
 }
 
 fn total(mut amounts: impl Iterator<Item = Amount>) -> Result<Amount, TxError> {
@@ -120,6 +118,10 @@ pub enum TxError {
     CommitmentMismatch(usize),
     BadSignature(usize),
     AmountOverflow,
+    /// A commitment or output hash is not a canonical field encoding.
+    NonCanonical,
+    /// No inputs and no outputs.
+    Empty,
 }
 
 impl fmt::Display for TxError {
@@ -134,6 +136,8 @@ impl fmt::Display for TxError {
             }
             Self::BadSignature(i) => write!(f, "input {i}: invalid signature"),
             Self::AmountOverflow => write!(f, "amounts overflow"),
+            Self::NonCanonical => write!(f, "non-canonical commitment or output hash"),
+            Self::Empty => write!(f, "transaction has no inputs or outputs"),
         }
     }
 }
@@ -145,16 +149,19 @@ impl Transaction {
     ///
     /// # Panics
     /// If the number of keys differs from the number of inputs.
-    pub fn sign(body: TxBody, keys: Vec<SecretKey>) -> Self {
+    pub fn sign(body: TxBody, keys: Vec<SecretKey>) -> Result<Self, TxError> {
         assert_eq!(keys.len(), body.inputs.len(), "one key per input");
-        let digest = body.digest();
+        let digest = body.digest().ok_or(TxError::NonCanonical)?;
         let signatures = keys.into_iter().map(|k| k.sign(&digest)).collect();
-        Self { body, signatures }
+        Ok(Self { body, signatures })
     }
 
     /// Checks everything that needs no chain state and returns the totals.
     pub fn validate(&self) -> Result<Totals, TxError> {
         let TxBody { inputs, outputs } = &self.body;
+        if inputs.is_empty() && outputs.is_empty() {
+            return Err(TxError::Empty);
+        }
         if self.signatures.len() != inputs.len() {
             return Err(TxError::SignatureCount {
                 inputs: inputs.len(),
@@ -175,7 +182,7 @@ impl Transaction {
         };
 
         // Signatures last: they are by far the most expensive check.
-        let digest = self.body.digest();
+        let digest = self.body.digest().ok_or(TxError::NonCanonical)?;
         for (i, (input, sig)) in inputs.iter().zip(&self.signatures).enumerate() {
             if !wots::verify(&input.pubkey, &digest, sig) {
                 return Err(TxError::BadSignature(i));
@@ -188,7 +195,7 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::babybear::BabyBear;
+    use crate::babybear::P;
     use crate::output::NONCE_LEN;
 
     fn key(n: u32) -> (SecretKey, PublicKey) {
@@ -201,7 +208,7 @@ mod tests {
     fn input(n: u32, amount: Amount) -> (SecretKey, Input) {
         let (sk, pubkey) = key(n);
         let nonce = [n as u8; NONCE_LEN];
-        let commitment = output::commit(&pubkey_hash(&pubkey), amount, &nonce);
+        let commitment = output::commit(&pubkey_hash(&pubkey), amount, &nonce).unwrap();
         (
             sk,
             Input {
@@ -229,7 +236,7 @@ mod tests {
             inputs: vec![in1, in2],
             outputs: vec![out(120, 1), out(20, 2)],
         };
-        Transaction::sign(body, vec![sk1, sk2])
+        Transaction::sign(body, vec![sk1, sk2]).unwrap()
     }
 
     /// Re-signs a modified body with the keys matching its inputs.
@@ -239,7 +246,7 @@ mod tests {
             .iter()
             .map(|i| (1..=4).map(key).find(|(_, pk)| *pk == i.pubkey).unwrap().0)
             .collect();
-        Transaction::sign(body, keys)
+        Transaction::sign(body, keys).unwrap()
     }
 
     fn totals(inputs: Amount, outputs: Amount) -> Result<Totals, TxError> {
@@ -267,7 +274,8 @@ mod tests {
                 outputs: vec![out(50, 1)],
             },
             vec![],
-        );
+        )
+        .unwrap();
         let t = reward.validate().unwrap();
         assert_eq!(
             t,
@@ -371,10 +379,45 @@ mod tests {
     }
 
     #[test]
-    fn encoding_lengths() {
+    fn digest_covers_counts_and_commitments() {
         let body = tx().body;
-        let input_len = 32 + (wots::PARAM_LEN + hash::HASH_LEN) * 4 + 8 + NONCE_LEN;
-        let output_len = 32 + 8 + NONCE_LEN;
-        assert_eq!(body.encode().len(), 4 + 2 * input_len + 4 + 2 * output_len);
+        let d = body.digest().unwrap();
+        // Moving an output into a fresh slot changes the counts.
+        let mut fewer = body.clone();
+        fewer.outputs.pop();
+        assert_ne!(fewer.digest().unwrap(), d);
+        // Same commitments, swapped order: a different digest.
+        let mut swapped = body.clone();
+        swapped.outputs.swap(0, 1);
+        assert_ne!(swapped.digest().unwrap(), d);
+    }
+
+    #[test]
+    fn rejects_empty_transaction() {
+        let empty = Transaction::sign(
+            TxBody {
+                inputs: vec![],
+                outputs: vec![],
+            },
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(empty.validate(), Err(TxError::Empty));
+    }
+
+    #[test]
+    fn rejects_non_canonical_output_hash() {
+        let mut body = tx().body;
+        body.outputs[0].hash[..4].copy_from_slice(&P.to_le_bytes());
+        assert_eq!(body.digest(), None);
+        let (sk1, _) = input(1, 100);
+        let (sk2, _) = input(2, 50);
+        assert_eq!(
+            Transaction::sign(body.clone(), vec![sk1, sk2]),
+            Err(TxError::NonCanonical)
+        );
+        let mut t = tx();
+        t.body = body;
+        assert_eq!(t.validate(), Err(TxError::NonCanonical));
     }
 }

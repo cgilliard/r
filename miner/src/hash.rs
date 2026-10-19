@@ -3,6 +3,7 @@
 
 use crate::babybear::{BabyBear, P};
 use crate::poseidon2::{self, WIDTH};
+use crate::poseidon2_x8::{LANES, permute_x8};
 
 /// Field elements per hash (~248 bits).
 pub const HASH_LEN: usize = 8;
@@ -33,6 +34,10 @@ pub mod domain {
     pub const TX_BODY: u32 = 9;
     pub const STATE_LEAF: u32 = 10;
     pub const STATE: u32 = 11;
+    pub const MERKLE_LEAF: u32 = 12;
+    pub const TRANSCRIPT: u32 = 13;
+    pub const ZK_RNG: u32 = 14;
+    pub const BLOCK_CHALLENGES: u32 = 15;
 
     #[cfg(test)]
     pub const ALL: &[u32] = &[
@@ -47,6 +52,10 @@ pub mod domain {
         TX_BODY,
         STATE_LEAF,
         STATE,
+        MERKLE_LEAF,
+        TRANSCRIPT,
+        ZK_RNG,
+        BLOCK_CHALLENGES,
     ];
 }
 
@@ -57,6 +66,17 @@ pub fn compress(input: [BabyBear; WIDTH]) -> Hash {
     let mut state = input;
     poseidon2::permute(&mut state);
     core::array::from_fn(|i| state[i] + input[i])
+}
+
+/// Merkle internal node: `compress(left || right)`. No domain tag; trees using
+/// it must give every path a fixed length known to the verifier, so a node
+/// can never be presented as a leaf or vice versa.
+#[inline]
+pub fn merge(left: &Hash, right: &Hash) -> Hash {
+    let mut input = [BabyBear::ZERO; WIDTH];
+    input[..HASH_LEN].copy_from_slice(left);
+    input[HASH_LEN..].copy_from_slice(right);
+    compress(input)
 }
 
 /// Sponge over the concatenation of `inputs`. The capacity is initialised with
@@ -86,6 +106,48 @@ pub fn sponge(domain: u32, param: &[BabyBear], inputs: &[&[BabyBear]]) -> Hash {
     core::array::from_fn(|i| state[i])
 }
 
+/// [`sponge`] of eight inputs of equal length at once.
+///
+/// # Panics
+/// If the inputs' lengths differ, or as [`sponge`].
+pub fn sponge_x8(domain: u32, param: &[BabyBear], inputs: [&[BabyBear]; LANES]) -> [Hash; LANES] {
+    assert!(param.len() <= MAX_PARAM_LEN, "sponge parameter too long");
+    let len = inputs[0].len();
+    assert!(inputs.iter().all(|x| x.len() == len), "lengths differ");
+    assert!(len < P as usize, "sponge input too long");
+    let mut init = [BabyBear::ZERO; WIDTH];
+    init[RATE..RATE + param.len()].copy_from_slice(param);
+    init[DOMAIN_SLOT] = BabyBear::new(domain);
+    init[DOMAIN_SLOT + 1] = BabyBear::new(len as u32);
+    let mut states = [init; LANES];
+    if len == 0 {
+        permute_x8(&mut states);
+    }
+    for start in (0..len).step_by(RATE) {
+        let end = (start + RATE).min(len);
+        for (state, input) in states.iter_mut().zip(&inputs) {
+            for (s, &x) in state.iter_mut().zip(&input[start..end]) {
+                *s += x;
+            }
+        }
+        permute_x8(&mut states);
+    }
+    states.map(|s| core::array::from_fn(|i| s[i]))
+}
+
+/// [`merge`] of eight pairs at once.
+pub fn merge_x8(pairs: [(&Hash, &Hash); LANES]) -> [Hash; LANES] {
+    let inputs: [[BabyBear; WIDTH]; LANES] = pairs.map(|(l, r)| {
+        let mut input = [BabyBear::ZERO; WIDTH];
+        input[..HASH_LEN].copy_from_slice(l);
+        input[HASH_LEN..].copy_from_slice(r);
+        input
+    });
+    let mut states = inputs;
+    permute_x8(&mut states);
+    core::array::from_fn(|l| core::array::from_fn(|i| states[l][i] + inputs[l][i]))
+}
+
 /// Serializes a hash as little-endian canonical `u32`s.
 pub fn to_bytes(hash: &Hash) -> [u8; HASH_BYTES] {
     let mut bytes = [0u8; HASH_BYTES];
@@ -107,19 +169,6 @@ pub fn from_bytes(bytes: &[u8; HASH_BYTES]) -> Option<Hash> {
         *x = BabyBear::new(v);
     }
     Some(hash)
-}
-
-/// Hashes a byte string: its length, then 3 bytes per field element.
-pub fn hash_bytes(domain: u32, bytes: &[u8]) -> Hash {
-    assert!(bytes.len() < P as usize, "byte string too long");
-    let mut elems = Vec::with_capacity(1 + bytes.len().div_ceil(3));
-    elems.push(BabyBear::new(bytes.len() as u32));
-    elems.extend(bytes.chunks(3).map(|c| {
-        let mut word = [0u8; 4];
-        word[..c.len()].copy_from_slice(c);
-        BabyBear::new(u32::from_le_bytes(word))
-    }));
-    sponge(domain, &[], &[&elems])
 }
 
 #[cfg(test)]
@@ -156,10 +205,28 @@ mod tests {
     }
 
     #[test]
-    fn hash_bytes_separates_trailing_zeros() {
-        assert_ne!(hash_bytes(1, &[]), hash_bytes(1, &[0]));
-        assert_ne!(hash_bytes(1, &[1]), hash_bytes(1, &[1, 0]));
-        assert_ne!(hash_bytes(1, &[1, 0]), hash_bytes(1, &[1, 0, 0]));
-        assert_ne!(hash_bytes(1, &[1, 2, 3]), hash_bytes(2, &[1, 2, 3]));
+    fn batched_hashes_match() {
+        for len in [0, 1, 7, 8, 9, 30] {
+            let rows: Vec<Vec<BabyBear>> = (0..LANES as u32)
+                .map(|l| {
+                    (0..len as u32)
+                        .map(|i| BabyBear::new(l * 1000 + i))
+                        .collect()
+                })
+                .collect();
+            let refs: [&[BabyBear]; LANES] = core::array::from_fn(|l| &rows[l][..]);
+            let param = [BabyBear::new(5), BabyBear::new(6)];
+            let got = sponge_x8(domain::MERKLE_LEAF, &param, refs);
+            for l in 0..LANES {
+                assert_eq!(got[l], sponge(domain::MERKLE_LEAF, &param, &[refs[l]]));
+            }
+        }
+        let hs: Vec<Hash> = (0..16u32)
+            .map(|i| BabyBear::new_array([i; HASH_LEN]))
+            .collect();
+        let got = merge_x8(core::array::from_fn(|l| (&hs[2 * l], &hs[2 * l + 1])));
+        for l in 0..LANES {
+            assert_eq!(got[l], merge(&hs[2 * l], &hs[2 * l + 1]));
+        }
     }
 }

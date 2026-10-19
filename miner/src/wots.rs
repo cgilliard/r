@@ -104,6 +104,14 @@ impl SecretKey {
     }
 }
 
+#[cfg(test)]
+impl SecretKey {
+    /// Chain `i` at position `pos`, for building adversarial witnesses.
+    pub(crate) fn chain_value(&self, i: usize, pos: usize) -> Hash {
+        chain(&self.param, i, 0, pos, prf(&self.seed, i))
+    }
+}
+
 /// Returns `true` if `sig` is a valid signature on `msg` under `pk`.
 pub fn verify(pk: &PublicKey, msg: &[BabyBear], sig: &Signature) -> bool {
     let digits = encode(&pk.param, &sig.rand, msg);
@@ -116,7 +124,11 @@ pub fn verify(pk: &PublicKey, msg: &[BabyBear], sig: &Signature) -> bool {
 
 /// Maps a message to `NUM_CHAINS` base-`W` digits: `MSG_CHAINS` digits of the
 /// randomized message digest, then the checksum `sum(W - 1 - d)` big-endian.
-fn encode(param: &Param, rand: &[BabyBear; RAND_LEN], msg: &[BabyBear]) -> [u8; NUM_CHAINS] {
+pub(crate) fn encode(
+    param: &Param,
+    rand: &[BabyBear; RAND_LEN],
+    msg: &[BabyBear],
+) -> [u8; NUM_CHAINS] {
     let digest = sponge(domain::WOTS_MESSAGE, param, &[rand, msg]);
     let mut digits = [0u8; NUM_CHAINS];
     for (i, d) in digits[..MSG_CHAINS].iter_mut().enumerate() {

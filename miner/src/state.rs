@@ -22,7 +22,7 @@ use heed::types::Bytes;
 use heed::{Database, Env, RoTxn, RwTxn};
 
 use crate::babybear::BabyBear;
-use crate::hash::{self, DOMAIN_SLOT, HASH_BYTES, HASH_LEN, Hash, compress, domain, sponge};
+use crate::hash::{self, DOMAIN_SLOT, HASH_BYTES, HASH_LEN, Hash, compress, domain, merge, sponge};
 use crate::output::Commitment;
 use crate::poseidon2::WIDTH;
 
@@ -435,7 +435,7 @@ impl StateTree {
         decode_leaf(bytes.ok_or(Error::Corrupt)?)
     }
 
-    fn witness(&self, txn: &RoTxn, index: u64) -> Result<LeafWitness, Error> {
+    pub(crate) fn witness(&self, txn: &RoTxn, index: u64) -> Result<LeafWitness, Error> {
         Ok(LeafWitness {
             index,
             leaf: self.leaf(txn, index)?,
@@ -539,15 +539,6 @@ fn root_of(leaf_hash: &Hash, index: u64, siblings: &Siblings) -> Hash {
     hash
 }
 
-/// Internal node hash. No domain tag: every path has exactly `DEPTH` levels,
-/// so a node can never be presented as a leaf or vice versa.
-fn merge(left: &Hash, right: &Hash) -> Hash {
-    let mut input = [BabyBear::ZERO; WIDTH];
-    input[..HASH_LEN].copy_from_slice(left);
-    input[HASH_LEN..].copy_from_slice(right);
-    compress(input)
-}
-
 /// `empty_hashes()[d]` is the root of an empty subtree of height `d`.
 fn empty_hashes() -> &'static [Hash; DEPTH + 1] {
     static EMPTY: OnceLock<[Hash; DEPTH + 1]> = OnceLock::new();
@@ -569,7 +560,7 @@ fn limbs(key: &Hash) -> [u32; HASH_LEN] {
     key.map(BabyBear::as_u32)
 }
 
-fn split(x: u64) -> (BabyBear, BabyBear) {
+pub(crate) fn split(x: u64) -> (BabyBear, BabyBear) {
     debug_assert!(x <= CAPACITY);
     let mask = (1 << LIMB_BITS) - 1;
     (
@@ -587,7 +578,7 @@ mod tests {
     fn commitment(n: u32) -> Commitment {
         let mut nonce = [0u8; NONCE_LEN];
         nonce[..4].copy_from_slice(&n.to_le_bytes());
-        output::commit(&[7; 32], 1, &nonce)
+        output::commit(&[7; 32], 1, &nonce).unwrap()
     }
 
     fn key(n: u32) -> Hash {

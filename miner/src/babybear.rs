@@ -9,16 +9,27 @@ use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 /// The BabyBear prime.
 pub const P: u32 = 0x7800_0001;
 
+/// `p - 1 = 2^27 * 15`, so the multiplicative group has subgroups of every
+/// order `2^k` for `k <= TWO_ADICITY`.
+pub const TWO_ADICITY: u32 = 27;
+
 /// `p^-1 mod 2^32`, used by `monty_reduce`.
-const MONTY_MU: u32 = 0x8800_0001;
+pub(crate) const MONTY_MU: u32 = 0x8800_0001;
 
 /// A BabyBear field element, internally in Montgomery form.
 #[derive(Copy, Clone, Default, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct BabyBear(u32);
 
 impl BabyBear {
     pub const ZERO: Self = Self(0);
     pub const ONE: Self = Self::new(1);
+
+    /// The Montgomery representation, for vectorized arithmetic.
+    #[inline(always)]
+    pub(crate) const fn raw(self) -> u32 {
+        self.0
+    }
 
     /// Builds an element from a `u32`, reducing it mod `p`.
     #[inline]
@@ -94,6 +105,37 @@ impl BabyBear {
         x
     }
 
+    pub const fn pow(self, mut exp: u64) -> Self {
+        let (mut base, mut acc) = (self, Self::ONE);
+        while exp > 0 {
+            if exp & 1 == 1 {
+                acc = acc.mul(base);
+            }
+            base = base.mul(base);
+            exp >>= 1;
+        }
+        acc
+    }
+
+    /// Multiplicative inverse, or `None` for zero.
+    pub const fn inverse(self) -> Option<Self> {
+        if self.0 == 0 {
+            None
+        } else {
+            Some(self.pow(P as u64 - 2))
+        }
+    }
+
+    /// A generator of the subgroup of order `2^bits`.
+    ///
+    /// # Panics
+    /// If `bits > TWO_ADICITY`.
+    pub const fn two_adic_generator(bits: u32) -> Self {
+        assert!(bits <= TWO_ADICITY, "no subgroup of that order");
+        // Same generator as Plonky3, so domains match.
+        Self::new(0x1a42_7a41).pow(1 << (TWO_ADICITY - bits))
+    }
+
     /// The Poseidon2 S-box, `x^7`.
     #[inline(always)]
     pub const fn pow7(self) -> Self {
@@ -112,6 +154,12 @@ const fn monty_reduce(x: u64) -> u32 {
     let (x_sub_u, over) = x.overflowing_sub(u);
     let hi = (x_sub_u >> 32) as u32;
     if over { hi.wrapping_add(P) } else { hi }
+}
+
+impl From<bool> for BabyBear {
+    fn from(b: bool) -> Self {
+        if b { Self::ONE } else { Self::ZERO }
+    }
 }
 
 impl fmt::Debug for BabyBear {
@@ -211,6 +259,30 @@ mod tests {
         let m1 = BabyBear::new(0x34167c58);
         let m2 = BabyBear::new(0x61f3207b);
         assert_eq!((m1 * m2).as_u32(), 0x1b5c8046);
+    }
+
+    #[test]
+    fn inverse_and_pow() {
+        assert_eq!(BabyBear::ZERO.inverse(), None);
+        for x in [1, 2, 3, 12345, P - 1] {
+            let x = BabyBear::new(x);
+            assert_eq!(x * x.inverse().unwrap(), BabyBear::ONE);
+        }
+        assert_eq!(BabyBear::new(3).pow(5), BabyBear::new(243));
+        assert_eq!(BabyBear::new(5).pow(0), BabyBear::ONE);
+    }
+
+    #[test]
+    fn two_adic_generators_have_exact_order() {
+        for bits in 0..=TWO_ADICITY {
+            let g = BabyBear::two_adic_generator(bits);
+            assert_eq!(g.pow(1 << bits), BabyBear::ONE);
+            if bits > 0 {
+                assert_ne!(g.pow(1 << (bits - 1)), BabyBear::ONE);
+            }
+        }
+        // Plonky3's 2^3 roots, from `ROOTS_8`.
+        assert_eq!(BabyBear::two_adic_generator(3).as_u32(), 0x5ee99486);
     }
 
     #[test]

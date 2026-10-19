@@ -82,7 +82,7 @@ fn internal_linear_layer(state: &mut [BabyBear; WIDTH]) {
 }
 
 /// `V = [-2, 1, 2, 1/2, 3, 4, -1/2, -3, -4, 1/2^8, 1/4, 1/8, 1/2^27, -1/2^8, -1/16, -1/2^27]`.
-const INTERNAL_DIAG: [BabyBear; WIDTH] = {
+pub(crate) const INTERNAL_DIAG: [BabyBear; WIDTH] = {
     let n = BabyBear::new;
     let inv = BabyBear::inv_two_pow;
     [
@@ -108,7 +108,7 @@ const INTERNAL_DIAG: [BabyBear; WIDTH] = {
 // Round constants, copied from Plonky3 (`baby-bear/src/poseidon2.rs`). Generated
 // by the Grain LFSR with field_type=1, alpha=7, n=31, t=16, R_F=8, R_P=13.
 
-const RC_EXTERNAL_INITIAL: [[BabyBear; WIDTH]; HALF_FULL_ROUNDS] = [
+pub(crate) const RC_EXTERNAL_INITIAL: [[BabyBear; WIDTH]; HALF_FULL_ROUNDS] = [
     BabyBear::new_array([
         0x69cbb6af, 0x46ad93f9, 0x60a00f4e, 0x6b1297cd, 0x23189afe, 0x732e7bef, 0x72c246de,
         0x2c941900, 0x0557eede, 0x1580496f, 0x3a3ea77b, 0x54f3f271, 0x0f49b029, 0x47872fe1,
@@ -131,7 +131,7 @@ const RC_EXTERNAL_INITIAL: [[BabyBear; WIDTH]; HALF_FULL_ROUNDS] = [
     ]),
 ];
 
-const RC_EXTERNAL_FINAL: [[BabyBear; WIDTH]; HALF_FULL_ROUNDS] = [
+pub(crate) const RC_EXTERNAL_FINAL: [[BabyBear; WIDTH]; HALF_FULL_ROUNDS] = [
     BabyBear::new_array([
         0x7290a80d, 0x6f7e5329, 0x598ec8a8, 0x76a859a0, 0x6559e868, 0x657b83af, 0x13271d3f,
         0x1f876063, 0x0aeeae37, 0x706e9ca6, 0x46400cee, 0x72a05c26, 0x2c589c9e, 0x20bd37a7,
@@ -154,7 +154,7 @@ const RC_EXTERNAL_FINAL: [[BabyBear; WIDTH]; HALF_FULL_ROUNDS] = [
     ]),
 ];
 
-const RC_INTERNAL: [BabyBear; PARTIAL_ROUNDS] = BabyBear::new_array([
+pub(crate) const RC_INTERNAL: [BabyBear; PARTIAL_ROUNDS] = BabyBear::new_array([
     0x5a8053c0, 0x693be639, 0x3858867d, 0x19334f6b, 0x128f0fd8, 0x4e2b1ccb, 0x61210ce0, 0x3c318939,
     0x0b5b2f22, 0x2edb11d5, 0x213effdf, 0x0cac4606, 0x241af16d,
 ]);
