@@ -38,6 +38,12 @@ pub mod domain {
     pub const TRANSCRIPT: u32 = 13;
     pub const ZK_RNG: u32 = 14;
     pub const BLOCK_CHALLENGES: u32 = 15;
+    pub const HEADER: u32 = 16;
+    pub const POW_SEED: u32 = 17;
+    pub const POW: u32 = 18;
+    pub const POW_DATASET: u32 = 19;
+    pub const BLOCK_BODY: u32 = 20;
+    pub const PROOF: u32 = 21;
 
     #[cfg(test)]
     pub const ALL: &[u32] = &[
@@ -56,6 +62,12 @@ pub mod domain {
         TRANSCRIPT,
         ZK_RNG,
         BLOCK_CHALLENGES,
+        HEADER,
+        POW_SEED,
+        POW,
+        POW_DATASET,
+        BLOCK_BODY,
+        PROOF,
     ];
 }
 

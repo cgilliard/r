@@ -73,7 +73,7 @@ impl Leaf {
 }
 
 /// What the block header commits to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct State {
     pub root: Hash,
     /// Number of filled slots, including the sentinel; the next insert goes

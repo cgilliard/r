@@ -1,38 +1,52 @@
-//! Blocks: the published input and output lists, the proof of the state
-//! transition, and how full nodes check them.
+//! Blocks: the published input and output lists, how a block's state
+//! transition is proved, and how its lists are applied.
 //!
 //! A block publishes its spent input commitments and its new output
 //! records, each in canonical order (ascending state-tree key, no
-//! duplicates), plus its total fee and mint and one aggregated proof
-//! ([`crate::aggregate`]). Transactions stay private.
+//! duplicates), and one chain proof ([`crate::chain`]) covering its own
+//! transition and the whole history before it. Transactions stay private.
 //!
-//! The multiset challenges `lambda, r` hash the previous state and both
-//! lists, so they are fixed once the block's contents are. A full node
-//! rebuilds the proof's statement from public data alone (the merge key,
-//! `lambda, r`, the four products over the lists, the fee and mint, the
-//! previous and new state, and the first and last keys) and checks the
-//! proof against it. The statement then says: every published output was
-//! created by a valid transaction and inserted, every published input was
-//! spent by a valid transaction and marked spent, the tree went from the
-//! previous state to the new one, and the transactions' fees and mint sum to
-//! the published totals. The node also checks `mint <= subsidy + fee`.
+//! Fees are implicit and there is no separate reward rule: transactions
+//! need not balance, and the only value rule is the block's, that
+//! `sum(outputs) - sum(inputs)` equals the subsidy. A block reward is just a
+//! transaction with outputs and no inputs, claiming the subsidy plus
+//! whatever the other transactions leave unspent. The proofs carry only that
+//! net value, so nothing about fees is published.
 //!
-//! The header (proof-of-work, links) isn't defined yet; [`verify`] takes the
-//! previous and new state directly.
+//! [`BlockProver`] proves a block's transition as one aggregated proof
+//! ([`crate::aggregate`]). Its two private halves, the transactions
+//! (sub-blocks) and the tree updates (segments), are tied together by
+//! multiset fingerprints over commitments, under challenges `lambda, r`
+//! that must be fixed only after both halves are ([`challenges`]): they
+//! hash the previous and new state, whose roots commit to every key
+//! inserted and spent, and the transaction hash, which commits (blinded) to
+//! every commitment the transactions spend and create. The chain proof
+//! checks that derivation, the fingerprint ratios, the net value and the
+//! state link in-circuit.
+//!
+//! The published lists are bound through the state: applying them to the
+//! previous tree must give the header's new state ([`apply`]). Output
+//! nonces are published for wallets but aren't fingerprinted; only the body
+//! hash commits to them.
+//!
+//! On the wire a block is its header and body ([`encode`]), at most
+//! [`MAX_BLOCK_SIZE`] bytes. A [`Header`] commits to the block through
+//! [`Block::body_hash`], which covers the proof too.
 
 use std::fmt;
 
-use crate::aggregate::{AggError, Aggregator, NodeProof, Statement, statement as st};
+use crate::aggregate::{AggError, Aggregator, NodeProof};
 use crate::babybear::BabyBear;
 use crate::babybear4::BabyBear4;
 use crate::fri::FriParams;
-use crate::hash::{self, HASH_LEN, domain};
-use crate::output::{self, Amount, Commitment, OutputRecord};
+use crate::hash::{self, HASH_LEN, Hash, domain};
+use crate::header::Header;
+use crate::output::{self, Amount, COMMITMENT_LEN, Commitment, NONCE_LEN, OutputRecord};
 use crate::rng::Rng;
 use crate::stark::{self, ProvingKey, StarkProof};
 use crate::state::{self, State, StateTree, key_of};
 use crate::state_air::{InsertOp, SegmentStart, SpendOp, StateSegmentAir};
-use crate::subblock_air::{SubBlockAir, input_element, output_element, product};
+use crate::subblock_air::{self, SubBlockAir};
 use crate::transaction::{Transaction, TxError};
 
 /// What a block publishes.
@@ -42,10 +56,7 @@ pub struct Block {
     pub inputs: Vec<Commitment>,
     /// New outputs, in canonical order.
     pub outputs: Vec<OutputRecord>,
-    /// Total fees paid by the block's transactions.
-    pub fee: Amount,
-    /// Total minted by its reward transactions.
-    pub mint: Amount,
+    /// The chain proof ([`crate::chain`]).
     pub proof: StarkProof,
 }
 
@@ -61,10 +72,21 @@ pub enum BlockError {
     /// The state tree rejected an operation (a missing or spent input, a
     /// duplicate output).
     State(state::Error),
-    /// Aggregation failed (prover) or the proof doesn't verify (verifier).
+    /// Aggregation or chain proving failed (prover), or the chain proof
+    /// doesn't verify (verifier).
     Proof(AggError),
-    /// Minted more than the subsidy plus fees.
-    Overmint,
+    /// The transactions don't create exactly the subsidy: their
+    /// `sum(outputs) - sum(inputs)` is this.
+    Net(i128),
+    /// The header doesn't commit to this body.
+    Body,
+    /// The serialized block would exceed [`MAX_BLOCK_SIZE`]: its size.
+    Oversize(usize),
+    /// The tree isn't at the parent's state, or applying the block doesn't
+    /// give the header's.
+    StateMismatch,
+    /// The chain proof doesn't verify.
+    Chain(crate::stark::StarkError),
 }
 
 impl fmt::Display for BlockError {
@@ -75,12 +97,36 @@ impl fmt::Display for BlockError {
             Self::NotCanonical => write!(f, "lists not in canonical order"),
             Self::State(e) => write!(f, "state: {e:?}"),
             Self::Proof(e) => write!(f, "proof: {e}"),
-            Self::Overmint => write!(f, "mint exceeds subsidy plus fees"),
+            Self::Net(n) => write!(f, "transactions create {n}, not the subsidy"),
+            Self::Body => write!(f, "header doesn't commit to the body"),
+            Self::Oversize(n) => write!(f, "block is {n} bytes, over {MAX_BLOCK_SIZE}"),
+            Self::StateMismatch => write!(f, "applying the block doesn't give the header's state"),
+            Self::Chain(e) => write!(f, "chain proof: {e}"),
         }
     }
 }
 
 impl std::error::Error for BlockError {}
+
+impl Block {
+    /// The hash a header commits to: both lists (with output nonces) and
+    /// the proof's digest. `None` if a commitment isn't a field encoding.
+    pub fn body_hash(&self) -> Option<Hash> {
+        let mut data = vec![
+            BabyBear::new(self.inputs.len() as u32),
+            BabyBear::new(self.outputs.len() as u32),
+        ];
+        for c in &self.inputs {
+            data.extend(c.to_field()?);
+        }
+        for o in &self.outputs {
+            data.extend(o.commitment.to_field()?);
+            data.extend(output::nonce_limbs(&o.nonce));
+        }
+        data.extend(self.proof.digest());
+        Some(hash::sponge(domain::BLOCK_BODY, &[], &[&data]))
+    }
+}
 
 /// The canonical order: ascending key, compared on canonical limbs.
 fn order_key(c: &Commitment) -> Option<[u32; HASH_LEN]> {
@@ -88,7 +134,7 @@ fn order_key(c: &Commitment) -> Option<[u32; HASH_LEN]> {
 }
 
 /// Whether `commitments` are valid keys in strictly ascending order.
-fn is_canonical<'a>(commitments: impl IntoIterator<Item = &'a Commitment>) -> bool {
+pub(crate) fn is_canonical<'a>(commitments: impl IntoIterator<Item = &'a Commitment>) -> bool {
     let mut last: Option<[u32; HASH_LEN]> = None;
     for c in commitments {
         match order_key(c) {
@@ -127,108 +173,175 @@ fn sort_canonical<T>(
     Ok(())
 }
 
-/// The multiset challenges for a block: a hash of the previous state and
-/// both lists (commitments, and outputs' nonces).
-pub fn challenges(
-    prev: &State,
-    inputs: &[Commitment],
-    outputs: &[OutputRecord],
-) -> Option<(BabyBear4, BabyBear4)> {
-    let (lo, hi) = state::split(prev.size);
-    let mut data = prev.root.to_vec();
-    data.extend([lo, hi]);
-    data.extend([inputs.len(), outputs.len()].map(|n| BabyBear::new(n as u32)));
-    for c in inputs {
-        data.extend(c.to_field()?);
+/// The multiset challenges for a block: a hash of the previous and new
+/// state and the transaction hash.
+pub fn challenges(prev: &State, new: &State, tx_hash: &Hash) -> (BabyBear4, BabyBear4) {
+    let (a, b) = state::split(prev.size);
+    let (c, d) = state::split(new.size);
+    let h = hash::sponge(
+        domain::BLOCK_CHALLENGES,
+        &[],
+        &[&prev.root, &[a, b], &new.root, &[c, d], tx_hash],
+    );
+    (
+        BabyBear4(core::array::from_fn(|i| h[i])),
+        BabyBear4(core::array::from_fn(|i| h[4 + i])),
+    )
+}
+
+/// The transaction hash of an aggregation tree with these leaf hashes
+/// (zero for segments), merged pairwise level by level as
+/// [`BlockProver::prove`] merges the nodes.
+fn merge_tx_hashes(mut level: Vec<Hash>) -> Hash {
+    while level.len() > 1 {
+        level = level
+            .chunks(2)
+            .map(|p| match p {
+                [a, b] => hash::merge(a, b),
+                [a] => *a,
+                _ => unreachable!(),
+            })
+            .collect();
     }
-    for o in outputs {
-        data.extend(o.commitment.to_field()?);
-        data.extend(output::nonce_limbs(&o.nonce));
+    level[0]
+}
+
+/// The most bytes a serialized block ([`encode`]) may take.
+pub const MAX_BLOCK_SIZE: usize = 2_000_000;
+
+/// Bytes per serialized input: its commitment.
+pub const INPUT_BYTES: usize = COMMITMENT_LEN;
+/// Bytes per serialized output: its commitment and nonce.
+pub const OUTPUT_BYTES: usize = COMMITMENT_LEN + NONCE_LEN;
+
+/// The serialized size of a block with these list lengths and proof size.
+pub fn encoded_size(inputs: usize, outputs: usize, proof: usize) -> usize {
+    crate::header::HEADER_BYTES
+        + 12
+        + inputs * INPUT_BYTES
+        + outputs * OUTPUT_BYTES
+        + proof
+}
+
+/// Serializes a block with its header: `header | n_in (u32) | inputs |
+/// n_out (u32) | outputs (commitment, nonce) | proof length (u32) | proof`,
+/// integers little-endian.
+pub fn encode(header: &Header, block: &Block) -> Vec<u8> {
+    let proof = block.proof.to_bytes();
+    let mut out = Vec::with_capacity(encoded_size(
+        block.inputs.len(),
+        block.outputs.len(),
+        proof.len(),
+    ));
+    out.extend(header.to_bytes());
+    out.extend((block.inputs.len() as u32).to_le_bytes());
+    for c in &block.inputs {
+        out.extend(c.0);
     }
-    let h = hash::sponge(domain::BLOCK_CHALLENGES, &[], &[&data]);
-    Some((
-        BabyBear4(core::array::from_fn(|b| h[b])),
-        BabyBear4(core::array::from_fn(|b| h[4 + b])),
+    out.extend((block.outputs.len() as u32).to_le_bytes());
+    for o in &block.outputs {
+        out.extend(o.commitment.0);
+        out.extend(o.nonce);
+    }
+    out.extend((proof.len() as u32).to_le_bytes());
+    out.extend(proof);
+    out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeError {
+    /// Over [`MAX_BLOCK_SIZE`].
+    Oversize(usize),
+    /// Ends early, has bytes left over, or a part doesn't parse.
+    Malformed,
+}
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Oversize(n) => write!(f, "block is {n} bytes, over {MAX_BLOCK_SIZE}"),
+            Self::Malformed => write!(f, "malformed block"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
+/// Parses a block written by [`encode`].
+pub fn decode(bytes: &[u8]) -> Result<(Header, Block), DecodeError> {
+    if bytes.len() > MAX_BLOCK_SIZE {
+        return Err(DecodeError::Oversize(bytes.len()));
+    }
+    let mut rest = bytes;
+    let mut take = |n: usize| -> Result<&[u8], DecodeError> {
+        if rest.len() < n {
+            return Err(DecodeError::Malformed);
+        }
+        let (a, b) = rest.split_at(n);
+        rest = b;
+        Ok(a)
+    };
+    let count = |b: &[u8]| u32::from_le_bytes(b.try_into().expect("4 bytes")) as usize;
+    let header =
+        Header::from_bytes(take(crate::header::HEADER_BYTES)?).ok_or(DecodeError::Malformed)?;
+    let n_in = count(take(4)?);
+    let mut inputs = Vec::with_capacity(n_in.min(MAX_BLOCK_SIZE / INPUT_BYTES));
+    for _ in 0..n_in {
+        inputs.push(Commitment(take(COMMITMENT_LEN)?.try_into().expect("length")));
+    }
+    let n_out = count(take(4)?);
+    let mut outputs = Vec::with_capacity(n_out.min(MAX_BLOCK_SIZE / OUTPUT_BYTES));
+    for _ in 0..n_out {
+        let commitment = Commitment(take(COMMITMENT_LEN)?.try_into().expect("length"));
+        let nonce = take(NONCE_LEN)?.try_into().expect("length");
+        outputs.push(OutputRecord { commitment, nonce });
+    }
+    let proof_len = count(take(4)?);
+    let proof = StarkProof::from_bytes(take(proof_len)?).ok_or(DecodeError::Malformed)?;
+    if !rest.is_empty() {
+        return Err(DecodeError::Malformed);
+    }
+    Ok((
+        header,
+        Block {
+            inputs,
+            outputs,
+            proof,
+        },
     ))
 }
 
-/// The statement a valid proof of this block must prove.
-fn expected_statement(
-    agg: &Aggregator,
-    prev: &State,
-    new: &State,
+/// Applies `block`'s lists to `tree` (whose state in `txn` must be
+/// `parent`'s) and checks the result is `header`'s state. On error `txn`
+/// may be partly updated; abort it.
+pub fn apply(
+    tree: &StateTree,
+    txn: &mut heed::RwTxn,
+    parent: &Header,
+    header: &Header,
     block: &Block,
-) -> Option<Statement> {
-    let (lambda, r) = challenges(prev, &block.inputs, &block.outputs)?;
-    let p_in = product(
-        r,
-        block
-            .inputs
-            .iter()
-            .map(|c| input_element(lambda, c))
-            .collect::<Option<Vec<_>>>()?,
-    );
-    let p_out = product(
-        r,
-        block
-            .outputs
-            .iter()
-            .map(|o| output_element(lambda, o))
-            .collect::<Option<Vec<_>>>()?,
-    );
-    let zero = [BabyBear::ZERO; HASH_LEN];
-    let last = |c: Option<&Commitment>| c.map_or(Some(zero), |c| key_of(c).ok());
-    let last_insert = last(block.outputs.last().map(|o| &o.commitment))?;
-    let last_spend = last(block.inputs.last())?;
-
-    let mut s = vec![BabyBear::ZERO; st::LEN];
-    let mut put = |at: usize, xs: &[BabyBear]| s[at..at + xs.len()].copy_from_slice(xs);
-    put(st::VK, &agg.merge_key());
-    put(st::LAMBDA, &lambda.0);
-    put(st::R, &r.0);
-    put(st::P_SUB_IN, &p_in.0);
-    put(st::P_SP, &p_in.0);
-    put(st::P_SUB_OUT, &p_out.0);
-    put(st::P_INS, &p_out.0);
-    put(st::FEE, &output::amount_limbs(block.fee));
-    put(st::MINT, &output::amount_limbs(block.mint));
-    put(st::HAS_STATE, &[BabyBear::ONE]);
-    for (state, root, size) in [
-        (prev, st::OLD_ROOT, st::OLD_SIZE),
-        (new, st::NEW_ROOT, st::NEW_SIZE),
-    ] {
-        let (lo, hi) = state::split(state.size);
-        put(root, &state.root);
-        put(size, &[lo, hi]);
-    }
-    put(st::PREV_INS_IN, &zero);
-    put(st::PREV_INS_OUT, &last_insert);
-    put(st::PREV_SP_IN, &zero);
-    put(st::PREV_SP_OUT, &last_spend);
-    Some(Statement(s))
-}
-
-/// Checks `block` as the transition from `prev` to `new`, with block
-/// subsidy `subsidy`.
-pub fn verify(
-    agg: &Aggregator,
-    prev: &State,
-    new: &State,
-    block: &Block,
-    subsidy: Amount,
 ) -> Result<(), BlockError> {
-    if !is_canonical(&block.inputs) || !is_canonical(block.outputs.iter().map(|o| &o.commitment)) {
-        return Err(BlockError::NotCanonical);
+    if tree.state(txn).map_err(BlockError::State)? != parent.state {
+        return Err(BlockError::StateMismatch);
     }
-    if block.mint as u128 > subsidy as u128 + block.fee as u128 {
-        return Err(BlockError::Overmint);
+    tree.apply_changes(txn, &created(block), &block.inputs)
+        .map_err(BlockError::State)?;
+    if tree.state(txn).map_err(BlockError::State)? != header.state {
+        return Err(BlockError::StateMismatch);
     }
-    let statement = expected_statement(agg, prev, new, block).ok_or(BlockError::NotCanonical)?;
-    agg.verify(&statement, &block.proof)
-        .map_err(BlockError::Proof)
+    Ok(())
 }
 
-/// Keys and shapes for proving blocks.
+/// A block's transition, proved: its lists and the final aggregation
+/// proof, which [`crate::chain`] turns into the block's chain proof.
+#[derive(Clone, Debug)]
+pub struct Aggregated {
+    pub inputs: Vec<Commitment>,
+    pub outputs: Vec<OutputRecord>,
+    pub node: NodeProof,
+}
+
+/// Keys and shapes for proving blocks' transitions.
 pub struct BlockProver {
     params: FriParams,
     sub: SubBlockAir,
@@ -260,19 +373,33 @@ impl BlockProver {
         &self.agg
     }
 
-    /// Proves a block of `txs` on top of `tree`'s state in `txn`, applying
-    /// its changes there (commit `txn` to keep them).
+    /// Proves the transition of a block of `txs` on top of `tree`'s state
+    /// in `txn`, applying its changes there (commit `txn` to keep them).
+    /// The transactions must create exactly `subsidy` in total and the
+    /// block must fit [`MAX_BLOCK_SIZE`]; both are checked before proving.
     pub fn prove(
         &self,
         tree: &StateTree,
         txn: &mut heed::RwTxn,
         txs: &[Transaction],
-    ) -> Result<Block, BlockError> {
+        subsidy: Amount,
+    ) -> Result<Aggregated, BlockError> {
+        let mut net: i128 = 0;
         for (i, tx) in txs.iter().enumerate() {
-            tx.validate().map_err(|e| BlockError::Tx(i, e))?;
+            let totals = tx.validate().map_err(|e| BlockError::Tx(i, e))?;
+            net -= totals.fee();
             if tx.body.inputs.len() > self.sub.inputs || tx.body.outputs.len() > self.sub.outputs {
                 return Err(BlockError::TooLarge(i));
             }
+        }
+        if net != subsidy as i128 {
+            return Err(BlockError::Net(net));
+        }
+        let n_in: usize = txs.iter().map(|t| t.body.inputs.len()).sum();
+        let n_out: usize = txs.iter().map(|t| t.body.outputs.len()).sum();
+        let size = encoded_size(n_in, n_out, self.agg.proof_size());
+        if size > MAX_BLOCK_SIZE {
+            return Err(BlockError::Oversize(size));
         }
         let mut inputs: Vec<Commitment> = txs
             .iter()
@@ -286,9 +413,9 @@ impl BlockProver {
         sort_canonical(&mut inputs, |c| c)?;
         sort_canonical(&mut outputs, |o| &o.commitment)?;
         let prev = tree.state(txn).map_err(BlockError::State)?;
-        let (lambda, r) = challenges(&prev, &inputs, &outputs).ok_or(BlockError::NotCanonical)?;
 
-        // State segments, in order: all inserts, then all spends.
+        // Apply the state changes natively, in segments: all inserts, then
+        // all spends.
         let mut segments = Vec::new();
         let mut start = SegmentStart {
             state: prev,
@@ -311,7 +438,7 @@ impl BlockProver {
                 .map(|record| {
                     Ok(InsertOp {
                         proof: tree.insert(txn, &record.commitment)?,
-                        record: *record,
+                        commitment: record.commitment,
                     })
                 })
                 .collect::<Result<_, state::Error>>()
@@ -326,14 +453,7 @@ impl BlockProver {
                 })
                 .collect::<Result<_, state::Error>>()
                 .map_err(BlockError::State)?;
-            let (trace, public) = self.seg.trace(&start, &inserts, &spends, lambda, r);
-            let proof = stark::prove(&self.params, &self.seg_pk, &self.seg, trace, &public);
-            segments.push(
-                self.agg
-                    .prove_segment(&public, &proof)
-                    .map_err(BlockError::Proof)?,
-            );
-            start = SegmentStart {
+            let next = SegmentStart {
                 state: tree.state(txn).map_err(BlockError::State)?,
                 prev_insert: take_ins.last().map_or(start.prev_insert, |o| {
                     key_of(&o.commitment).expect("checked")
@@ -342,13 +462,40 @@ impl BlockProver {
                     .last()
                     .map_or(start.prev_spend, |c| key_of(c).expect("checked")),
             };
+            segments.push((start, inserts, spends));
+            start = next;
         }
+        let new = start.state;
 
-        // Sub-blocks, then merge pairwise, keeping the segments' order.
+        // Fix the transactions' blinded hashes, then derive the challenges
+        // from both halves.
         let mut rng = Rng::from_os().expect("OS randomness");
-        let mut nodes: Vec<NodeProof> = segments;
+        let mut blindings = Vec::with_capacity(txs.len());
+        let mut leaves = vec![[BabyBear::ZERO; HASH_LEN]; segments.len()];
         for tx in txs {
-            let (trace, public) = self.sub.trace(tx, lambda, r, &mut rng);
+            let mut blinding = [BabyBear::ZERO; HASH_LEN];
+            rng.fill(&mut blinding);
+            let digest = tx.body.digest().ok_or(BlockError::NotCanonical)?;
+            leaves.push(subblock_air::tx_hash(&digest, &blinding));
+            blindings.push(blinding);
+        }
+        let tx_hash = merge_tx_hashes(leaves);
+        let (lambda, r) = challenges(&prev, &new, &tx_hash);
+
+        // Prove the segments, then the sub-blocks, then merge pairwise,
+        // keeping the segments' order.
+        let mut nodes: Vec<NodeProof> = Vec::with_capacity(segments.len() + txs.len());
+        for (start, inserts, spends) in &segments {
+            let (trace, public) = self.seg.trace(start, inserts, spends, lambda, r);
+            let proof = stark::prove(&self.params, &self.seg_pk, &self.seg, trace, &public);
+            nodes.push(
+                self.agg
+                    .prove_segment(&public, &proof)
+                    .map_err(BlockError::Proof)?,
+            );
+        }
+        for (tx, blinding) in txs.iter().zip(&blindings) {
+            let (trace, public) = self.sub.trace(tx, blinding, lambda, r, &mut rng);
             let proof = stark::prove(&self.params, &self.sub_pk, &self.sub, trace, &public);
             nodes.push(
                 self.agg
@@ -373,12 +520,11 @@ impl BlockProver {
             // has at least one transaction, so this doesn't happen.
             return Err(BlockError::Proof(AggError::Invalid));
         }
-        Ok(Block {
+        debug_assert_eq!(top.statement.tx_hash(), tx_hash);
+        Ok(Aggregated {
             inputs,
             outputs,
-            fee: top.statement.fee(),
-            mint: top.statement.mint(),
-            proof: top.proof,
+            node: top,
         })
     }
 }
@@ -428,8 +574,8 @@ mod tests {
     }
 
     /// A block with one transaction (1 input, 2 outputs, fee 10) and a
-    /// reward claiming the subsidy plus the fee, proved, checked as a full
-    /// node would, and applied natively.
+    /// reward claiming the subsidy plus the fee: its transition proved, its
+    /// encoding, and applying it.
     #[test]
     #[ignore = "slow: run in release"]
     fn proves_and_verifies_a_block() {
@@ -475,55 +621,103 @@ mod tests {
         )
         .unwrap();
 
-        // The miner proves the block (and drops its changes).
+        // Transactions that don't create exactly the subsidy are refused
+        // before proving: here the reward claims one unit too many.
+        let greedy = Transaction::sign(
+            TxBody {
+                inputs: vec![],
+                outputs: vec![pay(5, SUBSIDY + 11)],
+            },
+            vec![],
+        )
+        .unwrap();
+        let mut txn = env.env().write_txn().unwrap();
+        assert!(matches!(
+            prover.prove(&tree, &mut txn, &[tx.clone(), greedy], SUBSIDY),
+            Err(BlockError::Net(51))
+        ));
+        txn.abort();
+
+        // The miner proves the transition (and drops its changes).
         let t = std::time::Instant::now();
         let mut txn = env.env().write_txn().unwrap();
         let prev = tree.state(&txn).unwrap();
-        let block = prover.prove(&tree, &mut txn, &[tx, reward]).unwrap();
+        let agg = prover.prove(&tree, &mut txn, &[tx, reward], SUBSIDY).unwrap();
         let claimed = tree.state(&txn).unwrap();
         txn.abort();
         eprintln!("prove {:.1} s", t.elapsed().as_secs_f64());
-        assert_eq!((block.inputs.len(), block.outputs.len()), (1, 3));
-        assert_eq!((block.fee, block.mint), (10, SUBSIDY + 10));
+        assert_eq!((agg.inputs.len(), agg.outputs.len()), (1, 3));
 
-        // A full node checks it against its own state, then applies it.
-        let agg = prover.aggregator();
-        let t = std::time::Instant::now();
-        assert!(verify(agg, &prev, &claimed, &block, SUBSIDY).is_ok());
-        eprintln!("verify {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+        // The final statement: what the chain proof checks in-circuit.
+        let aggregator = prover.aggregator();
+        let s = &agg.node.statement;
+        assert_eq!(aggregator.verify(s, &agg.node.proof), Ok(()));
+        assert_eq!((s.old_state(), s.new_state()), (prev, claimed));
+        assert_eq!((s.lambda(), s.r()), challenges(&prev, &claimed, &s.tx_hash()));
+        assert_eq!((s.q_in(), s.q_out()), (BabyBear4::ONE, BabyBear4::ONE));
+        assert_eq!(s.net(), SUBSIDY as i128);
+
+        // Over the wire, with the aggregation proof standing in for the
+        // chain proof: the encoding round-trips, and its size is as
+        // computed.
+        let block = Block {
+            inputs: agg.inputs.clone(),
+            outputs: agg.outputs.clone(),
+            proof: agg.node.proof.clone(),
+        };
+        let parent = Header {
+            height: 7,
+            timestamp: 1000,
+            state: prev,
+            ..Header::default()
+        };
+        let header = Header {
+            height: 8,
+            prev: parent.hash(),
+            timestamp: 1600,
+            state: claimed,
+            body: block.body_hash().unwrap(),
+            nonce: 0,
+        };
+        let bytes = encode(&header, &block);
+        assert_eq!(bytes.len(), encoded_size(1, 3, aggregator.proof_size()));
+        eprintln!("serialized {} bytes", bytes.len());
+        let (h2, b2) = decode(&bytes).unwrap();
+        assert_eq!(h2, header);
+        assert_eq!((&b2.inputs, &b2.outputs), (&block.inputs, &block.outputs));
+        assert_eq!(b2.proof.elements(), block.proof.elements());
+        assert_eq!(b2.body_hash(), block.body_hash());
+        assert_eq!(decode(&bytes[..bytes.len() - 1]).err(), Some(DecodeError::Malformed));
+        let mut long = bytes.clone();
+        long.push(0);
+        assert_eq!(decode(&long).err(), Some(DecodeError::Malformed));
+        let mut huge = bytes.clone();
+        huge.resize(MAX_BLOCK_SIZE + 1, 0);
+        assert_eq!(
+            decode(&huge).err(),
+            Some(DecodeError::Oversize(MAX_BLOCK_SIZE + 1))
+        );
+        // The body hash covers the proof and the nonces.
+        let mut b = block.clone();
+        b.proof.fri.pow_witness += BabyBear::ONE;
+        assert_ne!(b.body_hash(), block.body_hash());
+        let mut b = block.clone();
+        b.outputs[1].nonce[3] ^= 1;
+        assert_ne!(b.body_hash(), block.body_hash());
+
+        // The lists are bound through the state: a body missing an output
+        // doesn't reach the header's state.
+        let mut b = block.clone();
+        b.outputs.remove(0);
         let mut txn = env.env().write_txn().unwrap();
-        tree.apply_changes(&mut txn, &created(&block), &block.inputs)
-            .unwrap();
+        assert!(matches!(
+            apply(&tree, &mut txn, &parent, &header, &b),
+            Err(BlockError::StateMismatch)
+        ));
+        txn.abort();
+        let mut txn = env.env().write_txn().unwrap();
+        apply(&tree, &mut txn, &parent, &header, &block).unwrap();
         assert_eq!(tree.state(&txn).unwrap(), claimed);
         txn.commit().unwrap();
-
-        // Rejections.
-        let rejects = |b: &Block, prev: &State, new: &State, subsidy| {
-            verify(agg, prev, new, b, subsidy).is_err()
-        };
-        assert!(rejects(&block, &prev, &claimed, SUBSIDY - 1), "overmint");
-        assert!(
-            rejects(&block, &claimed, &claimed, SUBSIDY),
-            "wrong previous state"
-        );
-        assert!(rejects(&block, &prev, &prev, SUBSIDY), "wrong new state");
-        let mut b = block.clone();
-        b.outputs.pop();
-        assert!(rejects(&b, &prev, &claimed, SUBSIDY), "dropped output");
-        let mut b = block.clone();
-        b.inputs.clear();
-        assert!(rejects(&b, &prev, &claimed, SUBSIDY), "dropped input");
-        let mut b = block.clone();
-        b.outputs[0].nonce[0] ^= 1;
-        assert!(rejects(&b, &prev, &claimed, SUBSIDY), "changed nonce");
-        let mut b = block.clone();
-        b.outputs.swap(0, 1);
-        assert!(rejects(&b, &prev, &claimed, SUBSIDY), "not canonical");
-        let mut b = block.clone();
-        (b.fee, b.mint) = (20, SUBSIDY + 20);
-        assert!(
-            rejects(&b, &prev, &claimed, SUBSIDY),
-            "inflated fee and mint"
-        );
     }
 }

@@ -8,15 +8,20 @@ pub const USAGE: &str = "\
 Usage: r [OPTIONS]
 
 Options:
-      --data-dir <PATH>  Directory for the database [default: data]
-  -h, --help             Print help
-  -V, --version          Print version";
+      --data-dir <PATH>      Directory for the database [default: data]
+      --dev-chain <BLOCKS>   Prove, mine and check a fresh development chain
+                             of BLOCKS blocks in <PATH>/devnet (replacing
+                             any previous one), logging each step
+  -h, --help                 Print help
+  -V, --version              Print version";
 
 pub const DEFAULT_DATA_DIR: &str = "data";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Args {
     pub data_dir: PathBuf,
+    /// Blocks of development chain to build, if asked for.
+    pub dev_chain: Option<u64>,
 }
 
 /// What the command line asked for.
@@ -35,6 +40,8 @@ pub enum ArgsError {
     Duplicate(&'static str),
     /// An option that takes no value was given one (`--help=x`).
     UnexpectedValue(&'static str),
+    /// An option's value doesn't parse.
+    InvalidValue(&'static str),
     Unknown(OsString),
 }
 
@@ -44,6 +51,7 @@ impl fmt::Display for ArgsError {
             Self::MissingValue(opt) => write!(f, "option '{opt}' requires a value"),
             Self::Duplicate(opt) => write!(f, "option '{opt}' was given more than once"),
             Self::UnexpectedValue(opt) => write!(f, "option '{opt}' does not take a value"),
+            Self::InvalidValue(opt) => write!(f, "invalid value for option '{opt}'"),
             Self::Unknown(arg) => write!(f, "unexpected argument '{}'", arg.to_string_lossy()),
         }
     }
@@ -68,6 +76,7 @@ impl Args {
         I::Item: Into<OsString>,
     {
         let mut data_dir: Option<PathBuf> = None;
+        let mut dev_chain: Option<u64> = None;
         let mut args = args.into_iter().map(Into::into);
 
         while let Some(arg) = args.next() {
@@ -94,12 +103,28 @@ impl Args {
                     }
                     data_dir = Some(value.into());
                 }
+                "--dev-chain" => {
+                    if dev_chain.is_some() {
+                        return Err(ArgsError::Duplicate("--dev-chain"));
+                    }
+                    let value = match inline {
+                        Some(v) => OsString::from(v),
+                        None => args.next().ok_or(ArgsError::MissingValue("--dev-chain"))?,
+                    };
+                    let blocks = value
+                        .to_str()
+                        .and_then(|v| v.parse().ok())
+                        .filter(|&n| n > 0)
+                        .ok_or(ArgsError::InvalidValue("--dev-chain"))?;
+                    dev_chain = Some(blocks);
+                }
                 _ => return Err(ArgsError::Unknown(arg)),
             }
         }
 
         Ok(Command::Run(Args {
             data_dir: data_dir.unwrap_or_else(|| DEFAULT_DATA_DIR.into()),
+            dev_chain,
         }))
     }
 }
@@ -123,6 +148,7 @@ mod tests {
     fn run(dir: &str) -> Result<Command, ArgsError> {
         Ok(Command::Run(Args {
             data_dir: dir.into(),
+            dev_chain: None,
         }))
     }
 
@@ -139,6 +165,16 @@ mod tests {
         assert_eq!(parse(&["--data-dir=a=b"]), run("a=b"));
         // A value that looks like an option is still taken as the value.
         assert_eq!(parse(&["--data-dir", "--help"]), run("--help"));
+    }
+
+    #[test]
+    fn dev_chain() {
+        let want = Ok(Command::Run(Args {
+            data_dir: DEFAULT_DATA_DIR.into(),
+            dev_chain: Some(5),
+        }));
+        assert_eq!(parse(&["--dev-chain", "5"]), want);
+        assert_eq!(parse(&["--dev-chain=5"]), want);
     }
 
     #[test]
@@ -163,6 +199,13 @@ mod tests {
             Err(Duplicate("--data-dir"))
         );
         assert_eq!(parse(&["--help=1"]), Err(UnexpectedValue("--help")));
+        assert_eq!(parse(&["--dev-chain"]), Err(MissingValue("--dev-chain")));
+        for v in ["0", "-1", "x", ""] {
+            assert_eq!(
+                parse(&["--dev-chain", v]),
+                Err(InvalidValue("--dev-chain"))
+            );
+        }
         assert_eq!(parse(&["--bogus"]), Err(Unknown("--bogus".into())));
         assert_eq!(parse(&["-x=1"]), Err(Unknown("-x=1".into())));
         assert_eq!(parse(&["stray"]), Err(Unknown("stray".into())));
@@ -177,7 +220,8 @@ mod tests {
         assert_eq!(
             parsed,
             Ok(Command::Run(Args {
-                data_dir: raw.into()
+                data_dir: raw.into(),
+                dev_chain: None,
             }))
         );
     }

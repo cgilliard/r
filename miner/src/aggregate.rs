@@ -5,13 +5,24 @@
 //! same height whose public values are a statement:
 //!
 //! - a sub-block leaf verifies one [`SubBlockAir`] proof and states its
-//!   fingerprints, fee and mint, with no state change;
-//! - a segment leaf verifies one [`StateSegmentAir`] proof and states its
-//!   fingerprints and state change, with no fee or mint;
+//!   fingerprints, net value and transaction hash, with no state change;
+//! - a segment leaf verifies one [`StateSegmentAir`] proof and states the
+//!   inverses of its fingerprints and its state change, with a net value of
+//!   zero and a zero transaction hash;
 //! - a merge verifies two node proofs and states their combination:
-//!   fingerprints multiply, fees and mints add (renormalized to 16-bit
-//!   limbs), state changes chain (the first child's end must be the second
-//!   child's start), and `lambda`, `r` must agree.
+//!   fingerprint ratios multiply, net values add (offset 16-bit limbs,
+//!   renormalized), transaction hashes merge (`hash::merge(a, b)`), state
+//!   changes chain (the first child's end must be the second child's
+//!   start), and `lambda`, `r` must agree.
+//!
+//! Fingerprints are carried as ratios, transaction side over tree side,
+//! separately for spent (`Q_IN`) and created (`Q_OUT`) commitments: both
+//! are 1 exactly when the transactions spend and create the commitments
+//! the tree updates do (with overwhelming probability over `lambda, r`).
+//!
+//! The final transaction hash commits to every sub-block's commitments, and
+//! the final state change to every key the segments touched, so the block's
+//! challenges `lambda, r` are derived from both ([`crate::block`]).
 //!
 //! All nodes share one constraint program, so a node's verifying key is its
 //! preprocessed commitment alone, and a merge can verify either kind of
@@ -22,10 +33,11 @@
 //! the final proof checks that the key is the real merge key.
 //!
 //! Grouping stays hidden: only the final proof is published, it is zero
-//! knowledge, and its statement holds only totals. The block-level checks
-//! (products against the published lists, the state chain against the
-//! headers, mint against subsidy plus fees) are made natively on the final
-//! statement.
+//! knowledge, and its statement holds only totals: the net value, which a
+//! valid block's must equal the subsidy, so it reveals nothing. The
+//! block-level checks (products against the published lists, the state
+//! chain against the headers, the net value against the subsidy) are made
+//! natively on the final statement.
 
 use std::fmt;
 
@@ -34,7 +46,7 @@ use crate::babybear4::BabyBear4;
 use crate::circuit::{Cell, Circuit, ExtCell};
 use crate::fri::FriParams;
 use crate::hash::{HASH_LEN, Hash};
-use crate::output::AMOUNT_LIMBS;
+use crate::output::{self, NET_LIMBS, NET_OFFSET};
 use crate::recursion_air::RecursionAir;
 use crate::stark::{self, ProvingKey, StarkError, StarkProof, VerifyingKey};
 use crate::state::State;
@@ -51,17 +63,18 @@ pub mod statement {
     pub const VK: usize = 0;
     pub const LAMBDA: usize = VK + HASH_LEN;
     pub const R: usize = LAMBDA + 4;
-    /// Fingerprints of the sub-blocks' inputs and outputs.
-    pub const P_SUB_IN: usize = R + 4;
-    pub const P_SUB_OUT: usize = P_SUB_IN + 4;
-    /// Fingerprints of the segments' inserts and spends.
-    pub const P_INS: usize = P_SUB_OUT + 4;
-    pub const P_SP: usize = P_INS + 4;
-    /// 16-bit limbs.
-    pub const FEE: usize = P_SP + 4;
-    pub const MINT: usize = FEE + 4;
+    /// Spent commitments' fingerprint ratio: the sub-blocks' inputs over
+    /// the segments' spends.
+    pub const Q_IN: usize = R + 4;
+    /// Created commitments' fingerprint ratio: the sub-blocks' outputs over
+    /// the segments' inserts.
+    pub const Q_OUT: usize = Q_IN + 4;
+    /// `sum(outputs) - sum(inputs)` as [`crate::output::net_limbs`].
+    pub const NET: usize = Q_OUT + 4;
+    /// The sub-blocks' transaction hashes, merged in tree order.
+    pub const TX_HASH: usize = NET + crate::output::NET_LIMBS;
     /// 1 if any segment is included; the state fields are zero otherwise.
-    pub const HAS_STATE: usize = MINT + 4;
+    pub const HAS_STATE: usize = TX_HASH + HASH_LEN;
     /// `root | size lo, hi` before and after, as a segment's public values.
     pub const OLD_ROOT: usize = HAS_STATE + 1;
     pub const OLD_SIZE: usize = OLD_ROOT + HASH_LEN;
@@ -101,12 +114,6 @@ impl Statement {
         core::array::from_fn(|j| self.0[at + j])
     }
 
-    fn amount(&self, at: usize) -> u64 {
-        (0..AMOUNT_LIMBS).fold(0, |acc, i| {
-            acc | (self.0[at + i].as_u32() as u64) << (16 * i)
-        })
-    }
-
     fn state(&self, root: usize, size: usize) -> State {
         let (lo, hi) = (
             self.0[size].as_u32() as u64,
@@ -130,28 +137,21 @@ impl Statement {
         self.ext(st::R)
     }
 
-    pub fn p_sub_in(&self) -> BabyBear4 {
-        self.ext(st::P_SUB_IN)
+    pub fn q_in(&self) -> BabyBear4 {
+        self.ext(st::Q_IN)
     }
 
-    pub fn p_sub_out(&self) -> BabyBear4 {
-        self.ext(st::P_SUB_OUT)
+    pub fn q_out(&self) -> BabyBear4 {
+        self.ext(st::Q_OUT)
     }
 
-    pub fn p_ins(&self) -> BabyBear4 {
-        self.ext(st::P_INS)
+    /// `sum(outputs) - sum(inputs)`.
+    pub fn net(&self) -> i128 {
+        output::net_value(&self.0[st::NET..st::NET + NET_LIMBS])
     }
 
-    pub fn p_sp(&self) -> BabyBear4 {
-        self.ext(st::P_SP)
-    }
-
-    pub fn fee(&self) -> u64 {
-        self.amount(st::FEE)
-    }
-
-    pub fn mint(&self) -> u64 {
-        self.amount(st::MINT)
+    pub fn tx_hash(&self) -> Hash {
+        self.hash(st::TX_HASH)
     }
 
     pub fn has_state(&self) -> bool {
@@ -222,21 +222,51 @@ impl fmt::Display for AggError {
 impl std::error::Error for AggError {}
 
 /// One node circuit's layout and keys.
-struct Node {
-    air: RecursionAir,
-    pk: ProvingKey,
-    vk: VerifyingKey,
+pub(crate) struct Node {
+    pub(crate) air: RecursionAir,
+    pub(crate) pk: ProvingKey,
+    pub(crate) vk: VerifyingKey,
 }
 
 impl Node {
-    fn new(params: &FriParams, circuit: &Circuit, public: &[Cell], log_height: u32) -> Self {
+    pub(crate) fn new(
+        params: &FriParams,
+        circuit: &Circuit,
+        public: &[Cell],
+        log_height: u32,
+    ) -> Self {
         let air = RecursionAir::with_height(circuit, public, log_height);
         let (pk, vk) = stark::setup(params, &air);
         Self { air, pk, vk }
     }
 
-    fn root(&self) -> Hash {
+    /// The node's key: its preprocessed commitment.
+    pub(crate) fn root(&self) -> Hash {
         self.vk.preprocessed.expect("preprocessed columns").root
+    }
+
+    /// Proves `c` with `public` as this node. `None` if an assertion in `c`
+    /// failed.
+    ///
+    /// # Panics
+    /// If `c` doesn't have this node's shape.
+    pub(crate) fn prove(
+        &self,
+        params: &FriParams,
+        c: &Circuit,
+        public: &[Cell],
+    ) -> Option<(Vec<BabyBear>, StarkProof)> {
+        if !c.failures().is_empty() {
+            return None;
+        }
+        let log_height = self.air.height().ilog2();
+        assert!(
+            RecursionAir::with_height(c, public, log_height) == self.air,
+            "circuit shape changed"
+        );
+        let pv = self.air.public_values(c);
+        let proof = stark::prove(params, &self.pk, &self.air, self.air.trace(c), &pv);
+        Some((pv, proof))
     }
 }
 
@@ -283,16 +313,17 @@ pub struct Aggregator {
     leaf_sub: Node,
     leaf_seg: Node,
     merge: Node,
+    /// Bytes in a final proof (every node proof has the same shape).
+    proof_size: usize,
 }
 
 /// Inputs `values` and returns their cells.
-fn inputs(c: &mut Circuit, values: &[BabyBear]) -> Vec<Cell> {
+pub(crate) fn inputs(c: &mut Circuit, values: &[BabyBear]) -> Vec<Cell> {
     values.iter().map(|&v| c.input(v)).collect()
 }
 
 /// New input cells equal to `cells`: the node's public values.
-fn publish(c: &mut Circuit, cells: &[Cell]) -> Vec<Cell> {
-    assert_eq!(cells.len(), st::LEN);
+pub(crate) fn publish(c: &mut Circuit, cells: &[Cell]) -> Vec<Cell> {
     cells
         .iter()
         .map(|&x| {
@@ -303,18 +334,23 @@ fn publish(c: &mut Circuit, cells: &[Cell]) -> Vec<Cell> {
         .collect()
 }
 
-fn ext_at(cells: &[Cell], at: usize) -> ExtCell {
+pub(crate) fn ext_at(cells: &[Cell], at: usize) -> ExtCell {
     ExtCell(core::array::from_fn(|b| cells[at + b]))
 }
 
-/// `a + b` on 16-bit limbs, renormalized; the total must fit in the limbs.
-fn add_amounts(c: &mut Circuit, a: &[Cell], b: &[Cell]) -> Vec<Cell> {
+/// The sum of two net values in offset limbs ([`output::net_limbs`]):
+/// `a + b - 2^95`, renormalized. Fails unless the total is in range.
+fn add_nets(c: &mut Circuit, a: &[Cell], b: &[Cell]) -> Vec<Cell> {
     let mut carry = c.zero();
-    let mut out = Vec::with_capacity(AMOUNT_LIMBS);
-    for i in 0..AMOUNT_LIMBS {
+    let mut out = Vec::with_capacity(NET_LIMBS);
+    for i in 0..NET_LIMBS {
         let s = c.add(a[i], b[i]);
-        let t = c.add(s, carry);
-        if i + 1 == AMOUNT_LIMBS {
+        let mut t = c.add(s, carry);
+        let offset = (NET_OFFSET >> (16 * i)) as u16 as u32;
+        if offset != 0 {
+            t = c.add_const(t, -BabyBear::new(offset));
+        }
+        if i + 1 == NET_LIMBS {
             c.bits(t, 16);
             out.push(t);
             break;
@@ -396,10 +432,31 @@ impl Aggregator {
             },
             leaf_sub,
             leaf_seg,
+            proof_size: child.proof.size(),
         };
         let (c, public) = agg.merge_circuit(&child, &child);
         agg.merge = Node::new(&agg.params, &c, &public, log_height);
         agg
+    }
+
+    /// Bytes in a node proof ([`StarkProof::size`]).
+    pub fn proof_size(&self) -> usize {
+        self.proof_size
+    }
+
+    pub fn params(&self) -> &FriParams {
+        &self.params
+    }
+
+    /// The verifier of final (merge) proofs, for circuits that verify one.
+    pub(crate) fn merge_inner(&self) -> Inner<'_, RecursionAir> {
+        Inner {
+            params: &self.params,
+            vk: &self.merge.vk,
+            air: &self.merge.air,
+            program: &self.node_program,
+            log_n: self.log_height,
+        }
     }
 
     /// The merge key every statement must name.
@@ -431,11 +488,11 @@ impl Aggregator {
         let pv = inputs(&mut c, public);
         let cells = ProofCells::load(&mut c, proof);
         verifier_circuit::verify(&mut c, &sub.inner(params), &pv, &cells);
-        let (one, zero) = (c.one(), c.zero());
+        let zero = c.zero();
         let mut s = vk;
-        s.extend_from_slice(&pv[..16]); // lambda, r, P_in, P_out
-        s.extend([one, zero, zero, zero, one, zero, zero, zero]); // P_ins, P_sp
-        s.extend_from_slice(&pv[16..24]); // fee, mint
+        s.extend_from_slice(&pv[..16]); // lambda, r, Q_in = P_in, Q_out = P_out
+        s.extend_from_slice(&pv[subblock_air::NET..subblock_air::NET + NET_LIMBS]);
+        s.extend_from_slice(&pv[subblock_air::TX_HASH..subblock_air::TX_HASH + HASH_LEN]);
         s.push(zero); // has_state
         s.resize(st::LEN, zero);
         let public = publish(&mut c, &s);
@@ -458,9 +515,14 @@ impl Aggregator {
         let (one, zero) = (c.one(), c.zero());
         let mut s = vk;
         s.extend_from_slice(&pv[sp::LAMBDA..sp::P_INS]);
-        s.extend([one, zero, zero, zero, one, zero, zero, zero]); // P_sub_in, P_sub_out
-        s.extend_from_slice(&pv[sp::P_INS..sp::PREV_INS_IN]);
-        s.extend([zero; 2 * AMOUNT_LIMBS]); // fee, mint
+        let q_in = c.ext_inverse(ext_at(&pv, sp::P_SP));
+        let q_out = c.ext_inverse(ext_at(&pv, sp::P_INS));
+        s.extend(q_in.0);
+        s.extend(q_out.0);
+        for limb in output::net_limbs(0) {
+            s.push(c.constant(limb)); // net
+        }
+        s.extend([zero; HASH_LEN]); // tx hash
         s.push(one); // has_state
         s.extend_from_slice(&pv[sp::OLD_ROOT..sp::LAMBDA]);
         s.extend_from_slice(&pv[sp::PREV_INS_IN..sp::LEN]);
@@ -514,19 +576,25 @@ impl Aggregator {
             c.assert_eq(sa[st::VK + j], vk[j]);
             c.assert_eq(sb[st::VK + j], vk[j]);
         }
-        for j in st::LAMBDA..st::P_SUB_IN {
+        for j in st::LAMBDA..st::Q_IN {
             c.assert_eq(sa[j], sb[j]);
         }
         let mut s = vk.clone();
-        s.extend_from_slice(&sa[st::LAMBDA..st::P_SUB_IN]);
-        for at in [st::P_SUB_IN, st::P_SUB_OUT, st::P_INS, st::P_SP] {
+        s.extend_from_slice(&sa[st::LAMBDA..st::Q_IN]);
+        for at in [st::Q_IN, st::Q_OUT] {
             let p = c.ext_mul(ext_at(&sa, at), ext_at(&sb, at));
             s.extend(p.0);
         }
-        for at in [st::FEE, st::MINT] {
-            let sum = add_amounts(c, &sa[at..at + AMOUNT_LIMBS], &sb[at..at + AMOUNT_LIMBS]);
-            s.extend(sum);
-        }
+        let net = add_nets(
+            c,
+            &sa[st::NET..st::NET + NET_LIMBS],
+            &sb[st::NET..st::NET + NET_LIMBS],
+        );
+        s.extend(net);
+        let a_tx: [Cell; HASH_LEN] = core::array::from_fn(|j| sa[st::TX_HASH + j]);
+        let b_tx: [Cell; HASH_LEN] = core::array::from_fn(|j| sb[st::TX_HASH + j]);
+        let left = c.zero();
+        s.extend(c.merkle_step(a_tx, b_tx, left));
         // State: chain when both have one, else whichever has one.
         let (ha, hb) = (sa[st::HAS_STATE], sb[st::HAS_STATE]);
         let both = c.mul(ha, hb);
@@ -550,16 +618,11 @@ impl Aggregator {
     }
 
     fn prove_node(&self, kind: Kind, c: &Circuit, public: &[Cell]) -> Result<NodeProof, AggError> {
-        if !c.failures().is_empty() {
-            return Err(AggError::Invalid);
-        }
-        let node = self.node(kind);
-        assert!(
-            RecursionAir::with_height(c, public, self.log_height) == node.air,
-            "circuit shape changed"
-        );
-        let pv = node.air.public_values(c);
-        let proof = stark::prove(&self.params, &node.pk, &node.air, node.air.trace(c), &pv);
+        assert_eq!(public.len(), st::LEN);
+        let (pv, proof) = self
+            .node(kind)
+            .prove(&self.params, c, public)
+            .ok_or(AggError::Invalid)?;
         Ok(NodeProof {
             kind,
             statement: Statement(pv),
@@ -633,7 +696,7 @@ mod tests {
     use crate::rng::Rng;
     use crate::state::StateTree;
     use crate::state_air::{InsertOp, SegmentStart};
-    use crate::subblock_air::{output_element, product};
+    use crate::subblock_air::{element, product};
     use crate::transaction::{Transaction, TxBody};
 
     const LAMBDA: BabyBear4 = BabyBear4::new([3, 5, 7, 11]);
@@ -661,25 +724,31 @@ mod tests {
     }
 
     #[test]
-    fn amounts_add_with_carries() {
-        let limbs = |x: u64| crate::output::amount_limbs(x);
+    fn nets_add_with_carries() {
+        let limbs = output::net_limbs;
+        let big = 1i128 << 94;
         for (a, b) in [
             (0, 0),
             (0xffff, 1),
-            (u64::MAX - 7, 7),
-            (0x1234_ffff_ffff, 0x1),
+            (-1, 1),
+            (-5, -7),
+            (u64::MAX as i128, -(u64::MAX as i128) - 3),
+            (big, big - 1),
+            (-big, -big + 1),
         ] {
             let mut c = Circuit::new();
             let (ca, cb) = (inputs(&mut c, &limbs(a)), inputs(&mut c, &limbs(b)));
-            let sum = add_amounts(&mut c, &ca, &cb);
-            assert!(c.failures().is_empty());
+            let sum = add_nets(&mut c, &ca, &cb);
+            assert!(c.failures().is_empty(), "{a} + {b}");
             let v: Vec<BabyBear> = sum.iter().map(|&x| c.value(x)).collect();
             assert_eq!(v, limbs(a + b));
         }
-        let mut c = Circuit::new();
-        let (ca, cb) = (inputs(&mut c, &limbs(u64::MAX)), inputs(&mut c, &limbs(1)));
-        add_amounts(&mut c, &ca, &cb);
-        assert!(!c.failures().is_empty());
+        for (a, b) in [(big, big), (-big, -big - 1)] {
+            let mut c = Circuit::new();
+            let (ca, cb) = (inputs(&mut c, &limbs(a)), inputs(&mut c, &limbs(b)));
+            add_nets(&mut c, &ca, &cb);
+            assert!(!c.failures().is_empty(), "{a} + {b} overflows");
+        }
     }
 
     struct Setup {
@@ -722,7 +791,8 @@ mod tests {
         }
 
         fn sub_block(&self, tx: &Transaction, lambda: BabyBear4) -> NodeProof {
-            let (t, public) = self.sub.trace(tx, lambda, R, &mut Rng::from_seed(1));
+            let blinding = [BabyBear::new(77); HASH_LEN];
+            let (t, public) = self.sub.trace(tx, &blinding, lambda, R, &mut Rng::from_seed(1));
             let proof = stark::prove(&self.params, &self.sub_pk, &self.sub, t, &public);
             let time = std::time::Instant::now();
             let node = self.agg.prove_sub_block(&public, &proof).unwrap();
@@ -749,7 +819,7 @@ mod tests {
                 .into_iter()
                 .map(|record| InsertOp {
                     proof: tree.insert(&mut txn, &record.commitment).unwrap(),
-                    record,
+                    commitment: record.commitment,
                 })
                 .collect();
             let after = tree.state(&txn).unwrap();
@@ -805,21 +875,29 @@ mod tests {
         let st = &top.statement;
         assert_eq!(st.vk(), s.agg.merge_key());
         assert_eq!((st.lambda(), st.r()), (LAMBDA, R));
+        // The transactions create exactly what the segment inserts.
+        assert_eq!((st.q_in(), st.q_out()), (BabyBear4::ONE, BabyBear4::ONE));
         let p_out = product(
             R,
-            records.iter().map(|r| output_element(LAMBDA, r).unwrap()),
+            records.iter().map(|r| element(LAMBDA, &r.commitment).unwrap()),
         );
-        assert_eq!(st.p_sub_out(), p_out);
-        assert_eq!(st.p_ins(), p_out);
-        assert_eq!((st.p_sub_in(), st.p_sp()), (BabyBear4::ONE, BabyBear4::ONE));
-        assert_eq!((st.fee(), st.mint()), (0, 50 + 0x1_0000_ffff + 0xffff));
+        assert_eq!(m1.statement.q_out(), sub1.statement.q_out() * p_out.inverse().unwrap());
+        assert_eq!(st.net(), 50 + 0x1_0000_ffff + 0xffff);
+        // Transaction hashes merge in tree order; the segment's is zero.
+        let zero = [BabyBear::ZERO; HASH_LEN];
+        let m1_tx = crate::hash::merge(&sub1.statement.tx_hash(), &zero);
+        assert_eq!(m1.statement.tx_hash(), m1_tx);
+        assert_eq!(
+            st.tx_hash(),
+            crate::hash::merge(&m1_tx, &sub2.statement.tx_hash())
+        );
         assert!(st.has_state());
         assert_eq!((st.old_state(), st.new_state()), (before, after));
         assert_eq!(st.prev_spend_out(), [BabyBear::ZERO; HASH_LEN]);
 
         // Tampered statements and keys are rejected.
         let mut bad = st.clone();
-        bad.0[st::MINT] += BabyBear::ONE;
+        bad.0[st::NET] += BabyBear::ONE;
         assert!(matches!(
             s.agg.verify(&bad, &top.proof),
             Err(AggError::Stark(_))

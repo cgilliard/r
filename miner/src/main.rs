@@ -29,6 +29,9 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(blocks) = args.dev_chain {
+        return r::devnet::run(&args.data_dir.join("devnet"), blocks);
+    }
     let env = db::open_env(&args.data_dir)?;
     let tree = StateTree::open(&env)?;
     let state = tree.state(&env.read_txn()?)?;

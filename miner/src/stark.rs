@@ -122,6 +122,213 @@ pub struct PreprocessedCommitment {
 }
 
 impl StarkProof {
+    /// A hash of the whole proof: of [`StarkProof::elements`].
+    pub fn digest(&self) -> Hash {
+        crate::hash::sponge(crate::hash::domain::PROOF, &[], &[&self.elements()])
+    }
+
+    /// Size in bytes as 4-byte field elements (the encoding hashed by
+    /// [`StarkProof::digest`]).
+    pub fn size(&self) -> usize {
+        4 * self.elements().len()
+    }
+
+    /// [`StarkProof::elements`] as little-endian canonical `u32`s.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.elements()
+            .iter()
+            .flat_map(|x| x.as_u32().to_le_bytes())
+            .collect()
+    }
+
+    /// Parses [`StarkProof::to_bytes`] output. `None` unless it is a whole
+    /// number of canonical elements forming a well-formed proof.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if !bytes.len().is_multiple_of(4) {
+            return None;
+        }
+        let elements = bytes
+            .chunks_exact(4)
+            .map(|c| {
+                let v = u32::from_le_bytes(c.try_into().expect("4 bytes"));
+                (v < crate::babybear::P).then(|| BabyBear::new(v))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Self::from_elements(&elements)
+    }
+
+    /// Parses [`StarkProof::elements`] output. `None` if it is malformed
+    /// or has elements left over.
+    pub fn from_elements(d: &[BabyBear]) -> Option<Self> {
+        struct Reader<'a>(&'a [BabyBear]);
+        impl Reader<'_> {
+            fn one(&mut self) -> Option<BabyBear> {
+                let (&x, rest) = self.0.split_first()?;
+                self.0 = rest;
+                Some(x)
+            }
+            /// A length, which can't exceed the elements left.
+            fn len(&mut self) -> Option<usize> {
+                let n = self.one()?.as_u32() as usize;
+                (n <= self.0.len()).then_some(n)
+            }
+            fn hash(&mut self) -> Option<Hash> {
+                let mut h = [BabyBear::ZERO; crate::hash::HASH_LEN];
+                for x in &mut h {
+                    *x = self.one()?;
+                }
+                Some(h)
+            }
+            fn base(&mut self) -> Option<Vec<BabyBear>> {
+                let n = self.len()?;
+                (0..n).map(|_| self.one()).collect()
+            }
+            fn ext(&mut self) -> Option<Vec<BabyBear4>> {
+                let n = self.len()?;
+                (0..n)
+                    .map(|_| Some(BabyBear4([self.one()?, self.one()?, self.one()?, self.one()?])))
+                    .collect()
+            }
+            fn path(&mut self) -> Option<MerklePath> {
+                let n = self.len()?;
+                (0..n).map(|_| self.hash()).collect()
+            }
+        }
+        let mut r = Reader(d);
+        let log_n = r.one()?.as_u32();
+        let trace_commitment = r.hash()?;
+        let aux_commitment = match r.one()?.as_u32() {
+            0 => None,
+            1 => Some(r.hash()?),
+            _ => return None,
+        };
+        let quotient_commitment = r.hash()?;
+        let trace_at_zeta = r.ext()?;
+        let trace_at_next = r.ext()?;
+        let preprocessed_at_zeta = r.ext()?;
+        let preprocessed_at_next = r.ext()?;
+        let aux_at_zeta = r.ext()?;
+        let aux_at_next = r.ext()?;
+        let quotient_at_zeta = r.ext()?;
+        let commitments = r.path()?;
+        let final_poly = r.ext()?;
+        let pow_witness = r.one()?;
+        let n = r.len()?;
+        let mut queries = Vec::with_capacity(n);
+        for _ in 0..n {
+            let m = r.len()?;
+            let mut layers = Vec::with_capacity(m);
+            for _ in 0..m {
+                layers.push(fri::LayerOpening {
+                    values: r.ext()?,
+                    path: r.path()?,
+                });
+            }
+            queries.push(fri::QueryProof { layers });
+        }
+        let n = r.len()?;
+        let mut openings = Vec::with_capacity(n);
+        for _ in 0..n {
+            openings.push(QueryOpening {
+                trace_row: r.base()?,
+                trace_path: r.path()?,
+                preprocessed_row: r.base()?,
+                preprocessed_path: r.path()?,
+                aux_row: r.base()?,
+                aux_path: r.path()?,
+                quotient_row: r.base()?,
+                quotient_path: r.path()?,
+            });
+        }
+        if !r.0.is_empty() {
+            return None;
+        }
+        Some(Self {
+            log_n,
+            trace_commitment,
+            aux_commitment,
+            quotient_commitment,
+            trace_at_zeta,
+            trace_at_next,
+            preprocessed_at_zeta,
+            preprocessed_at_next,
+            aux_at_zeta,
+            aux_at_next,
+            quotient_at_zeta,
+            fri: FriProof {
+                commitments,
+                final_poly,
+                pow_witness,
+                queries,
+            },
+            openings,
+        })
+    }
+
+    /// The whole proof as field elements, every vector prefixed by its
+    /// length.
+    pub fn elements(&self) -> Vec<BabyBear> {
+        let mut d = Vec::new();
+        let len = |d: &mut Vec<BabyBear>, n: usize| d.push(BabyBear::new(n as u32));
+        let base = |d: &mut Vec<BabyBear>, xs: &[BabyBear]| {
+            len(d, xs.len());
+            d.extend_from_slice(xs);
+        };
+        let ext = |d: &mut Vec<BabyBear>, xs: &[BabyBear4]| {
+            len(d, xs.len());
+            d.extend(xs.iter().flat_map(|x| x.0));
+        };
+        let path = |d: &mut Vec<BabyBear>, p: &[Hash]| {
+            len(d, p.len());
+            d.extend(p.iter().flatten());
+        };
+        len(&mut d, self.log_n as usize);
+        d.extend(self.trace_commitment);
+        match &self.aux_commitment {
+            Some(h) => {
+                len(&mut d, 1);
+                d.extend(h);
+            }
+            None => len(&mut d, 0),
+        }
+        d.extend(self.quotient_commitment);
+        for xs in [
+            &self.trace_at_zeta,
+            &self.trace_at_next,
+            &self.preprocessed_at_zeta,
+            &self.preprocessed_at_next,
+            &self.aux_at_zeta,
+            &self.aux_at_next,
+            &self.quotient_at_zeta,
+        ] {
+            ext(&mut d, xs);
+        }
+        path(&mut d, &self.fri.commitments);
+        ext(&mut d, &self.fri.final_poly);
+        d.push(self.fri.pow_witness);
+        len(&mut d, self.fri.queries.len());
+        for q in &self.fri.queries {
+            len(&mut d, q.layers.len());
+            for l in &q.layers {
+                ext(&mut d, &l.values);
+                path(&mut d, &l.path);
+            }
+        }
+        len(&mut d, self.openings.len());
+        for o in &self.openings {
+            for (row, p) in [
+                (&o.trace_row, &o.trace_path),
+                (&o.preprocessed_row, &o.preprocessed_path),
+                (&o.aux_row, &o.aux_path),
+                (&o.quotient_row, &o.quotient_path),
+            ] {
+                base(&mut d, row);
+                path(&mut d, p);
+            }
+        }
+        d
+    }
+
     /// An all-zero proof with the shape of a proof for `air` at height
     /// `2^log_n`: enough to lay out a verifier circuit, which depends only
     /// on the shape. It does not verify.
@@ -1393,6 +1600,30 @@ mod tests {
         let proof = prove(&params(), &air, trace, &public);
         assert_eq!(proof.preprocessed_at_zeta.len(), 1);
         assert_eq!(verify(&params(), &air, &public, &proof), Ok(()));
+    }
+
+    #[test]
+    fn bytes_round_trip() {
+        let air = Selected {
+            pattern: ALTERNATING,
+            n: 64,
+        };
+        let public = [BabyBear::new(5)];
+        let proof = prove(&params(), &air, selected_trace(&air), &public);
+        let bytes = proof.to_bytes();
+        assert_eq!(bytes.len(), proof.size());
+        let back = StarkProof::from_bytes(&bytes).unwrap();
+        assert_eq!(back.elements(), proof.elements());
+        assert_eq!(verify(&params(), &air, &public, &back), Ok(()));
+        // Truncated, extended, or with a non-canonical element.
+        assert!(StarkProof::from_bytes(&bytes[..bytes.len() - 4]).is_none());
+        let mut long = bytes.clone();
+        long.extend([0; 4]);
+        assert!(StarkProof::from_bytes(&long).is_none());
+        let mut bad = bytes.clone();
+        bad[4..8].copy_from_slice(&crate::babybear::P.to_le_bytes());
+        assert!(StarkProof::from_bytes(&bad).is_none());
+        assert!(StarkProof::from_bytes(&bytes[..3]).is_none());
     }
 
     #[test]

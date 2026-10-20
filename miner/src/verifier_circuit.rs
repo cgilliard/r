@@ -25,7 +25,7 @@ use crate::poseidon2::WIDTH;
 use crate::stark::{Layout, SHIFT, StarkProof, VerifyingKey};
 use crate::symbolic::{Input, Node, Program};
 
-type HashCells = [Cell; HASH_LEN];
+pub(crate) type HashCells = [Cell; HASH_LEN];
 const RATE: usize = HASH_LEN;
 
 /// One FRI query's openings, as cells.
@@ -201,7 +201,7 @@ impl Transcript {
 /// The 31 bits of `x`'s canonical value: `x = sum b_i 2^i` with the integer
 /// below `p = 15 * 2^27 + 1`, i.e. top four bits `t <= 15` (automatic) and
 /// `t = 15 => ` the low 27 bits are zero.
-fn canonical_bits(c: &mut Circuit, x: Cell) -> Vec<Cell> {
+pub(crate) fn canonical_bits(c: &mut Circuit, x: Cell) -> Vec<Cell> {
     let bits = c.bits(x, 31);
     let weighted = |c: &mut Circuit, bits: &[Cell]| {
         let mut acc = c.zero();
@@ -228,7 +228,7 @@ fn canonical_bits(c: &mut Circuit, x: Cell) -> Vec<Cell> {
 
 /// A running dot product `acc = sum gamma^j v_j` over absorbed values, with
 /// `pow` the next power.
-struct DotState {
+pub(crate) struct DotState {
     acc: ExtCell,
     pow: ExtCell,
     gamma: ExtCell,
@@ -238,7 +238,7 @@ struct DotState {
 /// per 8 elements, the first from the initial state. With `dot`, each
 /// block's values are also added to the running dot product, right after
 /// the block (so the two can share a row).
-fn sponge(c: &mut Circuit, dom: u32, elems: &[Cell], mut dot: Option<&mut DotState>) -> HashCells {
+pub(crate) fn sponge(c: &mut Circuit, dom: u32, elems: &[Cell], mut dot: Option<&mut DotState>) -> HashCells {
     let zero = c.zero();
     let mut state = [zero; WIDTH];
     state[DOMAIN_SLOT] = c.constant(BabyBear::new(dom));
@@ -256,7 +256,7 @@ fn sponge(c: &mut Circuit, dom: u32, elems: &[Cell], mut dot: Option<&mut DotSta
 }
 
 /// Checks `row` sits at the index given by `bits` under `root`.
-fn verify_path(
+pub(crate) fn verify_path(
     c: &mut Circuit,
     root: &HashCells,
     row: &[Cell],

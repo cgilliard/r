@@ -1,7 +1,7 @@
 //! The validity sub-block circuit: proves one transaction with up to
 //! `inputs` inputs and `outputs` outputs, revealing only multiset
-//! fingerprints of its input commitments and output records, plus its fee
-//! and mint.
+//! fingerprints of its input commitments and output records, plus its net
+//! value `sum(outputs) - sum(inputs)`.
 //!
 //! Rows (each one Poseidon2 permutation plus auxiliary columns; preprocessed
 //! selectors give each row its role):
@@ -11,7 +11,9 @@
 //!   region's root and parameter), `C1..C3` (the commitment) and `D` (absorb
 //!   the commitment into the digest sponge);
 //! - output slot: `C1..C3` with range-checked amount limbs, and `D`;
-//! - a final row checking the balance, digest, counts and fingerprints.
+//! - a final row checking the net value, digest, counts and fingerprints,
+//!   and hashing the digest with a random blinding into the transaction
+//!   hash.
 //!
 //! Each slot has an active flag, constant within the slot; active slots are
 //! a prefix, inputs then outputs, in transaction order. Inactive slots add
@@ -21,14 +23,22 @@
 //!
 //! The digest is `sponge(TX_BODY, [n_in, n_out], commitments)`, as
 //! [`TxBody::digest`]; every WOTS region checks its signature against it.
-//! A transaction with no inputs is a block reward: it mints `sum(outputs)`
-//! and pays no fee. Otherwise `sum(inputs) - sum(outputs) = fee >= 0` and
-//! nothing is minted.
+//! Transactions have no balance rule of their own: the net value may be
+//! negative (an implicit fee) or positive (a block reward is a transaction
+//! with outputs and no inputs). Only the block's total is constrained, to
+//! the subsidy ([`crate::block`]). The net value is published as
+//! [`output::net_limbs`]: the 16-bit limbs of `2^95 + net`.
 //!
-//! Public values: `lambda (4) | r (4) | P_in (4) | P_out (4) | fee (4) |
-//! mint (4)`, with `P_in = prod (r - sum_j lambda^j C_j)` over active input
-//! commitments and `P_out` likewise over output commitments followed by
-//! their nonce limbs (see [`input_element`], [`output_element`]).
+//! Public values: `lambda (4) | r (4) | P_in (4) | P_out (4) | net (6) |
+//! tx hash (8)`, with `P_in = prod (r - sum_j lambda^j C_j)` over active
+//! input commitments and `P_out` likewise over output commitments (see
+//! [`element`]).
+//!
+//! The transaction hash ([`tx_hash`]) is `Poseidon2(digest || blinding)`
+//! truncated to 8 elements. It commits to every commitment the sub-block
+//! fingerprints, so the block's challenges can be derived after the
+//! transactions are fixed, and the random blinding keeps it from revealing
+//! which published commitments belong to one transaction.
 //!
 //! [`TxBody::digest`]: crate::transaction::TxBody::digest
 
@@ -37,7 +47,7 @@ use crate::babybear::BabyBear;
 use crate::babybear4::BabyBear4;
 use crate::hash::{self, HASH_LEN, Hash, domain};
 use crate::matrix::RowMajorMatrix;
-use crate::output::{self, AMOUNT_LIMBS, Commitment, NONCE_LIMBS, Nonce, OutputRecord};
+use crate::output::{self, AMOUNT_LIMBS, Commitment, NET_LIMBS, NET_OFFSET, NONCE_LIMBS, Nonce};
 use crate::poseidon2::WIDTH;
 use crate::poseidon2_air::{self, OUTPUT_OFFSET};
 use crate::rng::Rng;
@@ -69,11 +79,10 @@ const CNT_IN: usize = POUT + 4;
 const CNT_OUT: usize = CNT_IN + 1;
 const NIN: usize = CNT_OUT + 1;
 const NOUT: usize = NIN + 1;
-/// Output amount bits on `C2_OUT` rows; fee-or-mint bits on the final row.
+/// Output amount bits on `C2_OUT` rows; net value bits on the final row.
 const BITS: usize = NOUT + 1;
-const CB: usize = BITS + AMOUNT_LIMBS * LIMB_BITS;
-const ZINV: usize = CB + (AMOUNT_LIMBS - 1) * CARRY_BITS;
-const INV2: usize = ZINV + 1;
+const CB: usize = BITS + NET_LIMBS * LIMB_BITS;
+const INV2: usize = CB + (NET_LIMBS - 1) * CARRY_BITS;
 pub const NUM_COLS: usize = INV2 + 1;
 
 // Preprocessed columns after the WOTS region's.
@@ -96,7 +105,11 @@ const NEXT_OUT_SLOT: usize = PW + 12;
 pub const PRE_WIDTH: usize = PW + 13;
 
 /// Number of public values.
-pub const PUBLIC_LEN: usize = 24;
+pub const PUBLIC_LEN: usize = TX_HASH + HASH_LEN;
+/// Where the net value starts in the public values.
+pub const NET: usize = 16;
+/// Where the transaction hash starts in the public values.
+pub const TX_HASH: usize = NET + NET_LIMBS;
 
 /// A sub-block's capacity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,18 +147,19 @@ fn fingerprint(lambda: BabyBear4, xs: impl IntoIterator<Item = BabyBear>) -> Bab
     acc
 }
 
-/// The multiset element of an input commitment.
-pub fn input_element(lambda: BabyBear4, c: &Commitment) -> Option<BabyBear4> {
+/// The multiset element of a commitment (spent or created).
+pub fn element(lambda: BabyBear4, c: &Commitment) -> Option<BabyBear4> {
     Some(fingerprint(lambda, c.to_field()?))
 }
 
-/// The multiset element of an output record: commitment then nonce limbs.
-pub fn output_element(lambda: BabyBear4, record: &OutputRecord) -> Option<BabyBear4> {
-    let c = record.commitment.to_field()?;
-    Some(fingerprint(
-        lambda,
-        c.into_iter().chain(output::nonce_limbs(&record.nonce)),
-    ))
+/// A transaction's hash for a sub-block: `Poseidon2(digest || blinding)`,
+/// truncated.
+pub fn tx_hash(digest: &Hash, blinding: &Hash) -> Hash {
+    let mut s = [BabyBear::ZERO; WIDTH];
+    s[..HASH_LEN].copy_from_slice(digest);
+    s[HASH_LEN..].copy_from_slice(blinding);
+    crate::poseidon2::permute(&mut s);
+    core::array::from_fn(|j| s[j])
 }
 
 /// `prod (r - e)` over `elements`.
@@ -287,7 +301,7 @@ impl Air for SubBlockAir {
 
         // Output amounts are 16-bit limbs (and the final row's bits are bits).
         let bits_rows = p[C2_OUT] + p[FINAL];
-        for b in 0..AMOUNT_LIMBS * LIMB_BITS {
+        for b in 0..NET_LIMBS * LIMB_BITS {
             c.assert_zero(bits_rows * l[BITS + b] * (l[BITS + b] - BabyBear::ONE));
         }
         for j in 0..AMOUNT_LIMBS {
@@ -304,7 +318,7 @@ impl Air for SubBlockAir {
 
         // Fingerprints at C3 rows: next = current * (r - element), if active.
         let commitment: [V; HASH_LEN] = core::array::from_fn(out);
-        let mut powers = [[zero; 4]; HASH_LEN + NONCE_LIMBS];
+        let mut powers = [[zero; 4]; HASH_LEN];
         powers[0][0] = k(1);
         for j in 1..powers.len() {
             powers[j] = ext_mul(powers[j - 1], lambda);
@@ -320,14 +334,8 @@ impl Air for SubBlockAir {
                 one - act * one + act * (r[b] - e[b])
             })
         };
-        let e_in = element(&mut commitment.iter().copied());
-        let e_out = element(
-            &mut commitment
-                .iter()
-                .copied()
-                .chain(l[NONCE..NONCE + NONCE_LIMBS].iter().copied()),
-        );
-        for (sel, col, e) in [(p[C3_IN], PIN, e_in), (p[C3_OUT], POUT, e_out)] {
+        let e = element(&mut commitment.iter().copied());
+        for (sel, col) in [(p[C3_IN], PIN), (p[C3_OUT], POUT)] {
             let next = ext_mul(ext(col, l), factor(e));
             for b in 0..4 {
                 c.assert_zero(sel * (n[col + b] - next[b]));
@@ -388,25 +396,28 @@ impl Air for SubBlockAir {
             c.assert_zero(fin * (l[PIN + b] - public[8 + b]));
             c.assert_zero(fin * (l[POUT + b] - public[12 + b]));
         }
-        // z = [n_in == 0]: a reward mints, anything else pays a fee.
-        let z = k(1) - l[NIN] * l[ZINV];
-        c.assert_zero(fin * l[NIN] * z);
-        for b in 0..(AMOUNT_LIMBS - 1) * CARRY_BITS {
+        // Net value: limbs x of 2^95 - sum_j SUM_j 2^(16 j), with carries.
+        for b in 0..(NET_LIMBS - 1) * CARRY_BITS {
             c.assert_zero(fin * l[CB + b] * (l[CB + b] - BabyBear::ONE));
         }
         let carry = |j: usize| limb(CB + j * CARRY_BITS, CARRY_BITS) - k(CARRY_OFFSET);
-        let sign = k(1) - z * BabyBear::new(2);
-        for j in 0..AMOUNT_LIMBS {
+        for j in 0..NET_LIMBS {
             let x = limb(BITS + j * LIMB_BITS, LIMB_BITS);
+            let sum = if j < AMOUNT_LIMBS { l[SUM + j] } else { zero };
+            let offset = k((NET_OFFSET >> (LIMB_BITS * j)) as u16 as u32);
             let carry_in = if j == 0 { zero } else { carry(j - 1) };
-            let carry_out = if j + 1 < AMOUNT_LIMBS { carry(j) } else { zero };
+            let carry_out = if j + 1 < NET_LIMBS { carry(j) } else { zero };
             c.assert_zero(
-                fin * (sign * l[SUM + j] + carry_in
-                    - x
-                    - carry_out * BabyBear::new(1 << LIMB_BITS)),
+                fin * (offset - sum + carry_in - x - carry_out * BabyBear::new(1 << LIMB_BITS)),
             );
-            c.assert_zero(fin * (public[16 + j] - (k(1) - z) * x));
-            c.assert_zero(fin * (public[20 + j] - z * x));
+            c.assert_zero(fin * (public[NET + j] - x));
+        }
+
+        // Transaction hash: the final row permutes digest || blinding (the
+        // blinding is free).
+        for j in 0..HASH_LEN {
+            c.assert_zero(fin * (l[j] - l[wots_air::MSG + j]));
+            c.assert_zero(fin * (public[TX_HASH + j] - out(j)));
         }
     }
 }
@@ -477,6 +488,7 @@ impl SubBlockAir {
     pub fn trace(
         &self,
         tx: &Transaction,
+        blinding: &Hash,
         lambda: BabyBear4,
         r: BabyBear4,
         rng: &mut Rng,
@@ -512,12 +524,13 @@ impl SubBlockAir {
                 },
             })
             .collect::<Vec<_>>();
-        self.trace_from(&msg, &ins, &outs, lambda, r)
+        self.trace_from(&msg, blinding, &ins, &outs, lambda, r)
     }
 
     fn trace_from(
         &self,
         msg: &Hash,
+        blinding: &Hash,
         ins: &[InSlot],
         outs: &[OutSlot],
         lambda: BabyBear4,
@@ -539,7 +552,7 @@ impl SubBlockAir {
             cnt_in: 0,
             cnt_out: 0,
         };
-        let powers: Vec<BabyBear4> = (0..HASH_LEN + NONCE_LIMBS)
+        let powers: Vec<BabyBear4> = (0..HASH_LEN)
             .scan(BabyBear4::ONE, |pw, _| {
                 let v = *pw;
                 *pw *= lambda;
@@ -597,12 +610,9 @@ impl SubBlockAir {
             st.write(m.row_mut(row + 2));
             let commitment: Hash = core::array::from_fn(|j| out3[j]);
             if active {
-                let xs = commitment.iter().copied().chain(if is_input {
-                    Vec::new()
-                } else {
-                    nonce.to_vec()
-                });
-                let e = xs
+                let e = commitment
+                    .iter()
+                    .copied()
                     .zip(&powers)
                     .fold(BabyBear4::ZERO, |acc, (x, &pw)| acc + pw * x);
                 let p = if is_input { &mut st.pin } else { &mut st.pout };
@@ -673,28 +683,27 @@ impl SubBlockAir {
             }
         }
 
-        // Final row: fee or mint, with carries.
+        // Final row: the net value, with carries.
         let fin = self.final_row();
-        let reward = nin == 0;
-        let value: i128 = st
+        let net: i128 = -st
             .sum
             .iter()
             .enumerate()
             .map(|(j, &s)| (s as i128) << (LIMB_BITS * j))
-            .sum::<i128>()
-            * if reward { -1 } else { 1 };
-        let x = output::amount_limbs(value.clamp(0, u64::MAX as i128) as u64);
+            .sum::<i128>();
+        let x = output::net_limbs(net);
         {
             let row = m.row_mut(fin);
             let mut carry = 0i64;
-            for j in 0..AMOUNT_LIMBS {
+            for j in 0..NET_LIMBS {
                 let xv = x[j].as_u32();
                 for b in 0..LIMB_BITS {
                     row[BITS + j * LIMB_BITS + b] = BabyBear::new((xv >> b) & 1);
                 }
-                if j + 1 < AMOUNT_LIMBS {
-                    let s = if reward { -st.sum[j] } else { st.sum[j] };
-                    carry = (s + carry - xv as i64).div_euclid(1 << LIMB_BITS);
+                if j + 1 < NET_LIMBS {
+                    let sum = if j < AMOUNT_LIMBS { st.sum[j] } else { 0 };
+                    let offset = (NET_OFFSET >> (LIMB_BITS * j)) as u16 as i64;
+                    carry = (offset - sum + carry - xv as i64).div_euclid(1 << LIMB_BITS);
                     let biased =
                         (carry + CARRY_OFFSET as i64).clamp(0, (1 << CARRY_BITS) - 1) as u32;
                     for b in 0..CARRY_BITS {
@@ -702,7 +711,6 @@ impl SubBlockAir {
                     }
                 }
             }
-            row[ZINV] = BabyBear::new(nin).inverse().unwrap_or(BabyBear::ZERO);
             row[INV2] = BabyBear::new(nin + nout)
                 .inverse()
                 .unwrap_or(BabyBear::ZERO);
@@ -713,7 +721,10 @@ impl SubBlockAir {
                 poseidon2_air::generate([BabyBear::ZERO; WIDTH], m.row_mut(r));
             }
         }
-        poseidon2_air::generate([BabyBear::ZERO; WIDTH], m.row_mut(fin));
+        let mut input = [BabyBear::ZERO; WIDTH];
+        input[..HASH_LEN].copy_from_slice(msg);
+        input[HASH_LEN..].copy_from_slice(blinding);
+        let hashed = poseidon2_air::generate(input, m.row_mut(fin));
         for r in 0..m.height() {
             let row = m.row_mut(r);
             row[wots_air::MSG..wots_air::MSG + HASH_LEN].copy_from_slice(msg);
@@ -721,18 +732,12 @@ impl SubBlockAir {
             row[NOUT] = BabyBear::new(nout);
         }
 
-        let zero_limbs = [BabyBear::ZERO; AMOUNT_LIMBS];
-        let (fee, mint) = if reward {
-            (zero_limbs, x)
-        } else {
-            (x, zero_limbs)
-        };
         let mut public = Vec::with_capacity(PUBLIC_LEN);
         for v in [lambda, r, st.pin, st.pout] {
             public.extend_from_slice(&v.0);
         }
-        public.extend_from_slice(&fee);
-        public.extend_from_slice(&mint);
+        public.extend_from_slice(&x);
+        public.extend_from_slice(&hashed[..HASH_LEN]);
         (m, public)
     }
 }
@@ -764,6 +769,7 @@ mod tests {
 
     const LAMBDA: BabyBear4 = BabyBear4::new([3, 5, 7, 11]);
     const R: BabyBear4 = BabyBear4::new([13, 17, 19, 23]);
+    const BLINDING: Hash = BabyBear::new_array([29, 31, 37, 41, 43, 47, 53, 59]);
 
     fn key(n: u32) -> (SecretKey, PublicKey) {
         keygen(BabyBear::new_array(core::array::from_fn(|i| {
@@ -808,20 +814,20 @@ mod tests {
             tx.body
                 .inputs
                 .iter()
-                .map(|i| input_element(LAMBDA, &i.commitment).unwrap()),
+                .map(|i| element(LAMBDA, &i.commitment).unwrap()),
         );
         let p_out = product(
             R,
             tx.body
                 .outputs
                 .iter()
-                .map(|o| output_element(LAMBDA, &o.record().unwrap()).unwrap()),
+                .map(|o| element(LAMBDA, &o.commitment().unwrap()).unwrap()),
         );
         (p_in, p_out)
     }
 
     fn check(air: &SubBlockAir, tx: &Transaction) -> (Result<(), usize>, Vec<BabyBear>) {
-        let (t, public) = air.trace(tx, LAMBDA, R, &mut Rng::from_seed(1));
+        let (t, public) = air.trace(tx, &BLINDING, LAMBDA, R, &mut Rng::from_seed(1));
         (check_constraints(air, &t, &public), public)
     }
 
@@ -845,8 +851,21 @@ mod tests {
         let (p_in, p_out) = expected(&t);
         assert_eq!(ext_at(&public, 8), p_in);
         assert_eq!(ext_at(&public, 12), p_out);
-        assert_eq!(&public[16..20], &output::amount_limbs(4469));
-        assert_eq!(&public[20..24], &output::amount_limbs(0));
+        assert_eq!(&public[16..22], &output::net_limbs(-4469));
+    }
+
+    #[test]
+    fn tx_hash_is_the_blinded_digest() {
+        let t = tx(vec![input(1, 100)], vec![out(1, 90)]);
+        let air = SubBlockAir {
+            inputs: 1,
+            outputs: 2,
+        };
+        let (result, public) = check(&air, &t);
+        assert_eq!(result, Ok(()));
+        let digest = t.body.digest().unwrap();
+        assert_eq!(&public[TX_HASH..], &tx_hash(&digest, &BLINDING));
+        assert_ne!(tx_hash(&digest, &BLINDING), tx_hash(&digest, &[BabyBear::ONE; HASH_LEN]));
     }
 
     #[test]
@@ -860,11 +879,11 @@ mod tests {
         let (result, public) = check(&air, &t);
         assert_eq!(result, Ok(()));
         assert_eq!(ext_at(&public, 8), expected(&t).0);
-        assert_eq!(&public[16..20], &output::amount_limbs(100));
+        assert_eq!(&public[16..22], &output::net_limbs(-100));
     }
 
     #[test]
-    fn reward_mints_and_pays_no_fee() {
+    fn reward_has_positive_net() {
         let t = tx(vec![], vec![out(1, 50), out(2, u64::MAX - 50)]);
         let air = SubBlockAir {
             inputs: 1,
@@ -873,18 +892,38 @@ mod tests {
         let (result, public) = check(&air, &t);
         assert_eq!(result, Ok(()));
         assert_eq!(ext_at(&public, 8), BabyBear4::ONE);
-        assert_eq!(&public[16..20], &output::amount_limbs(0));
-        assert_eq!(&public[20..24], &output::amount_limbs(u64::MAX));
+        assert_eq!(&public[16..22], &output::net_limbs(u64::MAX as i128));
     }
 
     #[test]
-    fn rejects_overspend() {
+    fn outputs_may_exceed_inputs() {
+        // Only the block's total is constrained.
         let t = tx(vec![input(1, 100)], vec![out(1, 101)]);
         let air = SubBlockAir {
             inputs: 1,
             outputs: 1,
         };
-        assert!(check(&air, &t).0.is_err());
+        let (result, public) = check(&air, &t);
+        assert_eq!(result, Ok(()));
+        assert_eq!(&public[16..22], &output::net_limbs(1));
+    }
+
+    #[test]
+    fn extreme_nets() {
+        // Sixteen maximal inputs, and sixteen maximal outputs.
+        let max = u64::MAX;
+        let air = SubBlockAir {
+            inputs: 16,
+            outputs: 16,
+        };
+        let t = tx((1..=16).map(|n| input(n, max)).collect(), vec![out(1, 0)]);
+        let (result, public) = check(&air, &t);
+        assert_eq!(result, Ok(()));
+        assert_eq!(&public[16..22], &output::net_limbs(-16 * max as i128));
+        let t = tx(vec![], (1..=16).map(|n| out(n, max)).collect());
+        let (result, public) = check(&air, &t);
+        assert_eq!(result, Ok(()));
+        assert_eq!(&public[16..22], &output::net_limbs(16 * max as i128));
     }
 
     #[test]
@@ -905,9 +944,9 @@ mod tests {
             inputs: 1,
             outputs: 2,
         };
-        let (trace, public) = air.trace(&t, LAMBDA, R, &mut Rng::from_seed(1));
-        // P_in, P_out, fee, and a mint on a non-reward transaction.
-        for at in [8, 13, 16, 20] {
+        let (trace, public) = air.trace(&t, &BLINDING, LAMBDA, R, &mut Rng::from_seed(1));
+        // P_in, P_out, the net value's low and high limbs, the tx hash.
+        for at in [8, 13, 16, 21, TX_HASH, TX_HASH + 7] {
             let mut bad = public.clone();
             bad[at] += BabyBear::ONE;
             assert!(
@@ -926,7 +965,7 @@ mod tests {
             inputs: 1,
             outputs: 2,
         };
-        let (mut trace, public) = air.trace(&t, LAMBDA, R, &mut Rng::from_seed(1));
+        let (mut trace, public) = air.trace(&t, &BLINDING, LAMBDA, R, &mut Rng::from_seed(1));
         let base = air.output_base(1);
         for r in base..base + OUT_ROWS {
             trace.row_mut(r)[ACT] = BabyBear::ZERO;
@@ -971,7 +1010,7 @@ mod tests {
             nonce,
             active: true,
         }];
-        let (trace, public) = air.trace_from(&msg, &ins, &outs, LAMBDA, R);
+        let (trace, public) = air.trace_from(&msg, &BLINDING, &ins, &outs, LAMBDA, R);
         let err = check_constraints(&air, &trace, &public).unwrap_err();
         assert_eq!(err, air.output_base(0) + 1, "fails at the output's C2 row");
     }
@@ -988,7 +1027,7 @@ mod tests {
             inputs: 1,
             outputs: 2,
         };
-        let (trace, public) = air.trace(&t, LAMBDA, R, &mut Rng::from_seed(1));
+        let (trace, public) = air.trace(&t, &BLINDING, LAMBDA, R, &mut Rng::from_seed(1));
         let (pk, vk) = stark::setup(&params, &air);
         let proof = stark::prove(&params, &pk, &air, trace, &public);
         assert_eq!(stark::verify(&params, &vk, &air, &public, &proof), Ok(()));

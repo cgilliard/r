@@ -99,6 +99,31 @@ pub fn amount_limbs(amount: Amount) -> [BabyBear; AMOUNT_LIMBS] {
     core::array::from_fn(|i| BabyBear::new((amount >> (LIMB_BITS as usize * i)) as u16 as u32))
 }
 
+/// Limbs of a net value (see [`net_limbs`]).
+pub const NET_LIMBS: usize = 6;
+/// The offset making net values non-negative: `2^95`.
+pub const NET_OFFSET: u128 = 1 << 95;
+
+/// A net value `sum(outputs) - sum(inputs)`, which may be negative, as the
+/// 16-bit limbs of `NET_OFFSET + net`, least significant first.
+///
+/// # Panics
+/// If `|net| >= 2^95`.
+pub fn net_limbs(net: i128) -> [BabyBear; NET_LIMBS] {
+    assert!(net.unsigned_abs() < NET_OFFSET, "net value out of range");
+    let v = (NET_OFFSET as i128 + net) as u128;
+    core::array::from_fn(|i| BabyBear::new((v >> (LIMB_BITS as usize * i)) as u16 as u32))
+}
+
+/// Inverse of [`net_limbs`] for canonical limbs.
+pub fn net_value(limbs: &[BabyBear]) -> i128 {
+    let v = limbs
+        .iter()
+        .enumerate()
+        .fold(0u128, |acc, (i, x)| acc | (x.as_u32() as u128) << (LIMB_BITS as usize * i));
+    v as i128 - NET_OFFSET as i128
+}
+
 /// `nonce` as 16-bit limbs: byte pairs, little-endian.
 pub fn nonce_limbs(nonce: &Nonce) -> [BabyBear; NONCE_LIMBS] {
     core::array::from_fn(|i| {

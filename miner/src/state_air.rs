@@ -44,7 +44,7 @@ use crate::babybear::{BabyBear, P};
 use crate::babybear4::BabyBear4;
 use crate::hash::{HASH_LEN, Hash, domain};
 use crate::matrix::RowMajorMatrix;
-use crate::output::{self, Commitment, NONCE_LIMBS, OutputRecord};
+use crate::output::Commitment;
 use crate::poseidon2::WIDTH;
 use crate::poseidon2_air::{self, OUTPUT_OFFSET};
 use crate::state::{self, DEPTH, InsertProof, Leaf, SpendProof, State, key_of};
@@ -73,8 +73,7 @@ const PSP: usize = PINS + 4;
 // Per operation, constant across its rows.
 const ACT: usize = PSP + 4;
 const KEY: usize = ACT + 1;
-const NONCE: usize = KEY + HASH_LEN;
-const LK: usize = NONCE + NONCE_LIMBS;
+const LK: usize = KEY + HASH_LEN;
 const LNK: usize = LK + HASH_LEN;
 const LNI_LO: usize = LNK + HASH_LEN;
 const LNI_HI: usize = LNI_LO + 1;
@@ -513,9 +512,9 @@ impl Air for StateSegmentAir {
                 c.assert_zero_transition((one - end) * (n[prev + j] - l[prev + j]));
             }
         }
-        // Fingerprints: inserted records (key then nonce limbs), spent keys.
+        // Fingerprints: inserted and spent keys.
         let (lambda, r) = (pub4(public::LAMBDA), pub4(public::R));
-        let mut powers = [[zero; 4]; HASH_LEN + NONCE_LIMBS];
+        let mut powers = [[zero; 4]; HASH_LEN];
         powers[0][0] = one;
         for j in 1..powers.len() {
             powers[j] = ext_mul(powers[j - 1], lambda);
@@ -531,9 +530,8 @@ impl Air for StateSegmentAir {
                 unit - act * unit + act * (r[b] - e[b])
             })
         };
-        let e_ins = element(&mut (KEY..KEY + HASH_LEN + NONCE_LIMBS).map(|col| l[col]));
-        let e_sp = element(&mut (KEY..KEY + HASH_LEN).map(|col| l[col]));
-        for (end, col, e) in [(ei, PINS, e_ins), (es, PSP, e_sp)] {
+        let e = element(&mut (KEY..KEY + HASH_LEN).map(|col| l[col]));
+        for (end, col) in [(ei, PINS), (es, PSP)] {
             let next = ext_mul(ext(col, l), factor(e));
             for b in 0..4 {
                 c.assert_zero(end * (n[col + b] - next[b]));
@@ -573,10 +571,10 @@ fn ext8<V: Copy>(row: &[V], col: usize) -> [V; 8] {
     core::array::from_fn(|j| row[col + j])
 }
 
-/// One insert: the record being inserted and its tree proof.
+/// One insert: the commitment being inserted and its tree proof.
 #[derive(Clone, Debug)]
 pub struct InsertOp {
-    pub record: OutputRecord,
+    pub commitment: Commitment,
     pub proof: InsertProof,
 }
 
@@ -623,7 +621,7 @@ impl StateSegmentAir {
             pins: BabyBear4::ONE,
             psp: BabyBear4::ONE,
         };
-        let powers: Vec<BabyBear4> = (0..HASH_LEN + NONCE_LIMBS)
+        let powers: Vec<BabyBear4> = (0..HASH_LEN)
             .scan(BabyBear4::ONE, |pw, _| {
                 let v = *pw;
                 *pw *= lambda;
@@ -642,8 +640,7 @@ impl StateSegmentAir {
             let o = match op {
                 Some(op) => OpFields {
                     active: true,
-                    key: key_of(&op.record.commitment).expect("canonical key"),
-                    nonce: output::nonce_limbs(&op.record.nonce),
+                    key: key_of(&op.commitment).expect("canonical key"),
                     low: op.proof.low.leaf,
                     low_index: op.proof.low.index,
                     low_siblings: *op.proof.low.siblings,
@@ -714,8 +711,7 @@ impl StateSegmentAir {
                 g.root = b2;
                 g.size += 1;
                 g.prev_ins = o.key;
-                let xs: Vec<BabyBear> = o.key.iter().chain(&o.nonce).copied().collect();
-                g.pins *= r - fp(&xs);
+                g.pins *= r - fp(&o.key);
             }
         }
 
@@ -725,7 +721,6 @@ impl StateSegmentAir {
                 Some(op) => OpFields {
                     active: true,
                     key: key_of(&op.commitment).expect("canonical key"),
-                    nonce: [BabyBear::ZERO; NONCE_LIMBS],
                     low: op.proof.leaf,
                     low_index: op.proof.index,
                     low_siblings: *op.proof.siblings,
@@ -869,7 +864,6 @@ impl Globals {
 struct OpFields {
     active: bool,
     key: Hash,
-    nonce: [BabyBear; NONCE_LIMBS],
     /// Insert: the low leaf. Spend: the leaf being spent.
     low: Leaf,
     low_index: u64,
@@ -886,7 +880,6 @@ impl OpFields {
         Self {
             active: false,
             key,
-            nonce: [BabyBear::ZERO; NONCE_LIMBS],
             low: Leaf {
                 key: [BabyBear::ZERO; HASH_LEN],
                 next_key: [BabyBear::ZERO; HASH_LEN],
@@ -912,7 +905,6 @@ impl OpFields {
             let row = m.row_mut(r);
             row[ACT] = BabyBear::from(self.active);
             row[KEY..KEY + HASH_LEN].copy_from_slice(&self.key);
-            row[NONCE..NONCE + NONCE_LIMBS].copy_from_slice(&self.nonce);
             row[LK..LK + HASH_LEN].copy_from_slice(&self.low.key);
             row[LNK..LNK + HASH_LEN].copy_from_slice(&self.low.next_key);
             row[LNI_LO] = lo;
@@ -1035,10 +1027,10 @@ mod tests {
     use crate::air::check_constraints;
     use crate::db::test::TempEnv;
     use crate::fri::FriParams;
-    use crate::output::NONCE_LEN;
+    use crate::output::{self, NONCE_LEN, OutputRecord};
     use crate::stark;
     use crate::state::StateTree;
-    use crate::subblock_air::{input_element, output_element, product};
+    use crate::subblock_air::{element, product};
 
     const LAMBDA: BabyBear4 = BabyBear4::new([3, 5, 7, 11]);
     const R: BabyBear4 = BabyBear4::new([13, 17, 19, 23]);
@@ -1089,7 +1081,7 @@ mod tests {
                 .into_iter()
                 .map(|record| InsertOp {
                     proof: self.tree.insert(&mut txn, &record.commitment).unwrap(),
-                    record,
+                    commitment: record.commitment,
                 })
                 .collect();
             let sp = sorted(spends.iter().map(|&n| record(n)).collect())
@@ -1142,12 +1134,12 @@ mod tests {
         let p_ins = product(
             R,
             ins.iter()
-                .map(|o| output_element(LAMBDA, &o.record).unwrap()),
+                .map(|o| element(LAMBDA, &o.commitment).unwrap()),
         );
         let p_sp = product(
             R,
             sp.iter()
-                .map(|o| input_element(LAMBDA, &o.commitment).unwrap()),
+                .map(|o| element(LAMBDA, &o.commitment).unwrap()),
         );
         assert_eq!(&public[public::P_INS..public::P_INS + 4], &p_ins.0);
         assert_eq!(&public[public::P_SP..public::P_SP + 4], &p_sp.0);
@@ -1256,7 +1248,7 @@ mod tests {
             .into_iter()
             .map(|record| InsertOp {
                 proof: f.tree.insert(&mut txn, &record.commitment).unwrap(),
-                record,
+                commitment: record.commitment,
             })
             .collect();
         let air = StateSegmentAir {
@@ -1292,7 +1284,7 @@ mod tests {
         let low = f.tree.witness(&txn, low_index).unwrap();
         assert_eq!(low.leaf.next_key, key);
         let ins = [InsertOp {
-            record: target,
+            commitment: target.commitment,
             proof: InsertProof {
                 low,
                 new_siblings: Box::new([[BabyBear::ZERO; HASH_LEN]; DEPTH]),
