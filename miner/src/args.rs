@@ -8,14 +8,14 @@ pub const USAGE: &str = "\
 Usage: r [OPTIONS]
 
 Options:
-      --data-dir <PATH>      Directory for the database [default: data]
+      --data-dir <PATH>      Directory for the database [default: target/data]
       --dev-chain <BLOCKS>   Prove, mine and check a fresh development chain
                              of BLOCKS blocks in <PATH>/devnet (replacing
                              any previous one), logging each step
   -h, --help                 Print help
   -V, --version              Print version";
 
-pub const DEFAULT_DATA_DIR: &str = "data";
+pub const DEFAULT_DATA_DIR: &str = "target/data";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Args {
