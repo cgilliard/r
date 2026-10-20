@@ -14,7 +14,8 @@
 use std::fmt;
 
 use crate::babybear::BabyBear;
-use crate::hash::{self, HASH_LEN, Hash, domain};
+use crate::hash::{self, DOMAIN_SLOT, HASH_LEN, Hash, domain};
+use crate::poseidon2::{self, WIDTH};
 use crate::output::{self, Amount, Commitment, Nonce, Output, OutputHash};
 use crate::wots::{self, PublicKey, SecretKey, Signature};
 
@@ -27,6 +28,10 @@ pub fn pubkey_hash(pubkey: &PublicKey) -> OutputHash {
 pub struct Input {
     /// Commitment of the output being spent.
     pub commitment: Commitment,
+    /// Its slot in the state tree: what makes the spent output unique, so
+    /// a signature can't be replayed against an identical output created
+    /// later (which lands in a new slot).
+    pub position: u64,
     pub pubkey: PublicKey,
     pub amount: Amount,
     pub nonce: Nonce,
@@ -47,25 +52,57 @@ pub struct TxBody {
 }
 
 impl TxBody {
-    /// The message every input signs:
-    /// `sponge(TX_BODY, [n_in, n_out], [input commitments, output commitments])`.
-    /// Each commitment binds its amount, nonce and hash (for an input,
-    /// `H(pubkey)`), and the signature checks the pubkey itself, so this
-    /// covers every field. `None` if a commitment or output hash is not a
-    /// canonical encoding.
+    /// The message every input signs: a sponge (domain `TX_BODY`, with
+    /// `n_in, n_out` and the absorbed length in the capacity) over each
+    /// input's commitment, then its position (two limbs, zero-padded to a
+    /// block), then each output's commitment. Each commitment binds its
+    /// amount, nonce and hash (for an input, `H(pubkey)`), the position
+    /// binds which output instance is spent, and the signature checks the
+    /// pubkey itself, so this covers every field. `None` if a commitment or
+    /// output hash is not a canonical encoding.
     pub fn digest(&self) -> Option<Hash> {
-        let mut items = Vec::with_capacity(HASH_LEN * (self.inputs.len() + self.outputs.len()));
-        for input in &self.inputs {
-            items.extend(input.commitment.to_field()?);
+        let inputs = self
+            .inputs
+            .iter()
+            .map(|i| Some((i.commitment.to_field()?, i.position)))
+            .collect::<Option<Vec<_>>>()?;
+        let outputs = self
+            .outputs
+            .iter()
+            .map(|o| o.commitment()?.to_field())
+            .collect::<Option<Vec<_>>>()?;
+        Some(digest_of(&inputs, &outputs))
+    }
+}
+
+/// [`TxBody::digest`] from the inputs' commitments and positions and the
+/// outputs' commitments, as field elements.
+pub(crate) fn digest_of(inputs: &[(Hash, u64)], outputs: &[Hash]) -> Hash {
+    {
+        let (nin, nout) = (count(inputs.len()), count(outputs.len()));
+        let mut state = [BabyBear::ZERO; WIDTH];
+        state[HASH_LEN] = BabyBear::new(nin);
+        state[HASH_LEN + 1] = BabyBear::new(nout);
+        state[DOMAIN_SLOT] = BabyBear::new(domain::TX_BODY);
+        state[DOMAIN_SLOT + 1] = BabyBear::new((HASH_LEN as u32 + 2) * nin + HASH_LEN as u32 * nout);
+        let mut absorb = |block: &[BabyBear]| {
+            for (x, &v) in state.iter_mut().zip(block) {
+                *x += v;
+            }
+            poseidon2::permute(&mut state);
+        };
+        for (c, position) in inputs {
+            absorb(c);
+            let (lo, hi) = crate::state::split(*position);
+            absorb(&[lo, hi]);
         }
-        for o in &self.outputs {
-            items.extend(o.commitment()?.to_field()?);
+        for c in outputs {
+            absorb(c);
         }
-        let counts = [
-            BabyBear::new(count(self.inputs.len())),
-            BabyBear::new(count(self.outputs.len())),
-        ];
-        Some(hash::sponge(domain::TX_BODY, &counts, &[&items]))
+        if nin + nout == 0 {
+            poseidon2::permute(&mut state);
+        }
+        core::array::from_fn(|j| state[j])
     }
 }
 
@@ -213,6 +250,7 @@ mod tests {
             sk,
             Input {
                 commitment,
+                position: n as u64,
                 pubkey,
                 amount,
                 nonce,
@@ -390,6 +428,18 @@ mod tests {
         let mut swapped = body.clone();
         swapped.outputs.swap(0, 1);
         assert_ne!(swapped.digest().unwrap(), d);
+        // The spent position is signed: the same commitment elsewhere in
+        // the tree is a different message.
+        let mut moved = body.clone();
+        moved.inputs[0].position += 1 << 30;
+        assert_ne!(moved.digest().unwrap(), d);
+        let mut moved = body.clone();
+        moved.inputs[1].position += 1;
+        assert_ne!(moved.digest().unwrap(), d);
+        let t = tx();
+        let mut replayed = t.clone();
+        replayed.body.inputs[0].position = 999;
+        assert_eq!(replayed.validate(), Err(TxError::BadSignature(0)));
     }
 
     #[test]

@@ -37,7 +37,9 @@
 //! without the transactions: it names the merge key, its challenges are
 //! derived from its old and new state and its transaction hash
 //! ([`block::challenges`]), its fingerprint ratios are 1, its net value is
-//! the subsidy, and its segments start from an empty key chain.
+//! the subsidy for the block's height ([`Consensus::subsidy`], which also
+//! ends the chain at its final height), and its segments start from an
+//! empty key chain.
 //!
 //! A node fast-syncing from block `N` needs only headers `N - 1` and `N` and
 //! block `N`'s proof: [`Chain::verify_proof`] with header `N`'s `prev` and
@@ -152,15 +154,62 @@ fn assert_eq_all(c: &mut Circuit, a: &[Cell], b: &[Cell]) {
     }
 }
 
+/// The net value block `parent_height + 1` must create
+/// ([`Consensus::subsidy`]), as [`output::net_limbs`] cells; fails if that
+/// height is past the final one.
+///
+/// # Panics
+/// If the final height isn't below `2^30` (the comparisons assume so).
+fn subsidy_net(c: &mut Circuit, consensus: &Consensus, parent_height: &[Cell; 4]) -> Vec<Cell> {
+    let last = consensus.final_height();
+    assert!(last < 1 << 30, "final height too large");
+    // Heights stay below 2^30, so the top limbs are zero and the height is
+    // one field element.
+    c.assert_zero(parent_height[2]);
+    c.assert_zero(parent_height[3]);
+    let hi = c.mul_const(parent_height[1], BabyBear::new(1 << 16));
+    let h = c.add(parent_height[0], hi);
+    let n = c.add_const(h, BabyBear::ONE);
+    let n_value = c.value(n).as_u32() as u64;
+    // n <= last.
+    let k = c.constant(BabyBear::new(last as u32));
+    let left = c.sub(k, n);
+    c.bits(left, 30);
+    // first = [n <= first_era], with n on the claimed side of the boundary.
+    let first = c.hint(BabyBear::from(n_value <= consensus.first_era));
+    let ff = c.mul(first, first);
+    c.assert_eq(ff, first);
+    let era = c.constant(BabyBear::new(consensus.first_era as u32));
+    let below = c.sub(era, n);
+    let above = c.sub(n, era);
+    let above = c.add_const(above, -BabyBear::ONE);
+    let d = c.sub(below, above);
+    let picked = c.mul(first, d);
+    let gap = c.add(above, picked);
+    c.bits(gap, 30);
+    // The era's net value.
+    let a = output::net_limbs(consensus.first_subsidy as i128);
+    let b = output::net_limbs(consensus.second_subsidy as i128);
+    a.iter()
+        .zip(&b)
+        .map(|(&x, &y)| {
+            let base = c.constant(y);
+            let t = c.mul_const(first, x - y);
+            c.add(base, t)
+        })
+        .collect()
+}
+
 /// The checks on a final aggregation statement `s` that its proof can't
-/// make itself, for a transition starting at `old_root`, `old_size`.
+/// make itself, for a transition starting at `old_root`, `old_size` and
+/// creating `net` ([`output::net_limbs`] cells).
 fn check_transition(
     c: &mut Circuit,
-    consensus: &Consensus,
     merge_key: &Hash,
     s: &[Cell],
     old_root: &[Cell],
     old_size: &[Cell],
+    net: &[Cell],
 ) {
     let key = consts(c, merge_key);
     assert_eq_all(c, &s[ast::VK..ast::VK + HASH_LEN], &key);
@@ -185,8 +234,7 @@ fn check_transition(
     let one_ext = consts(c, &crate::babybear4::BabyBear4::ONE.0);
     assert_eq_all(c, &s[ast::Q_IN..ast::Q_IN + 4], &one_ext);
     assert_eq_all(c, &s[ast::Q_OUT..ast::Q_OUT + 4], &one_ext);
-    let net = consts(c, &output::net_limbs(consensus.subsidy as i128));
-    assert_eq_all(c, &s[ast::NET..ast::NET + output::NET_LIMBS], &net);
+    assert_eq_all(c, &s[ast::NET..ast::NET + output::NET_LIMBS], net);
     let one = c.one();
     c.assert_eq(s[ast::HAS_STATE], one);
     let zeros = consts(c, &[BabyBear::ZERO; HASH_LEN]);
@@ -216,7 +264,9 @@ fn first_circuit(
     let (lo, hi) = state::split(genesis.state.size);
     let old_root = consts(&mut c, &genesis.state.root);
     let old_size = consts(&mut c, &[lo, hi]);
-    check_transition(&mut c, consensus, &agg.merge_key(), &s, &old_root, &old_size);
+    let subsidy = consensus.subsidy(1).expect("block 1 is valid");
+    let net = consts(&mut c, &output::net_limbs(subsidy as i128));
+    check_transition(&mut c, &agg.merge_key(), &s, &old_root, &old_size, &net);
     let mut out = vk;
     out.extend(consts(&mut c, &genesis.hash()));
     out.extend_from_slice(&s[ast::NEW_ROOT..ast::NEW_ROOT + HASH_LEN]);
@@ -241,7 +291,8 @@ fn block_circuit(
     let h = HeaderCells::input(&mut c, header);
     let check = pow_circuit::check_header(&mut c, consensus, tree, &p, &h);
     let s = load_aggregate(&mut c, agg, statement, proof);
-    check_transition(&mut c, consensus, &agg.merge_key(), &s, &h.root, &h.size);
+    let net = subsidy_net(&mut c, consensus, &h.height);
+    check_transition(&mut c, &agg.merge_key(), &s, &h.root, &h.size, &net);
     let mut out = check.parent_hash.to_vec();
     out.extend(check.hash);
     out.extend(h.root);
@@ -603,47 +654,16 @@ mod tests {
     use super::*;
     use crate::db::test::TempEnv;
     use crate::header::FRAC_BITS;
-    use crate::output::{Amount, NONCE_LEN, Nonce, Output};
+    use crate::output::Output;
     use crate::pow::Dataset;
     use crate::state_air::StateSegmentAir;
     use crate::subblock_air::SubBlockAir;
-    use crate::transaction::{Input, Transaction, TxBody, pubkey_hash};
-    use crate::wots::{self, SecretKey};
+    use crate::transaction::{Transaction, TxBody};
+    use crate::wallet::{Coin, Wallet};
 
-    fn key(n: u32) -> (SecretKey, wots::PublicKey) {
-        wots::keygen(BabyBear::new_array(core::array::from_fn(|i| n * 31 + i as u32)))
-    }
-
-    fn nonce(n: u32) -> Nonce {
-        [n as u8; NONCE_LEN]
-    }
-
-    fn pay(n: u32, amount: Amount) -> Output {
-        Output {
-            hash: pubkey_hash(&key(n).1),
-            amount,
-            nonce: nonce(n),
-        }
-    }
-
-    fn spend(coins: &[(u32, Amount)], outputs: Vec<Output>) -> Transaction {
-        let (keys, inputs) = coins
-            .iter()
-            .map(|&(n, amount)| {
-                let (sk, pubkey) = key(n);
-                let commitment =
-                    output::commit(&pubkey_hash(&pubkey), amount, &nonce(n)).unwrap();
-                (
-                    sk,
-                    Input {
-                        commitment,
-                        pubkey,
-                        amount,
-                        nonce: nonce(n),
-                    },
-                )
-            })
-            .unzip();
+    /// A transaction spending `coins` into `outputs`.
+    fn spend(wallet: &Wallet, coins: &[Coin], outputs: Vec<Output>) -> Transaction {
+        let (keys, inputs) = coins.iter().map(|c| wallet.input(c)).unzip();
         Transaction::sign(TxBody { inputs, outputs }, keys).unwrap()
     }
 
@@ -660,6 +680,11 @@ mod tests {
             genesis_time: 1_000_000,
             // About 2^8 expected hashes.
             genesis_log_target: (100 << FRAC_BITS) + 1000,
+            // Two blocks of 50, then one of 7: the chain ends at height 3.
+            first_era: 2,
+            first_subsidy: 50,
+            second_era: 1,
+            second_subsidy: 7,
             ..Consensus::DEFAULT
         };
         let genesis = Header {
@@ -683,24 +708,36 @@ mod tests {
         let chain = Chain::new(consensus, genesis, blocks, data.tree());
         eprintln!("setup {:.1} s, rows {:?}", t.elapsed().as_secs_f64(), chain.used_rows());
 
-        let subsidy = consensus.subsidy;
-        let block_txs: Vec<Vec<Transaction>> = vec![
-            vec![spend(&[], vec![pay(1, subsidy)])],
-            vec![
-                spend(&[(1, subsidy)], vec![pay(2, 20), pay(3, 25)]),
-                spend(&[], vec![pay(4, subsidy + 5)]),
-            ],
-            vec![
-                spend(&[(2, 20), (3, 25), (4, subsidy + 5)], vec![pay(5, 100)]),
-                spend(&[], vec![pay(6, subsidy)]),
-            ],
-        ];
+        let (early, late) = (consensus.first_subsidy, consensus.second_subsidy);
+        let wallet = Wallet::from_seed(BabyBear::new_array([9, 8, 7, 6, 5, 4, 3, 2]));
+        let pay = |i: u32, amount| wallet.address(i).pay(amount);
+        let coins = |tree: &StateTree| {
+            let outputs = tree.outputs(&env.env().read_txn().unwrap()).unwrap();
+            wallet.scan(&outputs, 0..20)
+        };
 
         let mut headers = vec![genesis];
         let mut work = vec![0u128];
         let mut proofs: Vec<ChainProof> = Vec::new();
         let mut bodies: Vec<Block> = Vec::new();
-        for txs in &block_txs {
+        for height in 1..=3u64 {
+            // Spend everything the wallet holds (found in the state, with
+            // positions) and claim the reward.
+            let held = coins(&tree);
+            let subsidy = consensus.subsidy(height).unwrap();
+            let txs = match height {
+                1 => vec![spend(&wallet, &[], vec![pay(0, early)])],
+                2 => vec![
+                    spend(&wallet, &held, vec![pay(1, 20), pay(2, 25)]),
+                    spend(&wallet, &[], vec![pay(3, early + 5)]),
+                ],
+                // The second era.
+                _ => vec![
+                    spend(&wallet, &held, vec![pay(4, 100)]),
+                    spend(&wallet, &[], vec![pay(5, late)]),
+                ],
+            };
+            let txs = &txs;
             let parent = *headers.last().unwrap();
             let t = std::time::Instant::now();
             let mut txn = env.env().write_txn().unwrap();
@@ -749,6 +786,12 @@ mod tests {
             bodies.push(block);
         }
 
+        // The wallet's coins are recovered from the state with amounts:
+        // block 3's two outputs.
+        let mut held: Vec<(u32, u64)> = coins(&tree).iter().map(|c| (c.index, c.amount)).collect();
+        held.sort();
+        assert_eq!(held, [(4, 100), (5, late)]);
+
         // Fast sync from the tip: two headers and one proof.
         let tip = headers[3];
         assert_eq!(chain.verify_proof(&tip, work[2], &proofs[2].proof), Ok(()));
@@ -785,11 +828,11 @@ mod tests {
         ));
 
         // The prover can't extend from a header that doesn't match the
-        // transition: block 3's transition on top of header 1.
+        // transition: a transition on top of header 3, claimed for header 2.
         let mut txn = env.env().write_txn().unwrap();
         let agg = chain
             .block_prover()
-            .prove(&tree, &mut txn, &[spend(&[], vec![pay(7, subsidy)])], subsidy)
+            .prove(&tree, &mut txn, &[spend(&wallet, &[], vec![pay(6, late)])], late)
             .unwrap();
         txn.abort();
         assert_eq!(
@@ -798,6 +841,25 @@ mod tests {
                 .err(),
             Some(AggError::Invalid),
             "transition doesn't start at the parent's state"
+        );
+        // And the chain has ended: no block 4, in the proof or natively.
+        assert_eq!(
+            chain
+                .prove_next(&proofs[2], &headers[2], &headers[3], &agg)
+                .err(),
+            Some(AggError::Invalid),
+            "block past the final height"
+        );
+        let mut past = Header {
+            height: 4,
+            prev: headers[3].hash(),
+            timestamp: headers[3].timestamp + 600,
+            ..headers[3]
+        };
+        assert!(past.mine(data, consensus.target(&headers[3])));
+        assert_eq!(
+            header::check(&consensus, data, &headers[3], &past),
+            Err(header::HeaderError::PastEnd)
         );
     }
 }

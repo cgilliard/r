@@ -1,17 +1,19 @@
 //! The state-update segment circuit: proves a run of state-tree inserts then
-//! spends ([`verify_insert`], [`verify_spend`]), in strictly increasing key
-//! order, moving the state from one `(root, size)` to another.
+//! removals ([`verify_insert`], [`verify_remove`]), in strictly increasing
+//! key order, moving the state from one `(root, size)` to another.
 //!
 //! Blocks apply their sorted output list (inserts) and then their sorted
-//! input list (spends); segments cover consecutive slices, chained by their
-//! public states and last keys. Each segment also outputs multiset
-//! fingerprints of what it inserted and spent, which the aggregation matches
-//! against the validity sub-blocks'.
+//! input list (removals); segments cover consecutive slices, chained by
+//! their public states and last keys. Each segment also outputs multiset
+//! fingerprints of what it inserted (key and nonce) and removed (key and
+//! position), which the aggregation matches against the validity
+//! sub-blocks'.
 //!
 //! Every row holds one Poseidon2 permutation plus auxiliary columns, with
-//! preprocessed selectors giving each row its role. Merkle paths are 40
-//! merge rows; two paths sharing siblings run interleaved (`A`, `B`, `A`,
-//! ...), so each level's sibling is copied to the adjacent row. Per insert:
+//! preprocessed selectors giving each row its role. A leaf hash is four
+//! sponge rows (key, nonce, next key, next index). Merkle paths are 40 merge
+//! rows; two paths sharing siblings run interleaved (`A`, `B`, `A`, ...), so
+//! each level's sibling is copied to the adjacent row. Per insert:
 //!
 //! - three comparisons: previous key < key, low key < key, key < low next
 //!   key (or the end of the list);
@@ -21,8 +23,15 @@
 //! - path pair 2 (empty slot / new leaf) along `size`: `A` must reach the
 //!   intermediate root, `B` is the new root.
 //!
-//! Per spend: an order comparison, the leaf hashed unspent and spent, and one
-//! path pair (`A` reaches the current root, `B` is the new root).
+//! Per removal (spend) at position `pos`:
+//!
+//! - an order comparison: previous key < key;
+//! - leaf hashes of the predecessor linking to `(key, pos)`, the predecessor
+//!   relinked past it, and the removed leaf;
+//! - path pair 1 (old / relinked predecessor) along the predecessor's
+//!   index: `A` reaches the current root, `B` the intermediate root;
+//! - path pair 2 (removed leaf / empty slot) along `pos`: `A` must reach
+//!   the intermediate root, `B` is the new root.
 //!
 //! Comparisons are lexicographic on the keys' 8 canonical limbs: a one-hot
 //! column marks the first differing limb, earlier limbs are equal, and that
@@ -37,28 +46,28 @@
 //! inserted and spent keys before and after (`8` each).
 //!
 //! [`verify_insert`]: crate::state::verify_insert
-//! [`verify_spend`]: crate::state::verify_spend
+//! [`verify_remove`]: crate::state::verify_remove
 
 use crate::air::{Air, Constraints, Var};
 use crate::babybear::{BabyBear, P};
 use crate::babybear4::BabyBear4;
 use crate::hash::{HASH_LEN, Hash, domain};
 use crate::matrix::RowMajorMatrix;
-use crate::output::Commitment;
+use crate::output::{self, Commitment, NONCE_LIMBS, OutputRecord};
 use crate::poseidon2::WIDTH;
 use crate::poseidon2_air::{self, OUTPUT_OFFSET};
-use crate::state::{self, DEPTH, InsertProof, Leaf, SpendProof, State, key_of};
+use crate::state::{self, DEPTH, InsertProof, LEAF_LEN, Leaf, RemoveProof, State, key_of};
 
-/// Elements in a leaf hash: key, next key, next index lo/hi, spent.
-const LEAF_LEN: usize = 2 * HASH_LEN + 3;
 /// `p - 1 = 30720 * 2^16`: the largest canonical limb's high part.
 const HI_MAX: u32 = 30720;
 const LO_LIMIT: u32 = (1 << 30) - 1;
 /// The comparison bound for "end of list": every canonical limb is `<= p - 1`.
 const MAX_LIMB: u32 = P - 1;
 
-const INS_ROWS: usize = 3 + 3 + 3 + 2 * DEPTH + 3 + 2 * DEPTH + 1;
-const SP_ROWS: usize = 1 + 3 + 3 + 2 * DEPTH + 1;
+/// Rows of one leaf hash.
+const LEAF_ROWS: usize = 4;
+const INS_ROWS: usize = 3 + 2 * LEAF_ROWS + 2 * DEPTH + LEAF_ROWS + 2 * DEPTH + 1;
+const SP_ROWS: usize = 1 + 2 * LEAF_ROWS + 2 * DEPTH + LEAF_ROWS + 2 * DEPTH + 1;
 
 // Auxiliary columns after the permutation's.
 const AUX: usize = poseidon2_air::NUM_COLS;
@@ -72,21 +81,31 @@ const PINS: usize = PREV_SP + HASH_LEN;
 const PSP: usize = PINS + 4;
 // Per operation, constant across its rows.
 const ACT: usize = PSP + 4;
+/// The inserted or removed key, and its nonce.
 const KEY: usize = ACT + 1;
-const LK: usize = KEY + HASH_LEN;
-const LNK: usize = LK + HASH_LEN;
+const NONCE: usize = KEY + HASH_LEN;
+/// The low leaf (insert) or predecessor (removal): key, nonce, next key
+/// and next index.
+const LK: usize = NONCE + NONCE_LIMBS;
+const LN: usize = LK + HASH_LEN;
+const LNK: usize = LN + NONCE_LIMBS;
 const LNI_LO: usize = LNK + HASH_LEN;
 const LNI_HI: usize = LNI_LO + 1;
-const LSP: usize = LNI_HI + 1;
-const MID: usize = LSP + 1;
+/// The removed leaf's next key and index, and its position.
+const RNK: usize = LNI_HI + 1;
+const RNI_LO: usize = RNK + HASH_LEN;
+const RNI_HI: usize = RNI_LO + 1;
+const POS_LO: usize = RNI_HI + 1;
+const POS_HI: usize = POS_LO + 1;
+const MID: usize = POS_HI + 1;
 // Leaf hash rows.
 const LEAF_K: usize = MID + HASH_LEN;
-const LEAF_NK: usize = LEAF_K + HASH_LEN;
+const LEAF_N: usize = LEAF_K + HASH_LEN;
+const LEAF_NK: usize = LEAF_N + NONCE_LIMBS;
 const LEAF_LO: usize = LEAF_NK + HASH_LEN;
 const LEAF_HI: usize = LEAF_LO + 1;
-const LEAF_SP: usize = LEAF_HI + 1;
 // Merge rows.
-const CUR_A: usize = LEAF_SP + 1;
+const CUR_A: usize = LEAF_HI + 1;
 const CUR_B: usize = CUR_A + HASH_LEN;
 const SIB: usize = CUR_B + HASH_LEN;
 const BIT: usize = SIB + HASH_LEN;
@@ -117,25 +136,28 @@ const CMP_ORD_SP: usize = 3;
 const H1: usize = 4;
 const H2: usize = 5;
 const H3: usize = 6;
-const K_INS_OLD: usize = 7;
-const K_INS_RELINK: usize = 8;
-const K_INS_NEW: usize = 9;
-const K_SP_OLD: usize = 10;
-const K_SP_NEW: usize = 11;
-const SET_A: usize = 12;
-const SET_B: usize = 13;
-const RESET_A: usize = 14;
-const MA: usize = 15;
-const MB: usize = 16;
-const WLO: usize = 17;
-const WHI: usize = 18;
-const CHECK1: usize = 19;
-const END_INS: usize = 20;
-const END_SP: usize = 21;
-const SAME_OP: usize = 22;
-const FIRST: usize = 23;
-const FINAL: usize = 24;
-pub const PRE_WIDTH: usize = 25;
+const H4: usize = 7;
+const K_INS_OLD: usize = 8;
+const K_INS_RELINK: usize = 9;
+const K_INS_NEW: usize = 10;
+const K_PRED_OLD: usize = 11;
+const K_PRED_NEW: usize = 12;
+const K_REMOVED: usize = 13;
+const SET_A: usize = 14;
+const SET_B: usize = 15;
+const RESET_A: usize = 16;
+const RESET_B: usize = 17;
+const MA: usize = 18;
+const MB: usize = 19;
+const WLO: usize = 20;
+const WHI: usize = 21;
+const CHECK1: usize = 22;
+const END_INS: usize = 23;
+const END_SP: usize = 24;
+const SAME_OP: usize = 25;
+const FIRST: usize = 26;
+const FINAL: usize = 27;
+pub const PRE_WIDTH: usize = 28;
 
 /// Offsets of the public values.
 pub mod public {
@@ -161,27 +183,30 @@ pub struct StateSegmentAir {
     pub spends: usize,
 }
 
-/// Fingerprint row offsets of one insert.
+/// Row offsets of one insert.
 mod ins {
     use super::*;
     pub const ORD: usize = 0;
     pub const LOW: usize = 1;
     pub const NEXT: usize = 2;
     pub const H_OLD: usize = 3;
-    pub const H_RELINK: usize = 6;
-    pub const P1: usize = 9;
+    pub const H_RELINK: usize = H_OLD + LEAF_ROWS;
+    pub const P1: usize = H_RELINK + LEAF_ROWS;
     pub const H_NEW: usize = P1 + 2 * DEPTH;
-    pub const P2: usize = H_NEW + 3;
+    pub const P2: usize = H_NEW + LEAF_ROWS;
     pub const END: usize = P2 + 2 * DEPTH;
 }
 
+/// Row offsets of one removal.
 mod sp {
     use super::*;
     pub const ORD: usize = 0;
-    pub const H_OLD: usize = 1;
-    pub const H_NEW: usize = 4;
-    pub const P: usize = 7;
-    pub const END: usize = P + 2 * DEPTH;
+    pub const H_PRED_OLD: usize = 1;
+    pub const H_PRED_NEW: usize = H_PRED_OLD + LEAF_ROWS;
+    pub const P1: usize = H_PRED_NEW + LEAF_ROWS;
+    pub const H_REMOVED: usize = P1 + 2 * DEPTH;
+    pub const P2: usize = H_REMOVED + LEAF_ROWS;
+    pub const END: usize = P2 + 2 * DEPTH;
 }
 
 impl StateSegmentAir {
@@ -233,8 +258,9 @@ impl Air for StateSegmentAir {
             m.row_mut(at)[kind] = one;
             m.row_mut(at + 1)[H2] = one;
             m.row_mut(at + 2)[H3] = one;
+            m.row_mut(at + 3)[H4] = one;
             for &col in set {
-                m.row_mut(at + 2)[col] = one;
+                m.row_mut(at + 3)[col] = one;
             }
         };
         let path = |m: &mut RowMajorMatrix, at: usize| {
@@ -268,9 +294,12 @@ impl Air for StateSegmentAir {
         for s in 0..self.spends {
             let b = self.spend_base(s);
             m.row_mut(b + sp::ORD)[CMP_ORD_SP] = one;
-            leaf(&mut m, b + sp::H_OLD, K_SP_OLD, &[SET_A]);
-            leaf(&mut m, b + sp::H_NEW, K_SP_NEW, &[SET_B]);
-            path(&mut m, b + sp::P);
+            leaf(&mut m, b + sp::H_PRED_OLD, K_PRED_OLD, &[SET_A]);
+            leaf(&mut m, b + sp::H_PRED_NEW, K_PRED_NEW, &[SET_B]);
+            path(&mut m, b + sp::P1);
+            leaf(&mut m, b + sp::H_REMOVED, K_REMOVED, &[SET_A, RESET_B]);
+            m.row_mut(b + sp::H_REMOVED)[CHECK1] = one;
+            path(&mut m, b + sp::P2);
             m.row_mut(b + sp::END)[END_SP] = one;
             for r in b..b + sp::END {
                 m.row_mut(r)[SAME_OP] = one;
@@ -303,7 +332,8 @@ impl Air for StateSegmentAir {
             c.assert_zero(p[SAME_OP] * (n[col] - l[col]));
         }
 
-        // Leaf hash rows: sponge(STATE_LEAF, [], [key, next key, lo, hi, spent]).
+        // Leaf hash rows: sponge(STATE_LEAF, [], [key, nonce, next key, lo,
+        // hi]), one block per row.
         let h1 = p[H1];
         for j in 0..HASH_LEN {
             c.assert_zero(h1 * (l[j] - l[LEAF_K + j]));
@@ -314,100 +344,72 @@ impl Air for StateSegmentAir {
         c.assert_zero(h1 * (l[13] - k(domain::STATE_LEAF)));
         c.assert_zero(h1 * (l[14] - k(LEAF_LEN as u32)));
         c.assert_zero(h1 * l[15]);
-        for col in LEAF_K..LEAF_SP + 1 {
-            c.assert_zero((h1 + p[H2]) * (n[col] - l[col]));
+        for col in LEAF_K..LEAF_HI + 1 {
+            c.assert_zero((h1 + p[H2] + p[H3]) * (n[col] - l[col]));
         }
-        for (j, &x) in n[..WIDTH].iter().enumerate() {
-            let absorbed = if j < HASH_LEN { n[LEAF_NK + j] } else { zero };
-            c.assert_zero(h1 * (x - out(j) - absorbed));
+        for (sel, block) in [(h1, LEAF_N), (p[H2], LEAF_NK)] {
+            for (j, &x) in n[..WIDTH].iter().enumerate() {
+                let absorbed = if j < HASH_LEN { n[block + j] } else { zero };
+                c.assert_zero(sel * (x - out(j) - absorbed));
+            }
         }
         for (j, &x) in n[..WIDTH].iter().enumerate() {
             let absorbed = match j {
                 0 => l[LEAF_LO],
                 1 => l[LEAF_HI],
-                2 => l[LEAF_SP],
                 _ => zero,
             };
-            c.assert_zero(p[H2] * (x - out(j) - absorbed));
+            c.assert_zero(p[H3] * (x - out(j) - absorbed));
         }
-        // Which leaf: (key, next key, next index, spent) by kind.
-        // (selector, key, next key, next index lo, hi, spent)
-        type Kind<V> = (usize, [V; 8], [V; 8], V, V, V);
-        let kinds: [Kind<V>; 5] = [
-            (
-                K_INS_OLD,
-                ext8(l, LK),
-                ext8(l, LNK),
-                l[LNI_LO],
-                l[LNI_HI],
-                l[LSP],
-            ),
-            (
-                K_INS_RELINK,
-                ext8(l, LK),
-                ext8(l, KEY),
-                l[SIZE_LO],
-                l[SIZE_HI],
-                l[LSP],
-            ),
-            (
-                K_INS_NEW,
-                ext8(l, KEY),
-                ext8(l, LNK),
-                l[LNI_LO],
-                l[LNI_HI],
-                zero,
-            ),
-            (
-                K_SP_OLD,
-                ext8(l, KEY),
-                ext8(l, LNK),
-                l[LNI_LO],
-                l[LNI_HI],
-                zero,
-            ),
-            (
-                K_SP_NEW,
-                ext8(l, KEY),
-                ext8(l, LNK),
-                l[LNI_LO],
-                l[LNI_HI],
-                one,
-            ),
+        // Which leaf: (selector, key, nonce, next key, next index lo, hi).
+        type Kind<V> = (usize, [V; 8], [V; 8], [V; 8], V, V);
+        let kinds: [Kind<V>; 6] = [
+            (K_INS_OLD, ext8(l, LK), ext8(l, LN), ext8(l, LNK), l[LNI_LO], l[LNI_HI]),
+            (K_INS_RELINK, ext8(l, LK), ext8(l, LN), ext8(l, KEY), l[SIZE_LO], l[SIZE_HI]),
+            (K_INS_NEW, ext8(l, KEY), ext8(l, NONCE), ext8(l, LNK), l[LNI_LO], l[LNI_HI]),
+            (K_PRED_OLD, ext8(l, LK), ext8(l, LN), ext8(l, KEY), l[POS_LO], l[POS_HI]),
+            (K_PRED_NEW, ext8(l, LK), ext8(l, LN), ext8(l, RNK), l[RNI_LO], l[RNI_HI]),
+            (K_REMOVED, ext8(l, KEY), ext8(l, NONCE), ext8(l, RNK), l[RNI_LO], l[RNI_HI]),
         ];
         for j in 0..HASH_LEN {
-            let (mut dk, mut dnk) = (zero, zero);
-            for (kind, key, nk, ..) in &kinds {
+            let (mut dk, mut dn, mut dnk) = (zero, zero, zero);
+            for (kind, key, nonce, nk, ..) in &kinds {
                 dk = dk + p[*kind] * (l[LEAF_K + j] - key[j]);
+                dn = dn + p[*kind] * (l[LEAF_N + j] - nonce[j]);
                 dnk = dnk + p[*kind] * (l[LEAF_NK + j] - nk[j]);
             }
             c.assert_zero(dk);
+            c.assert_zero(dn);
             c.assert_zero(dnk);
         }
-        let (mut dlo, mut dhi, mut dsp) = (zero, zero, zero);
-        for (kind, _, _, lo, hi, spent) in &kinds {
+        let (mut dlo, mut dhi) = (zero, zero);
+        for (kind, _, _, _, lo, hi) in &kinds {
             dlo = dlo + p[*kind] * (l[LEAF_LO] - *lo);
             dhi = dhi + p[*kind] * (l[LEAF_HI] - *hi);
-            dsp = dsp + p[*kind] * (l[LEAF_SP] - *spent);
         }
         c.assert_zero(dlo);
         c.assert_zero(dhi);
-        c.assert_zero(dsp);
 
-        // Running nodes: set from leaf hashes, advanced by merges, else carried.
+        // Running nodes: set from leaf hashes, reset to the empty leaf,
+        // advanced by merges, else carried.
         let (ma, mb) = (p[MA], p[MB]);
         for j in 0..HASH_LEN {
             c.assert_zero(p[SET_A] * (n[CUR_A + j] - out(j)));
             c.assert_zero(p[RESET_A] * n[CUR_A + j]);
             c.assert_zero(p[SET_B] * (n[CUR_B + j] - out(j)));
+            c.assert_zero(p[RESET_B] * n[CUR_B + j]);
             c.assert_zero_transition(
                 (one - p[SET_A] - p[RESET_A] - ma) * (n[CUR_A + j] - l[CUR_A + j]),
             );
-            c.assert_zero_transition((one - p[SET_B] - mb) * (n[CUR_B + j] - l[CUR_B + j]));
+            c.assert_zero_transition(
+                (one - p[SET_B] - p[RESET_B] - mb) * (n[CUR_B + j] - l[CUR_B + j]),
+            );
         }
         for col in [IDX_LO, IDX_HI] {
-            c.assert_zero(p[SET_B] * n[col]);
-            c.assert_zero_transition((one - p[SET_B] - ma) * (n[col] - l[col]));
+            c.assert_zero((p[SET_B] + p[RESET_B]) * n[col]);
+            c.assert_zero_transition(
+                (one - p[SET_B] - p[RESET_B] - ma) * (n[col] - l[col]),
+            );
         }
         let bit = l[BIT];
         for (sel, cur) in [(ma, CUR_A), (mb, CUR_B)] {
@@ -426,8 +428,8 @@ impl Air for StateSegmentAir {
         c.assert_zero(ma * (n[IDX_LO] - l[IDX_LO] - bit * p[WLO]));
         c.assert_zero(ma * (n[IDX_HI] - l[IDX_HI] - bit * p[WHI]));
 
-        // End of pair 1 (on the new leaf's first hash row): A is the root,
-        // B the intermediate root.
+        // End of pair 1 (on the second pair's first hash row): A is the
+        // root, B the intermediate root.
         for j in 0..HASH_LEN {
             c.assert_zero(p[CHECK1] * act * (l[CUR_A + j] - l[ROOT + j]));
             c.assert_zero(p[CHECK1] * (l[MID + j] - l[CUR_B + j]));
@@ -483,17 +485,20 @@ impl Air for StateSegmentAir {
         c.assert_zero(cmp * (one - f) * (ah - bh));
         c.assert_zero(cmp * (bits(DBITS, 16) - f * (bh - ah - one) - (one - f) * (bl - al - one)));
 
-        // End rows.
+        // End rows: pair 2's A reaches the intermediate root along the
+        // operation's slot (size for inserts, the position for removals);
+        // its B is the new root.
         let (ei, es) = (p[END_INS], p[END_SP]);
         for j in 0..HASH_LEN {
-            c.assert_zero(ei * act * (l[CUR_A + j] - l[MID + j]));
-            c.assert_zero(es * act * (l[CUR_A + j] - l[ROOT + j]));
+            c.assert_zero((ei + es) * act * (l[CUR_A + j] - l[MID + j]));
             let updated = act * l[CUR_B + j] + (one - act) * l[ROOT + j];
             c.assert_zero((ei + es) * (n[ROOT + j] - updated));
             c.assert_zero_transition((one - ei - es) * (n[ROOT + j] - l[ROOT + j]));
         }
         c.assert_zero(ei * act * (l[IDX_LO] - l[SIZE_LO]));
         c.assert_zero(ei * act * (l[IDX_HI] - l[SIZE_HI]));
+        c.assert_zero(es * act * (l[IDX_LO] - l[POS_LO]));
+        c.assert_zero(es * act * (l[IDX_HI] - l[POS_HI]));
         // size + 1, carrying from the low 30 bits.
         let w = l[SIZE_LO] - k(LO_LIMIT);
         let carry = one - w * l[CINV];
@@ -512,9 +517,9 @@ impl Air for StateSegmentAir {
                 c.assert_zero_transition((one - end) * (n[prev + j] - l[prev + j]));
             }
         }
-        // Fingerprints: inserted and spent keys.
+        // Fingerprints: inserted (key, nonce), removed (key, position).
         let (lambda, r) = (pub4(public::LAMBDA), pub4(public::R));
-        let mut powers = [[zero; 4]; HASH_LEN];
+        let mut powers = [[zero; 4]; HASH_LEN + NONCE_LIMBS];
         powers[0][0] = one;
         for j in 1..powers.len() {
             powers[j] = ext_mul(powers[j - 1], lambda);
@@ -530,8 +535,13 @@ impl Air for StateSegmentAir {
                 unit - act * unit + act * (r[b] - e[b])
             })
         };
-        let e = element(&mut (KEY..KEY + HASH_LEN).map(|col| l[col]));
-        for (end, col) in [(ei, PINS), (es, PSP)] {
+        let e_ins = element(&mut (KEY..NONCE + NONCE_LIMBS).map(|col| l[col]));
+        let e_sp = element(
+            &mut (KEY..KEY + HASH_LEN)
+                .chain([POS_LO, POS_HI])
+                .map(|col| l[col]),
+        );
+        for (end, col, e) in [(ei, PINS, e_ins), (es, PSP, e_sp)] {
             let next = ext_mul(ext(col, l), factor(e));
             for b in 0..4 {
                 c.assert_zero(end * (n[col + b] - next[b]));
@@ -571,18 +581,19 @@ fn ext8<V: Copy>(row: &[V], col: usize) -> [V; 8] {
     core::array::from_fn(|j| row[col + j])
 }
 
-/// One insert: the commitment being inserted and its tree proof.
+/// One insert: the output being inserted and its tree proof.
 #[derive(Clone, Debug)]
 pub struct InsertOp {
-    pub commitment: Commitment,
+    pub record: OutputRecord,
     pub proof: InsertProof,
 }
 
-/// One spend: the commitment being spent and its tree proof.
+/// One removal: the commitment being spent and its tree proof (which
+/// holds its position).
 #[derive(Clone, Debug)]
 pub struct SpendOp {
     pub commitment: Commitment,
-    pub proof: SpendProof,
+    pub proof: RemoveProof,
 }
 
 /// Where a segment starts: the state and the last keys inserted and spent
@@ -621,7 +632,7 @@ impl StateSegmentAir {
             pins: BabyBear4::ONE,
             psp: BabyBear4::ONE,
         };
-        let powers: Vec<BabyBear4> = (0..HASH_LEN)
+        let powers: Vec<BabyBear4> = (0..HASH_LEN + NONCE_LIMBS)
             .scan(BabyBear4::ONE, |pw, _| {
                 let v = *pw;
                 *pw *= lambda;
@@ -636,15 +647,18 @@ impl StateSegmentAir {
 
         for slot in 0..self.inserts {
             let b = self.insert_base(slot);
-            let op = inserts.get(slot);
-            let o = match op {
+            let o = match inserts.get(slot) {
                 Some(op) => OpFields {
                     active: true,
-                    key: key_of(&op.commitment).expect("canonical key"),
+                    key: key_of(&op.record.commitment).expect("canonical key"),
+                    nonce: op.record.nonce,
                     low: op.proof.low.leaf,
                     low_index: op.proof.low.index,
                     low_siblings: *op.proof.low.siblings,
                     new_siblings: *op.proof.new_siblings,
+                    removed_next_key: [BabyBear::ZERO; HASH_LEN],
+                    removed_next_index: 0,
+                    position: 0,
                 },
                 None => OpFields::dummy_insert(),
             };
@@ -656,9 +670,9 @@ impl StateSegmentAir {
             };
             let new_leaf = Leaf {
                 key: o.key,
+                nonce: o.nonce,
                 next_key: o.low.next_key,
                 next_index: o.low.next_index,
-                spent: false,
             };
             o.write_constants(&mut m, b, INS_ROWS);
             compare(&mut m, b + ins::ORD, &g.prev_ins, &o.key);
@@ -711,7 +725,9 @@ impl StateSegmentAir {
                 g.root = b2;
                 g.size += 1;
                 g.prev_ins = o.key;
-                g.pins *= r - fp(&o.key);
+                let mut xs = o.key.to_vec();
+                xs.extend(output::nonce_limbs(&o.nonce));
+                g.pins *= r - fp(&xs);
             }
         }
 
@@ -721,41 +737,66 @@ impl StateSegmentAir {
                 Some(op) => OpFields {
                     active: true,
                     key: key_of(&op.commitment).expect("canonical key"),
-                    low: op.proof.leaf,
-                    low_index: op.proof.index,
-                    low_siblings: *op.proof.siblings,
-                    new_siblings: [[BabyBear::ZERO; HASH_LEN]; DEPTH],
+                    nonce: op.proof.leaf.leaf.nonce,
+                    low: op.proof.pred.leaf,
+                    low_index: op.proof.pred.index,
+                    low_siblings: *op.proof.pred.siblings,
+                    new_siblings: *op.proof.leaf.siblings,
+                    removed_next_key: op.proof.leaf.leaf.next_key,
+                    removed_next_index: op.proof.leaf.leaf.next_index,
+                    position: op.proof.position(),
                 },
                 None => OpFields::dummy_spend(),
             };
-            // For spends, `low` is the spent leaf itself.
             o.write_constants(&mut m, b, SP_ROWS);
             compare(&mut m, b + sp::ORD, &g.prev_sp, &o.key);
-            let unspent = Leaf {
-                key: o.key,
-                spent: false,
+            let pred_old = Leaf {
+                next_key: o.key,
+                next_index: o.position,
                 ..o.low
             };
-            let spent = Leaf {
-                spent: true,
-                ..unspent
+            let pred_new = Leaf {
+                next_key: o.removed_next_key,
+                next_index: o.removed_next_index,
+                ..o.low
             };
-            let h_old = leaf_rows(&mut m, b + sp::H_OLD, &unspent);
-            let h_new = leaf_rows(&mut m, b + sp::H_NEW, &spent);
-            let (_, bb) = path_rows(
+            let removed = Leaf {
+                key: o.key,
+                nonce: o.nonce,
+                next_key: o.removed_next_key,
+                next_index: o.removed_next_index,
+            };
+            let h_old = leaf_rows(&mut m, b + sp::H_PRED_OLD, &pred_old);
+            let h_new = leaf_rows(&mut m, b + sp::H_PRED_NEW, &pred_new);
+            let (_, b1) = path_rows(
                 &mut m,
-                b + sp::P,
+                b + sp::P1,
                 h_old,
                 h_new,
                 o.low_index,
                 &o.low_siblings,
             );
+            let h_removed = leaf_rows(&mut m, b + sp::H_REMOVED, &removed);
+            let (_, b2) = path_rows(
+                &mut m,
+                b + sp::P2,
+                h_removed,
+                [BabyBear::ZERO; HASH_LEN],
+                o.position,
+                &o.new_siblings,
+            );
+            for r in b..b + SP_ROWS {
+                m.row_mut(r)[MID..MID + HASH_LEN].copy_from_slice(&b1);
+            }
             poseidon2_air::generate([BabyBear::ZERO; WIDTH], m.row_mut(b + sp::END));
             g.write(&mut m, b, SP_ROWS);
             if o.active {
-                g.root = bb;
+                g.root = b2;
                 g.prev_sp = o.key;
-                g.psp *= r - fp(&o.key);
+                let (lo, hi) = state::split(o.position);
+                let mut xs = o.key.to_vec();
+                xs.extend([lo, hi]);
+                g.psp *= r - fp(&xs);
             }
         }
 
@@ -815,10 +856,14 @@ impl StateSegmentAir {
             }
             if p[SET_B] == one {
                 b.copy_from_slice(out);
-                lo = BabyBear::ZERO;
-                hi = BabyBear::ZERO;
+            } else if p[RESET_B] == one {
+                b = [BabyBear::ZERO; HASH_LEN];
             } else if p[MB] == one {
                 b = node;
+            }
+            if p[SET_B] == one || p[RESET_B] == one {
+                lo = BabyBear::ZERO;
+                hi = BabyBear::ZERO;
             }
             let path_row = pre.row(r + 1)[MA] == one || pre.row(r + 1)[MB] == one;
             let next = m.row_mut(r + 1);
@@ -864,11 +909,18 @@ impl Globals {
 struct OpFields {
     active: bool,
     key: Hash,
-    /// Insert: the low leaf. Spend: the leaf being spent.
+    /// The inserted or removed output's nonce.
+    nonce: output::Nonce,
+    /// Insert: the low leaf. Removal: the predecessor.
     low: Leaf,
     low_index: u64,
     low_siblings: [Hash; DEPTH],
+    /// Insert: the path to slot `size`. Removal: the removed leaf's path.
     new_siblings: [Hash; DEPTH],
+    /// Removal: the removed leaf's link and its position.
+    removed_next_key: Hash,
+    removed_next_index: u64,
+    position: u64,
 }
 
 impl OpFields {
@@ -880,15 +932,14 @@ impl OpFields {
         Self {
             active: false,
             key,
-            low: Leaf {
-                key: [BabyBear::ZERO; HASH_LEN],
-                next_key: [BabyBear::ZERO; HASH_LEN],
-                next_index: 0,
-                spent: false,
-            },
+            nonce: [0; output::NONCE_LEN],
+            low: Leaf::SENTINEL,
             low_index: 0,
             low_siblings: [[BabyBear::ZERO; HASH_LEN]; DEPTH],
             new_siblings: [[BabyBear::ZERO; HASH_LEN]; DEPTH],
+            removed_next_key: [BabyBear::ZERO; HASH_LEN],
+            removed_next_index: 0,
+            position: 0,
         }
     }
 
@@ -901,15 +952,23 @@ impl OpFields {
 
     fn write_constants(&self, m: &mut RowMajorMatrix, start: usize, rows: usize) {
         let (lo, hi) = state::split(self.low.next_index);
+        let (rlo, rhi) = state::split(self.removed_next_index);
+        let (plo, phi) = state::split(self.position);
         for r in start..start + rows {
             let row = m.row_mut(r);
             row[ACT] = BabyBear::from(self.active);
             row[KEY..KEY + HASH_LEN].copy_from_slice(&self.key);
+            row[NONCE..NONCE + NONCE_LIMBS].copy_from_slice(&output::nonce_limbs(&self.nonce));
             row[LK..LK + HASH_LEN].copy_from_slice(&self.low.key);
+            row[LN..LN + NONCE_LIMBS].copy_from_slice(&output::nonce_limbs(&self.low.nonce));
             row[LNK..LNK + HASH_LEN].copy_from_slice(&self.low.next_key);
             row[LNI_LO] = lo;
             row[LNI_HI] = hi;
-            row[LSP] = BabyBear::from(self.low.spent);
+            row[RNK..RNK + HASH_LEN].copy_from_slice(&self.removed_next_key);
+            row[RNI_LO] = rlo;
+            row[RNI_HI] = rhi;
+            row[POS_LO] = plo;
+            row[POS_HI] = phi;
         }
     }
 }
@@ -949,33 +1008,31 @@ fn compare(m: &mut RowMajorMatrix, at: usize, a: &Hash, b: &Hash) {
     put(row, DBITS, d, 16);
 }
 
-/// Fills three leaf-hash rows and returns the leaf hash.
+/// Fills four leaf-hash rows and returns the leaf hash.
 fn leaf_rows(m: &mut RowMajorMatrix, at: usize, leaf: &Leaf) -> Hash {
     let (lo, hi) = state::split(leaf.next_index);
-    for r in at..at + 3 {
+    let nonce = output::nonce_limbs(&leaf.nonce);
+    for r in at..at + LEAF_ROWS {
         let row = m.row_mut(r);
         row[LEAF_K..LEAF_K + HASH_LEN].copy_from_slice(&leaf.key);
+        row[LEAF_N..LEAF_N + NONCE_LIMBS].copy_from_slice(&nonce);
         row[LEAF_NK..LEAF_NK + HASH_LEN].copy_from_slice(&leaf.next_key);
         row[LEAF_LO] = lo;
         row[LEAF_HI] = hi;
-        row[LEAF_SP] = BabyBear::from(leaf.spent);
     }
     let mut input = [BabyBear::ZERO; WIDTH];
     input[..HASH_LEN].copy_from_slice(&leaf.key);
     input[13] = BabyBear::new(domain::STATE_LEAF);
     input[14] = BabyBear::new(LEAF_LEN as u32);
-    let out1 = poseidon2_air::generate(input, m.row_mut(at));
-    let mut input = out1;
-    for (x, &nk) in input.iter_mut().zip(&leaf.next_key) {
-        *x += nk;
+    let mut state = poseidon2_air::generate(input, m.row_mut(at));
+    for (offset, block) in [(1, &nonce[..]), (2, &leaf.next_key[..]), (3, &[lo, hi][..])] {
+        let mut input = state;
+        for (x, &v) in input.iter_mut().zip(block) {
+            *x += v;
+        }
+        state = poseidon2_air::generate(input, m.row_mut(at + offset));
     }
-    let out2 = poseidon2_air::generate(input, m.row_mut(at + 1));
-    let mut input = out2;
-    input[0] += lo;
-    input[1] += hi;
-    input[2] += BabyBear::from(leaf.spent);
-    let out3 = poseidon2_air::generate(input, m.row_mut(at + 2));
-    let h = core::array::from_fn(|j| out3[j]);
+    let h = core::array::from_fn(|j| state[j]);
     debug_assert_eq!(h, leaf.hash());
     h
 }
@@ -1027,10 +1084,10 @@ mod tests {
     use crate::air::check_constraints;
     use crate::db::test::TempEnv;
     use crate::fri::FriParams;
-    use crate::output::{self, NONCE_LEN, OutputRecord};
+    use crate::output::NONCE_LEN;
     use crate::stark;
     use crate::state::StateTree;
-    use crate::subblock_air::{element, product};
+    use crate::subblock_air::{input_element, output_element, product};
 
     const LAMBDA: BabyBear4 = BabyBear4::new([3, 5, 7, 11]);
     const R: BabyBear4 = BabyBear4::new([13, 17, 19, 23]);
@@ -1063,7 +1120,7 @@ mod tests {
             let tree = StateTree::open(tmp.env()).unwrap();
             let mut txn = tmp.env().write_txn().unwrap();
             for r in sorted(existing.iter().map(|&n| record(n)).collect()) {
-                tree.insert(&mut txn, &r.commitment).unwrap();
+                tree.insert(&mut txn, &r).unwrap();
             }
             txn.commit().unwrap();
             Self { tmp, tree }
@@ -1080,14 +1137,14 @@ mod tests {
             let ins = sorted(inserts.iter().map(|&n| record(n)).collect())
                 .into_iter()
                 .map(|record| InsertOp {
-                    proof: self.tree.insert(&mut txn, &record.commitment).unwrap(),
-                    commitment: record.commitment,
+                    proof: self.tree.insert(&mut txn, &record).unwrap(),
+                    record,
                 })
                 .collect();
             let sp = sorted(spends.iter().map(|&n| record(n)).collect())
                 .into_iter()
                 .map(|r| SpendOp {
-                    proof: self.tree.spend(&mut txn, &r.commitment).unwrap(),
+                    proof: self.tree.remove(&mut txn, &r.commitment).unwrap(),
                     commitment: r.commitment,
                 })
                 .collect();
@@ -1113,8 +1170,8 @@ mod tests {
 
     #[test]
     fn layout() {
-        assert_eq!(INS_ROWS, 173);
-        assert_eq!(SP_ROWS, 88);
+        assert_eq!(INS_ROWS, 176);
+        assert_eq!(SP_ROWS, 174);
     }
 
     #[test]
@@ -1131,15 +1188,11 @@ mod tests {
             state_at(&public, public::NEW_ROOT, public::NEW_SIZE),
             (after.root, after.size)
         );
-        let p_ins = product(
-            R,
-            ins.iter()
-                .map(|o| element(LAMBDA, &o.commitment).unwrap()),
-        );
+        let p_ins = product(R, ins.iter().map(|o| output_element(LAMBDA, &o.record).unwrap()));
         let p_sp = product(
             R,
             sp.iter()
-                .map(|o| element(LAMBDA, &o.commitment).unwrap()),
+                .map(|o| input_element(LAMBDA, &o.commitment, o.proof.position()).unwrap()),
         );
         assert_eq!(&public[public::P_INS..public::P_INS + 4], &p_ins.0);
         assert_eq!(&public[public::P_SP..public::P_SP + 4], &p_sp.0);
@@ -1247,8 +1300,8 @@ mod tests {
         let ins: Vec<InsertOp> = records
             .into_iter()
             .map(|record| InsertOp {
-                proof: f.tree.insert(&mut txn, &record.commitment).unwrap(),
-                commitment: record.commitment,
+                proof: f.tree.insert(&mut txn, &record).unwrap(),
+                record,
             })
             .collect();
         let air = StateSegmentAir {
@@ -1284,7 +1337,7 @@ mod tests {
         let low = f.tree.witness(&txn, low_index).unwrap();
         assert_eq!(low.leaf.next_key, key);
         let ins = [InsertOp {
-            commitment: target.commitment,
+            record: target,
             proof: InsertProof {
                 low,
                 new_siblings: Box::new([[BabyBear::ZERO; HASH_LEN]; DEPTH]),
@@ -1299,20 +1352,47 @@ mod tests {
     }
 
     #[test]
+    fn removal_frees_the_commitment_for_a_new_slot() {
+        // Spend 1, then create it again: it lands in a new slot.
+        let f = Fixture::new(&[1, 2]);
+        let (before, _, sp, after) = f.ops(&[], &[1]);
+        let air = StateSegmentAir {
+            inserts: 1,
+            spends: 1,
+        };
+        let (t, public) = air.trace(&start(before), &[], &sp, LAMBDA, R);
+        assert_eq!(check_constraints(&air, &t, &public), Ok(()));
+        let mut txn = f.tmp.env().write_txn().unwrap();
+        f.tree.remove(&mut txn, &record(1).commitment).unwrap();
+        assert_eq!(f.tree.state(&txn).unwrap(), after);
+        let ins = [InsertOp {
+            proof: f.tree.insert(&mut txn, &record(1)).unwrap(),
+            record: record(1),
+        }];
+        let (t, public) = air.trace(&start(after), &ins, &[], LAMBDA, R);
+        assert_eq!(check_constraints(&air, &t, &public), Ok(()));
+        assert_eq!(
+            state_at(&public, public::NEW_ROOT, public::NEW_SIZE),
+            (f.tree.state(&txn).unwrap().root, after.size + 1)
+        );
+    }
+
+    #[test]
     fn rejects_double_spend() {
-        // Spend 1 for real, then replay the earlier spend proof: the leaf is
-        // spent now, so hashing it unspent no longer reaches the root.
+        // Remove 1 for real, then replay the earlier removal proof: the
+        // predecessor no longer links to it, so its old hash doesn't reach
+        // the root.
         let f = Fixture::new(&[1, 2]);
         let (_, _, sp, _) = f.ops(&[], &[1]);
         let mut txn = f.tmp.env().write_txn().unwrap();
-        f.tree.spend(&mut txn, &record(1).commitment).unwrap();
+        f.tree.remove(&mut txn, &record(1).commitment).unwrap();
         let spent_state = f.tree.state(&txn).unwrap();
         let air = StateSegmentAir {
             inserts: 0,
             spends: 1,
         };
         let (t, public) = air.trace(&start(spent_state), &[], &sp, LAMBDA, R);
-        assert_eq!(check_constraints(&air, &t, &public), Err(sp::END));
+        assert_eq!(check_constraints(&air, &t, &public), Err(sp::H_REMOVED));
     }
 
     #[test]
@@ -1325,7 +1405,29 @@ mod tests {
             spends: 1,
         };
         let (t, public) = air.trace(&start(before), &[], &sp, LAMBDA, R);
-        // The leaf hashed with the wrong key doesn't reach the root.
+        // The predecessor hashed as linking to the wrong key doesn't reach
+        // the root.
+        assert_eq!(check_constraints(&air, &t, &public), Err(sp::H_REMOVED));
+    }
+
+    #[test]
+    fn rejects_a_wrong_position_or_nonce() {
+        let f = Fixture::new(&[1, 2, 3]);
+        let (before, _, sp, _) = f.ops(&[], &[2]);
+        let air = StateSegmentAir {
+            inserts: 0,
+            spends: 1,
+        };
+        // Claiming another slot: the predecessor's link no longer matches.
+        let mut bad = sp.clone();
+        bad[0].proof.leaf.index += 1;
+        let (t, public) = air.trace(&start(before), &[], &bad, LAMBDA, R);
+        assert!(check_constraints(&air, &t, &public).is_err());
+        // Another nonce: the removed leaf doesn't reach the intermediate
+        // root.
+        let mut bad = sp.clone();
+        bad[0].proof.leaf.leaf.nonce[0] ^= 1;
+        let (t, public) = air.trace(&start(before), &[], &bad, LAMBDA, R);
         assert_eq!(check_constraints(&air, &t, &public), Err(sp::END));
     }
 

@@ -8,8 +8,9 @@
 //!
 //! - input slot: a WOTS region verifying the input's signature on the
 //!   transaction digest ([`wots_air`]), then `PKH` (`H(pubkey)` from the
-//!   region's root and parameter), `C1..C3` (the commitment) and `D` (absorb
-//!   the commitment into the digest sponge);
+//!   region's root and parameter), `C1..C3` (the commitment), `D` (absorb
+//!   the commitment into the digest sponge) and `DP` (absorb the spent
+//!   output's position);
 //! - output slot: `C1..C3` with range-checked amount limbs, and `D`;
 //! - a final row checking the net value, digest, counts and fingerprints,
 //!   and hashing the digest with a random blinding into the transaction
@@ -21,8 +22,9 @@
 //! verifies a signature: the prover fills it with a dummy key signing the
 //! same digest, which keeps every constraint at degree 4.
 //!
-//! The digest is `sponge(TX_BODY, [n_in, n_out], commitments)`, as
-//! [`TxBody::digest`]; every WOTS region checks its signature against it.
+//! The digest is [`TxBody::digest`]: each input's commitment and position,
+//! then each output's commitment; every WOTS region checks its signature
+//! against it.
 //! Transactions have no balance rule of their own: the net value may be
 //! negative (an implicit fee) or positive (a block reward is a transaction
 //! with outputs and no inputs). Only the block's total is constrained, to
@@ -30,9 +32,10 @@
 //! [`output::net_limbs`]: the 16-bit limbs of `2^95 + net`.
 //!
 //! Public values: `lambda (4) | r (4) | P_in (4) | P_out (4) | net (6) |
-//! tx hash (8)`, with `P_in = prod (r - sum_j lambda^j C_j)` over active
-//! input commitments and `P_out` likewise over output commitments (see
-//! [`element`]).
+//! tx hash (8)`, with `P_in = prod (r - e)` over active inputs' elements
+//! (commitment and position, [`input_element`]) and `P_out` likewise over
+//! outputs' (commitment and nonce, [`output_element`]): what the state
+//! segments remove and insert.
 //!
 //! The transaction hash ([`tx_hash`]) is `Poseidon2(digest || blinding)`
 //! truncated to 8 elements. It commits to every commitment the sub-block
@@ -47,7 +50,9 @@ use crate::babybear::BabyBear;
 use crate::babybear4::BabyBear4;
 use crate::hash::{self, HASH_LEN, Hash, domain};
 use crate::matrix::RowMajorMatrix;
-use crate::output::{self, AMOUNT_LIMBS, Commitment, NET_LIMBS, NET_OFFSET, NONCE_LIMBS, Nonce};
+use crate::output::{
+    self, AMOUNT_LIMBS, Commitment, NET_LIMBS, NET_OFFSET, NONCE_LIMBS, Nonce, OutputRecord,
+};
 use crate::poseidon2::WIDTH;
 use crate::poseidon2_air::{self, OUTPUT_OFFSET};
 use crate::rng::Rng;
@@ -62,8 +67,8 @@ const CARRY_OFFSET: u32 = 1 << (CARRY_BITS - 1);
 /// `x^4 = W` in the extension field.
 const EXT_W: BabyBear = BabyBear::new(11);
 
-/// Rows per input slot: the WOTS region, `PKH`, `C1..C3`, `D`.
-const IN_ROWS: usize = wots_air::NUM_ROWS + 5;
+/// Rows per input slot: the WOTS region, `PKH`, `C1..C3`, `D`, `DP`.
+const IN_ROWS: usize = wots_air::NUM_ROWS + 6;
 const OUT_ROWS: usize = 4;
 
 // Auxiliary columns after the permutation's and the WOTS region's.
@@ -83,7 +88,9 @@ const NOUT: usize = NIN + 1;
 const BITS: usize = NOUT + 1;
 const CB: usize = BITS + NET_LIMBS * LIMB_BITS;
 const INV2: usize = CB + (NET_LIMBS - 1) * CARRY_BITS;
-pub const NUM_COLS: usize = INV2 + 1;
+/// An input slot's spent position (lo, hi limbs), constant in the slot.
+const POS: usize = INV2 + 1;
+pub const NUM_COLS: usize = POS + 2;
 
 // Preprocessed columns after the WOTS region's.
 const PW: usize = wots_air::PRE_WIDTH;
@@ -102,7 +109,9 @@ const SAME_SLOT: usize = PW + 10;
 /// `D` rows of input (output) slots followed by another input (output) slot.
 const NEXT_IN_SLOT: usize = PW + 11;
 const NEXT_OUT_SLOT: usize = PW + 12;
-pub const PRE_WIDTH: usize = PW + 13;
+/// An input slot's position-absorbing row, after `D`.
+const DP: usize = PW + 13;
+pub const PRE_WIDTH: usize = PW + 14;
 
 /// Number of public values.
 pub const PUBLIC_LEN: usize = TX_HASH + HASH_LEN;
@@ -147,9 +156,19 @@ fn fingerprint(lambda: BabyBear4, xs: impl IntoIterator<Item = BabyBear>) -> Bab
     acc
 }
 
-/// The multiset element of a commitment (spent or created).
-pub fn element(lambda: BabyBear4, c: &Commitment) -> Option<BabyBear4> {
-    Some(fingerprint(lambda, c.to_field()?))
+/// The multiset element of a spent output: its commitment and position.
+pub fn input_element(lambda: BabyBear4, c: &Commitment, position: u64) -> Option<BabyBear4> {
+    let (lo, hi) = crate::state::split(position);
+    Some(fingerprint(lambda, c.to_field()?.into_iter().chain([lo, hi])))
+}
+
+/// The multiset element of a created output: its commitment and nonce.
+pub fn output_element(lambda: BabyBear4, record: &OutputRecord) -> Option<BabyBear4> {
+    let c = record.commitment.to_field()?;
+    Some(fingerprint(
+        lambda,
+        c.into_iter().chain(output::nonce_limbs(&record.nonce)),
+    ))
 }
 
 /// A transaction's hash for a sub-block: `Poseidon2(digest || blinding)`,
@@ -202,7 +221,7 @@ impl Air for SubBlockAir {
                 m.row_mut(base + r)[..PW].copy_from_slice(row);
             }
             let tail = base + wots_air::NUM_ROWS;
-            for (offset, col) in [(0, PKH), (1, C1), (2, C2_IN), (3, C3_IN), (4, D_IN)] {
+            for (offset, col) in [(0, PKH), (1, C1), (2, C2_IN), (3, C3_IN), (4, D_IN), (5, DP)] {
                 m.row_mut(tail + offset)[col] = one;
             }
             for r in base..base + IN_ROWS - 1 {
@@ -256,6 +275,9 @@ impl Air for SubBlockAir {
         }
         c.assert_zero(act * (act - BabyBear::ONE));
         c.assert_zero(p[SAME_SLOT] * (n[ACT] - act));
+        for j in 0..2 {
+            c.assert_zero(p[SAME_SLOT] * (n[POS + j] - l[POS + j]));
+        }
         c.assert_zero((p[NEXT_IN_SLOT] + p[NEXT_OUT_SLOT]) * n[ACT] * (k(1) - act));
 
         // The WOTS root feeds PKH: input root | param | PUBLIC_KEY_HASH | 0 | 0.
@@ -318,7 +340,7 @@ impl Air for SubBlockAir {
 
         // Fingerprints at C3 rows: next = current * (r - element), if active.
         let commitment: [V; HASH_LEN] = core::array::from_fn(out);
-        let mut powers = [[zero; 4]; HASH_LEN];
+        let mut powers = [[zero; 4]; HASH_LEN + NONCE_LIMBS];
         powers[0][0] = k(1);
         for j in 1..powers.len() {
             powers[j] = ext_mul(powers[j - 1], lambda);
@@ -334,8 +356,14 @@ impl Air for SubBlockAir {
                 one - act * one + act * (r[b] - e[b])
             })
         };
-        let e = element(&mut commitment.iter().copied());
-        for (sel, col) in [(p[C3_IN], PIN), (p[C3_OUT], POUT)] {
+        let e_in = element(&mut commitment.iter().copied().chain([l[POS], l[POS + 1]]));
+        let e_out = element(
+            &mut commitment
+                .iter()
+                .copied()
+                .chain(l[NONCE..NONCE + NONCE_LIMBS].iter().copied()),
+        );
+        for (sel, col, e) in [(p[C3_IN], PIN, e_in), (p[C3_OUT], POUT, e_out)] {
             let next = ext_mul(ext(col, l), factor(e));
             for b in 0..4 {
                 c.assert_zero(sel * (n[col + b] - next[b]));
@@ -349,7 +377,16 @@ impl Air for SubBlockAir {
             let absorbed = if j < HASH_LEN { out(j) } else { zero };
             c.assert_zero(c3 * (n[j] - n[DIG + j] - absorbed));
         }
-        let d_row = p[D_IN] + p[D_OUT];
+        // An input's D row continues into DP, absorbing its position.
+        for (j, &x) in n[..WIDTH].iter().enumerate() {
+            let absorbed = match j {
+                0 => l[POS],
+                1 => l[POS + 1],
+                _ => zero,
+            };
+            c.assert_zero(p[D_IN] * (x - out(j) - absorbed));
+        }
+        let d_row = p[DP] + p[D_OUT];
         for j in 0..WIDTH {
             let col = DIG + j;
             c.assert_zero(d_row * (n[col] - act * out(j) - (k(1) - act) * l[col]));
@@ -357,7 +394,7 @@ impl Air for SubBlockAir {
         }
 
         // Counts.
-        for (sel, col) in [(p[D_IN], CNT_IN), (p[D_OUT], CNT_OUT)] {
+        for (sel, col) in [(p[DP], CNT_IN), (p[D_OUT], CNT_OUT)] {
             c.assert_zero(sel * (n[col] - l[col] - act));
             c.assert_zero_transition((k(1) - sel) * (n[col] - l[col]));
         }
@@ -378,7 +415,8 @@ impl Air for SubBlockAir {
                 8 => l[NIN],
                 9 => l[NOUT],
                 13 => k(domain::TX_BODY),
-                14 => (l[NIN] + l[NOUT]) * BabyBear::new(HASH_LEN as u32),
+                14 => l[NIN] * BabyBear::new(HASH_LEN as u32 + 2)
+                    + l[NOUT] * BabyBear::new(HASH_LEN as u32),
                 _ => zero,
             };
             c.assert_zero(first * (l[DIG + j] - expected));
@@ -428,6 +466,7 @@ struct InSlot {
     sig: Signature,
     amount: [BabyBear; AMOUNT_LIMBS],
     nonce: [BabyBear; NONCE_LIMBS],
+    position: u64,
     active: bool,
 }
 
@@ -503,6 +542,7 @@ impl SubBlockAir {
                     sig: tx.signatures[i].clone(),
                     amount: output::amount_limbs(input.amount),
                     nonce: output::nonce_limbs(&input.nonce),
+                    position: input.position,
                     active: true,
                 },
                 None => dummy_input(&msg, rng),
@@ -543,7 +583,7 @@ impl SubBlockAir {
         dig[8] = BabyBear::new(nin);
         dig[9] = BabyBear::new(nout);
         dig[13] = BabyBear::new(domain::TX_BODY);
-        dig[14] = BabyBear::new(HASH_LEN as u32 * (nin + nout));
+        dig[14] = BabyBear::new((HASH_LEN as u32 + 2) * nin + HASH_LEN as u32 * nout);
         let mut st = Carried {
             sum: [0; AMOUNT_LIMBS],
             dig,
@@ -552,7 +592,7 @@ impl SubBlockAir {
             cnt_in: 0,
             cnt_out: 0,
         };
-        let powers: Vec<BabyBear4> = (0..HASH_LEN)
+        let powers: Vec<BabyBear4> = (0..HASH_LEN + NONCE_LIMBS)
             .scan(BabyBear4::ONE, |pw, _| {
                 let v = *pw;
                 *pw *= lambda;
@@ -560,15 +600,17 @@ impl SubBlockAir {
             })
             .collect();
 
-        // C1..C3 and D for one slot starting at `row`. Returns the commitment.
+        // C1..C3 and D (and DP for an input, at `position`) for one slot
+        // starting at `row`.
         let commit_rows = |m: &mut RowMajorMatrix,
                            st: &mut Carried,
                            row: usize,
                            hash_in: Hash,
                            amount: &[BabyBear; AMOUNT_LIMBS],
                            nonce: &[BabyBear; NONCE_LIMBS],
-                           active: bool,
-                           is_input: bool| {
+                           position: Option<u64>,
+                           active: bool| {
+            let is_input = position.is_some();
             let mut input = [BabyBear::ZERO; WIDTH];
             input[..HASH_LEN].copy_from_slice(&hash_in);
             input[13] = BabyBear::new(domain::OUTPUT);
@@ -609,12 +651,14 @@ impl SubBlockAir {
             m.row_mut(row + 2)[NONCE..NONCE + NONCE_LIMBS].copy_from_slice(nonce);
             st.write(m.row_mut(row + 2));
             let commitment: Hash = core::array::from_fn(|j| out3[j]);
+            let (lo, hi) = crate::state::split(position.unwrap_or(0));
             if active {
+                let tail: Vec<BabyBear> = if is_input { vec![lo, hi] } else { nonce.to_vec() };
                 let e = commitment
                     .iter()
-                    .copied()
+                    .chain(&tail)
                     .zip(&powers)
-                    .fold(BabyBear4::ZERO, |acc, (x, &pw)| acc + pw * x);
+                    .fold(BabyBear4::ZERO, |acc, (&x, &pw)| acc + pw * x);
                 let p = if is_input { &mut st.pin } else { &mut st.pout };
                 *p *= r - e;
             }
@@ -623,8 +667,15 @@ impl SubBlockAir {
             for (x, &cv) in input.iter_mut().zip(&commitment) {
                 *x += cv;
             }
-            let out_d = poseidon2_air::generate(input, m.row_mut(row + 3));
+            let mut out_d = poseidon2_air::generate(input, m.row_mut(row + 3));
             st.write(m.row_mut(row + 3));
+            if is_input {
+                let mut input = out_d;
+                input[0] += lo;
+                input[1] += hi;
+                out_d = poseidon2_air::generate(input, m.row_mut(row + 4));
+                st.write(m.row_mut(row + 4));
+            }
             if active {
                 st.dig = out_d;
                 if is_input {
@@ -656,12 +707,15 @@ impl SubBlockAir {
                 pkh,
                 &slot.amount,
                 &slot.nonce,
+                Some(slot.position),
                 slot.active,
-                true,
             );
+            let (lo, hi) = crate::state::split(slot.position);
             for r in base..base + IN_ROWS {
                 let row = m.row_mut(r);
                 row[ACT] = BabyBear::from(slot.active);
+                row[POS] = lo;
+                row[POS + 1] = hi;
                 row[wots_air::PARAM..wots_air::PARAM + PARAM_LEN]
                     .copy_from_slice(&slot.pubkey.param);
             }
@@ -675,8 +729,8 @@ impl SubBlockAir {
                 slot.hash,
                 &slot.amount,
                 &slot.nonce,
+                None,
                 slot.active,
-                false,
             );
             for r in base..base + OUT_ROWS {
                 m.row_mut(r)[ACT] = BabyBear::from(slot.active);
@@ -752,6 +806,7 @@ fn dummy_input(msg: &Hash, rng: &mut Rng) -> InSlot {
         pubkey,
         amount: [BabyBear::ZERO; AMOUNT_LIMBS],
         nonce: output::nonce_limbs(&Nonce::default()),
+        position: 0,
         active: false,
     }
 }
@@ -785,6 +840,7 @@ mod tests {
             sk,
             Input {
                 commitment,
+                position: 1000 + n as u64,
                 pubkey,
                 amount,
                 nonce,
@@ -814,14 +870,14 @@ mod tests {
             tx.body
                 .inputs
                 .iter()
-                .map(|i| element(LAMBDA, &i.commitment).unwrap()),
+                .map(|i| input_element(LAMBDA, &i.commitment, i.position).unwrap()),
         );
         let p_out = product(
             R,
             tx.body
                 .outputs
                 .iter()
-                .map(|o| element(LAMBDA, &o.commitment().unwrap()).unwrap()),
+                .map(|o| output_element(LAMBDA, &o.record().unwrap()).unwrap()),
         );
         (p_in, p_out)
     }
@@ -988,10 +1044,9 @@ mod tests {
         ];
         let nonce = [BabyBear::ZERO; NONCE_LIMBS];
         let c_out = hash::sponge(domain::OUTPUT, &[], &[&hash, &amount, &nonce]);
-        let msg = hash::sponge(
-            domain::TX_BODY,
-            &[BabyBear::ONE, BabyBear::ONE],
-            &[&input.commitment.to_field().unwrap(), &c_out],
+        let msg = crate::transaction::digest_of(
+            &[(input.commitment.to_field().unwrap(), input.position)],
+            &[c_out],
         );
         let air = SubBlockAir {
             inputs: 1,
@@ -1002,6 +1057,7 @@ mod tests {
             pubkey: input.pubkey.clone(),
             amount: output::amount_limbs(100),
             nonce: output::nonce_limbs(&input.nonce),
+            position: input.position,
             active: true,
         }];
         let outs = [OutSlot {

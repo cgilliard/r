@@ -11,6 +11,9 @@ use crate::hash::{self, HASH_BYTES, HASH_LEN, Hash, domain, sponge};
 
 pub type Amount = u64;
 
+/// Units per coin.
+pub const COIN: Amount = 100_000_000;
+
 pub const OUTPUT_HASH_LEN: usize = HASH_BYTES;
 /// Spend condition of an output, e.g. a public key hash: 8 field elements as
 /// little-endian `u32`s (see [`hash::to_bytes`]), each below `p`.

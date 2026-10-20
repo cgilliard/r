@@ -18,6 +18,7 @@
 use std::fmt;
 
 use crate::hash::{self, Hash, domain};
+use crate::output::{Amount, COIN};
 use crate::pow::{self, Dataset, VALUE_BITS, u64_limbs};
 use crate::state::{self, State};
 
@@ -43,9 +44,15 @@ pub struct Consensus {
     /// How far past a node's clock a timestamp may be. Not provable, so a
     /// node applies it only to blocks it receives.
     pub max_future: u64,
-    /// What each block's transactions must create in total:
-    /// `sum(outputs) - sum(inputs)`.
-    pub subsidy: crate::output::Amount,
+    /// Emission: blocks `1 ..= first_era` each create `first_subsidy`
+    /// (what a block's transactions must create in total,
+    /// `sum(outputs) - sum(inputs)`), the next `second_era` blocks
+    /// `second_subsidy`. After that the chain ends: no block above
+    /// [`Consensus::final_height`] is valid.
+    pub first_era: u64,
+    pub first_subsidy: Amount,
+    pub second_era: u64,
+    pub second_subsidy: Amount,
 }
 
 impl Consensus {
@@ -58,8 +65,35 @@ impl Consensus {
         // About 36 hours.
         log_half_life: 17,
         max_future: 2 * 3600,
-        subsidy: 50,
+        // Seven years of 1000 coins, then a thousand years of 7, at 144
+        // blocks a day.
+        first_era: 7 * 144 * 365,
+        first_subsidy: 1000 * COIN,
+        second_era: 1000 * 144 * 365,
+        second_subsidy: 7 * COIN,
     };
+
+    /// The last valid height.
+    pub fn final_height(&self) -> u64 {
+        self.first_era + self.second_era
+    }
+
+    /// What block `height` must create; `None` for genesis and past the
+    /// final height.
+    pub fn subsidy(&self, height: u64) -> Option<Amount> {
+        match height {
+            0 => None,
+            h if h <= self.first_era => Some(self.first_subsidy),
+            h if h <= self.final_height() => Some(self.second_subsidy),
+            _ => None,
+        }
+    }
+
+    /// Every coin the chain creates.
+    pub fn total_supply(&self) -> u128 {
+        self.first_era as u128 * self.first_subsidy as u128
+            + self.second_era as u128 * self.second_subsidy as u128
+    }
 
     /// The log-target of the block after `parent`.
     pub fn log_target(&self, parent: &Header) -> i64 {
@@ -255,6 +289,8 @@ pub enum HeaderError {
     TooNew,
     /// The PoW hash isn't below the target.
     Work,
+    /// Above the final height: the chain has ended.
+    PastEnd,
 }
 
 impl fmt::Display for HeaderError {
@@ -265,6 +301,7 @@ impl fmt::Display for HeaderError {
             Self::TooOld => "timestamp not after its parent's",
             Self::TooNew => "timestamp too far in the future",
             Self::Work => "insufficient proof of work",
+            Self::PastEnd => "the chain has ended",
         })
     }
 }
@@ -281,6 +318,9 @@ pub fn check(
 ) -> Result<(), HeaderError> {
     if header.height != parent.height + 1 {
         return Err(HeaderError::Height);
+    }
+    if header.height > c.final_height() {
+        return Err(HeaderError::PastEnd);
     }
     if header.prev != parent.hash() {
         return Err(HeaderError::Prev);
@@ -398,6 +438,21 @@ mod tests {
         let at = 8 + 32 + 8 + 32;
         bad[at..at + 8].copy_from_slice(&(state::CAPACITY + 1).to_le_bytes());
         assert_eq!(Header::from_bytes(&bad), None, "size over capacity");
+    }
+
+    #[test]
+    fn emission_schedule() {
+        let c = Consensus::DEFAULT;
+        assert_eq!(c.subsidy(0), None);
+        assert_eq!(c.subsidy(1), Some(100_000_000_000));
+        assert_eq!(c.subsidy(367_920), Some(100_000_000_000));
+        assert_eq!(c.subsidy(367_921), Some(700_000_000));
+        assert_eq!(c.final_height(), 52_927_920);
+        assert_eq!(c.subsidy(52_927_920), Some(700_000_000));
+        assert_eq!(c.subsidy(52_927_921), None);
+        // 367,920 * 1000 + 52,560,000 * 7 coins: the two eras emit equally.
+        assert_eq!(c.total_supply(), 735_840_000 * COIN as u128);
+        assert!(c.total_supply() < u64::MAX as u128);
     }
 
     #[test]

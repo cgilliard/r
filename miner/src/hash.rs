@@ -44,6 +44,10 @@ pub mod domain {
     pub const POW_DATASET: u32 = 19;
     pub const BLOCK_BODY: u32 = 20;
     pub const PROOF: u32 = 21;
+    pub const WALLET_KEY: u32 = 22;
+    pub const WALLET_VIEW: u32 = 23;
+    pub const NONCE_TAG: u32 = 24;
+    pub const NONCE_MASK: u32 = 25;
 
     #[cfg(test)]
     pub const ALL: &[u32] = &[
@@ -68,6 +72,10 @@ pub mod domain {
         POW_DATASET,
         BLOCK_BODY,
         PROOF,
+        WALLET_KEY,
+        WALLET_VIEW,
+        NONCE_TAG,
+        NONCE_MASK,
     ];
 }
 

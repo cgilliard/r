@@ -696,7 +696,7 @@ mod tests {
     use crate::rng::Rng;
     use crate::state::StateTree;
     use crate::state_air::{InsertOp, SegmentStart};
-    use crate::subblock_air::{element, product};
+    use crate::subblock_air::{output_element, product};
     use crate::transaction::{Transaction, TxBody};
 
     const LAMBDA: BabyBear4 = BabyBear4::new([3, 5, 7, 11]);
@@ -818,8 +818,8 @@ mod tests {
             let ops: Vec<InsertOp> = records
                 .into_iter()
                 .map(|record| InsertOp {
-                    proof: tree.insert(&mut txn, &record.commitment).unwrap(),
-                    commitment: record.commitment,
+                    proof: tree.insert(&mut txn, &record).unwrap(),
+                    record,
                 })
                 .collect();
             let after = tree.state(&txn).unwrap();
@@ -879,7 +879,7 @@ mod tests {
         assert_eq!((st.q_in(), st.q_out()), (BabyBear4::ONE, BabyBear4::ONE));
         let p_out = product(
             R,
-            records.iter().map(|r| element(LAMBDA, &r.commitment).unwrap()),
+            records.iter().map(|r| output_element(LAMBDA, r).unwrap()),
         );
         assert_eq!(m1.statement.q_out(), sub1.statement.q_out() * p_out.inverse().unwrap());
         assert_eq!(st.net(), 50 + 0x1_0000_ffff + 0xffff);

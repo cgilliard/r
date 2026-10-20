@@ -66,6 +66,9 @@ pub enum BlockError {
     Tx(usize, TxError),
     /// A transaction doesn't fit the sub-block shape.
     TooLarge(usize),
+    /// A transaction's input names a position other than the spent
+    /// output's slot.
+    Position(usize),
     /// The lists aren't in canonical order, repeat a commitment, or hold a
     /// commitment that isn't a valid key.
     NotCanonical,
@@ -94,6 +97,7 @@ impl fmt::Display for BlockError {
         match self {
             Self::Tx(i, e) => write!(f, "transaction {i}: {e:?}"),
             Self::TooLarge(i) => write!(f, "transaction {i} exceeds the sub-block shape"),
+            Self::Position(i) => write!(f, "transaction {i} names the wrong position for an input"),
             Self::NotCanonical => write!(f, "lists not in canonical order"),
             Self::State(e) => write!(f, "state: {e:?}"),
             Self::Proof(e) => write!(f, "proof: {e}"),
@@ -324,7 +328,7 @@ pub fn apply(
     if tree.state(txn).map_err(BlockError::State)? != parent.state {
         return Err(BlockError::StateMismatch);
     }
-    tree.apply_changes(txn, &created(block), &block.inputs)
+    tree.apply_changes(txn, &block.outputs, &block.inputs)
         .map_err(BlockError::State)?;
     if tree.state(txn).map_err(BlockError::State)? != header.state {
         return Err(BlockError::StateMismatch);
@@ -437,8 +441,8 @@ impl BlockProver {
                 .iter()
                 .map(|record| {
                     Ok(InsertOp {
-                        proof: tree.insert(txn, &record.commitment)?,
-                        commitment: record.commitment,
+                        proof: tree.insert(txn, record)?,
+                        record: *record,
                     })
                 })
                 .collect::<Result<_, state::Error>>()
@@ -447,7 +451,7 @@ impl BlockProver {
                 .iter()
                 .map(|c| {
                     Ok(SpendOp {
-                        proof: tree.spend(txn, c)?,
+                        proof: tree.remove(txn, c)?,
                         commitment: *c,
                     })
                 })
@@ -466,6 +470,17 @@ impl BlockProver {
             start = next;
         }
         let new = start.state;
+
+        // Each input must sign the position the tree removed it from.
+        let positions: std::collections::HashMap<Commitment, u64> = segments
+            .iter()
+            .flat_map(|(_, _, spends)| spends.iter().map(|s| (s.commitment, s.proof.position())))
+            .collect();
+        for (i, tx) in txs.iter().enumerate() {
+            if tx.body.inputs.iter().any(|input| positions.get(&input.commitment) != Some(&input.position)) {
+                return Err(BlockError::Position(i));
+            }
+        }
 
         // Fix the transactions' blinded hashes, then derive the challenges
         // from both halves.
@@ -529,11 +544,6 @@ impl BlockProver {
     }
 }
 
-/// The published commitments of a block's outputs, for applying it.
-pub fn created(block: &Block) -> Vec<Commitment> {
-    block.outputs.iter().map(|o| o.commitment).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,13 +569,14 @@ mod tests {
         }
     }
 
-    fn spend(n: u32, amount: Amount, nonce: Nonce) -> (SecretKey, Input) {
+    fn spend(n: u32, amount: Amount, nonce: Nonce, position: u64) -> (SecretKey, Input) {
         let (sk, pubkey) = key(n);
         let commitment = output::commit(&pubkey_hash(&pubkey), amount, &nonce).unwrap();
         (
             sk,
             Input {
                 commitment,
+                position,
                 pubkey,
                 amount,
                 nonce,
@@ -599,11 +610,36 @@ mod tests {
         let env = TempEnv::new();
         let tree = StateTree::open(env.env()).unwrap();
         let mut txn = env.env().write_txn().unwrap();
-        tree.insert(&mut txn, &funding.commitment().unwrap())
-            .unwrap();
+        tree.insert(&mut txn, &funding.record().unwrap()).unwrap();
         txn.commit().unwrap();
 
-        let (sk, input) = spend(1, 100, funding.nonce);
+        // It's in slot 1 (the sentinel has slot 0). Signing another slot is
+        // refused before proving.
+        let (sk, input) = spend(1, 100, funding.nonce, 2);
+        let wrong = Transaction::sign(
+            TxBody {
+                inputs: vec![input],
+                outputs: vec![pay(2, 60), pay(3, 30)],
+            },
+            vec![sk],
+        )
+        .unwrap();
+        let reward = Transaction::sign(
+            TxBody {
+                inputs: vec![],
+                outputs: vec![pay(4, SUBSIDY + 10)],
+            },
+            vec![],
+        )
+        .unwrap();
+        let mut txn = env.env().write_txn().unwrap();
+        assert!(matches!(
+            prover.prove(&tree, &mut txn, &[wrong, reward], SUBSIDY),
+            Err(BlockError::Position(0))
+        ));
+        txn.abort();
+
+        let (sk, input) = spend(1, 100, funding.nonce, 1);
         let tx = Transaction::sign(
             TxBody {
                 inputs: vec![input],

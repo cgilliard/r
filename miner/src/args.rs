@@ -7,11 +7,14 @@ use std::path::PathBuf;
 pub const USAGE: &str = "\
 Usage: r [OPTIONS]
 
+Without --dev-chain, prints the stored development chain's status.
+
 Options:
       --data-dir <PATH>      Directory for the database [default: target/data]
-      --dev-chain <BLOCKS>   Prove, mine and check a fresh development chain
-                             of BLOCKS blocks in <PATH>/devnet (replacing
-                             any previous one), logging each step
+      --dev-chain <BLOCKS>   Prove, mine, check and store BLOCKS more blocks
+                             of the development chain in <PATH>/devnet
+                             (creating it if needed; delete the directory
+                             to start over), logging each step
   -h, --help                 Print help
   -V, --version              Print version";
 
