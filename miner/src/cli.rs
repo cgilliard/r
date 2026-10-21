@@ -5,52 +5,44 @@
 //!
 //! - `send <amount> <fee> <file>`: picks coins, locks them, and writes the
 //!   slate to `<file>` for the receiver;
-//! - `receive <file>`: makes an output for the slate's amount at a fresh
-//!   key and writes it to `<file>.response` for the sender;
+//! - `receive <file>`: makes an output for the slate's amount with new
+//!   keys and writes it to `<file>.response` for the sender;
 //! - `finalize <file>`: signs the transaction with the receiver's output and
 //!   submits it to the mempool, which relays it.
+//!
+//! A payment waiting for a block can be re-signed with other one-time keys
+//! of its coins (each output has [`crate::transaction::KEY_LEAVES`]) to
+//! replace it in the mempool: `bump <id> <fee>` raises its fee (out of the
+//! change), and `cancel <id> <fee>` pays its coins back to the wallet
+//! instead. Either replacement must pay a higher fee.
 //!
 //! `info` shows the balance, with the coins received but not yet in a block
 //! as pending; `txs` lists the payments in progress, sent and received (and
 //! drops the confirmed ones); `cancel <id>` unlocks the coins of a payment
 //! not yet finalized, or stops tracking one being received.
 
-use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ledger::Ledger;
 use crate::mempool::{Chainstate, Mempool, Refused};
 use crate::net::node::Event;
-use crate::output::{Amount, format_coins, parse_coins};
+use crate::output::{Amount, Output, format_coins, parse_coins};
 use crate::transaction::{Transaction, TxBody};
 use crate::wallet::{
-    Coin, Owned, Received, Response, Sent, Slate, SlateId, Tag, Wallet, WalletStore, hex, tag_of,
+    Coin, Leaves, Owned, Received, Response, Sent, Slate, SlateId, Wallet, WalletStore, hex,
 };
 
-/// Inputs in one payment, at most (each adds about 2.2 KB).
+/// Inputs in one payment, at most (each adds about 2.3 KB).
 const MAX_INPUTS: usize = 32;
-/// Key indices looked at past the last one used, when scanning blocks.
-const LOOKAHEAD: u32 = 100;
-/// Key indices scanned past the last one found when looking for a restored
-/// wallet's outputs
-/// (a restored wallet), and skipped after restoring.
-const GAP: u32 = 1000;
 /// Blocks a spent output is remembered for, in case a reorg unspends it.
 const KEEP_GONE: u64 = 100;
 /// Mining rewards' maturity by default, in confirmations.
 pub const DEFAULT_MATURITY: u64 = 6;
-
-/// Tags of key indices below `end`.
-#[derive(Default)]
-pub struct TagCache {
-    end: u32,
-    map: HashMap<Tag, u32>,
-}
 
 /// What an output of the wallet's can do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,8 +81,11 @@ commands:
   receive <file>               answer a slate: writes <file>.response
   finalize <file>              sign and submit a payment from its response
   txs                          payments in progress, sent and received
-  cancel <id>                  drop a payment not yet finalized (or stop
-                               tracking one being received)
+  bump <id> <fee>              re-sign a payment waiting for a block with a
+                               higher fee (taken from its change)
+  cancel <id> [<fee>]          drop a payment not yet finalized (or stop
+                               tracking one being received); a signed one
+                               needs a higher fee, and pays its coins back
   status                       the node: tip, sync, mempool
   help                         this list
   quit                         stop the node";
@@ -112,8 +107,6 @@ pub struct Cli {
     pub synced: Arc<AtomicBool>,
     /// Confirmations before a mining reward of ours can be spent.
     pub maturity: u64,
-    /// Key index tags computed so far.
-    pub tag_cache: Mutex<TagCache>,
     /// Logs to the node's log.
     pub log: Box<dyn Fn(String) + Send + Sync>,
 }
@@ -193,7 +186,15 @@ impl Cli {
             ["receive", file] => self.receive(file)?,
             ["finalize", file] => self.finalize(file)?,
             ["txs"] => self.txs()?,
-            ["cancel", id] => self.cancel(id)?,
+            ["cancel", id] => self.cancel(id, None)?,
+            ["cancel", id, fee] => {
+                let fee = parse_coins(fee).ok_or("bad fee")?;
+                self.cancel(id, Some(fee))?
+            }
+            ["bump", id, fee] => {
+                let fee = parse_coins(fee).ok_or("bad fee")?;
+                self.bump(id, fee)?
+            }
             [cmd, ..] => return Err(format!("unknown or incomplete command \"{cmd}\"; try help")),
         };
         Ok(Outcome::Text(text))
@@ -201,11 +202,10 @@ impl Cli {
 
     /// Brings the wallet's outputs up to the tip. After a reorg it first
     /// drops what came from blocks no longer on the main chain. Then it
-    /// looks each new main-chain block's outputs up by their tags, or, when
-    /// blocks are missing (below a fast-sync base) or a restored wallet is
-    /// still looking, scans the whole state. Outputs gone from the state
-    /// (spent) are kept for [`KEEP_GONE`] blocks, in case a reorg brings
-    /// them back.
+    /// checks each new main-chain block's outputs for its tag (one hash
+    /// each), or, when blocks are missing (below a fast-sync base), the
+    /// whole state. Outputs gone from the state (spent) are kept for
+    /// [`KEEP_GONE`] blocks, in case a reorg brings them back.
     fn sync(&self) -> Result<(), String> {
         let l = &self.ledger;
         let txn = l.env.read_txn().map_err(err)?;
@@ -225,85 +225,56 @@ impl Cli {
             }
         }
         let base = l.store.base(&txn).map_err(err)?;
-        // A restored wallet looks from the start (it doesn't know how far
-        // its key indices go, so the range widens while outputs turn up near
-        // its end). Outputs it finds may be mining rewards: they mature.
+        // A restored wallet looks from the start. Outputs it finds may be
+        // mining rewards: they mature.
         let start = if restoring {
             1
         } else {
             fork.map_or(1, |h| h + 1)
         };
         let whole_state = base > 0 && start < base;
-        let next = self.store.next_index(&txn).map_err(err)?;
-        let mut end = next.saturating_add(if restoring { GAP } else { LOOKAHEAD });
-        let mut found: Vec<Owned>;
-        let mut hashes;
-        loop {
-            let tags = self.tags(end);
-            found = Vec::new();
-            hashes = Vec::new();
-            // The blocks there are: from the start, or (when older ones are
-            // missing, below a fast-sync base) from the base.
-            let first = if whole_state { base.max(1) } else { start };
-            for h in first..=tip.height {
-                let block = l
-                    .store
-                    .block(&txn, h)
-                    .map_err(err)?
-                    .ok_or("missing block")?;
-                let hash = l
-                    .store
-                    .hash_at(&txn, h)
-                    .map_err(err)?
-                    .ok_or("missing block")?;
-                for record in &block.outputs {
-                    let Some(&index) = tags.get(&tag_of(record)) else {
-                        continue;
-                    };
-                    if let Some(amount) = self.wallet.identify(index, record) {
-                        found.push(Owned {
-                            index,
-                            amount,
-                            record: *record,
-                            height: h,
-                            reward: restoring || self.store.is_reward(&txn, index).map_err(err)?,
-                            gone_since: 0,
-                        });
-                    }
-                }
-                hashes.push((h, crate::hash::to_bytes(&hash)));
-            }
-            if whole_state {
-                // The state has every unspent output; one no block above
-                // the base made was made at or below it.
-                let outputs = l.tree.outputs(&txn).map_err(err)?;
-                for (_, record) in outputs {
-                    if found
-                        .iter()
-                        .any(|o| o.record.commitment == record.commitment)
-                    {
-                        continue;
-                    }
-                    let Some(&index) = tags.get(&tag_of(&record)) else {
-                        continue;
-                    };
-                    if let Some(amount) = self.wallet.identify(index, &record) {
-                        found.push(Owned {
-                            index,
-                            amount,
-                            record,
-                            height: base,
-                            reward: restoring || self.store.is_reward(&txn, index).map_err(err)?,
-                            gone_since: 0,
-                        });
-                    }
+        let mut found: Vec<Owned> = Vec::new();
+        let mut hashes = Vec::new();
+        let owned = |r, amount, record, height, txn: &heed::RoTxn| -> Result<Owned, String> {
+            Ok(Owned {
+                r,
+                amount,
+                record,
+                height,
+                reward: restoring || self.store.is_reward(txn, &r).map_err(err)?,
+                gone_since: 0,
+            })
+        };
+        // The blocks there are: from the start, or (when older ones are
+        // missing, below a fast-sync base) from the base.
+        let first = if whole_state { base.max(1) } else { start };
+        for h in first..=tip.height {
+            let block = l
+                .store
+                .block(&txn, h)
+                .map_err(err)?
+                .ok_or("missing block")?;
+            let hash = l
+                .store
+                .hash_at(&txn, h)
+                .map_err(err)?
+                .ok_or("missing block")?;
+            for record in &block.outputs {
+                if let Some((r, amount)) = self.wallet.identify(record) {
+                    found.push(owned(r, amount, *record, h, &txn)?);
                 }
             }
-            let top = found.iter().map(|o| o.index).max().unwrap_or(0);
-            if !restoring || top.saturating_add(GAP) < end {
-                break;
+            hashes.push((h, crate::hash::to_bytes(&hash)));
+        }
+        if whole_state {
+            // The state has every unspent output; one no block above the
+            // base made was made at or below it.
+            let outputs = l.tree.outputs(&txn).map_err(err)?;
+            for coin in self.wallet.scan(&outputs) {
+                if !found.iter().any(|o| o.record == coin.record) {
+                    found.push(owned(coin.r, coin.amount, coin.record, base, &txn)?);
+                }
             }
-            end = top.saturating_add(1).saturating_add(GAP);
         }
         let known = self.store.owned(&txn).map_err(err)?;
         drop(txn);
@@ -316,7 +287,6 @@ impl Cli {
                     .map_err(err)?;
             }
         }
-        let top = found.iter().map(|o| o.index).max();
         for o in &found {
             // A state scan doesn't know heights below the base: keep the
             // one we know, if it's earlier.
@@ -331,23 +301,28 @@ impl Cli {
                 _ => *o,
             };
             self.store.put_owned(&mut txn, &o).map_err(err)?;
+            // Found on restore: earlier signatures by its keys may exist
+            // that we don't know of.
+            let c = &o.record.commitment;
+            if restoring && old.is_none() {
+                let leaves = self.store.leaves(&txn, c).map_err(err)?;
+                self.store
+                    .set_leaves(
+                        &mut txn,
+                        c,
+                        Leaves {
+                            unknown: true,
+                            ..leaves
+                        },
+                    )
+                    .map_err(err)?;
+            }
         }
         for (h, hash) in &hashes {
             self.store.set_block_hash(&mut txn, *h, hash).map_err(err)?;
         }
         self.store.set_synced(&mut txn, tip.height).map_err(err)?;
-        if let Some(top) = top
-            && top >= next
-        {
-            self.store.set_next_index(&mut txn, top + 1).map_err(err)?;
-        }
         if restoring && self.synced.load(Ordering::Relaxed) {
-            // Skip past key indices that may have been used and spent: their
-            // keys may have signed already.
-            let next = self.store.next_index(&txn).map_err(err)?;
-            self.store
-                .set_next_index(&mut txn, next.saturating_add(GAP))
-                .map_err(err)?;
             self.store.set_restoring(&mut txn, false).map_err(err)?;
             (self.log)(format!(
                 "wallet: restored; {} output{} found",
@@ -372,6 +347,9 @@ impl Cli {
                     self.store
                         .remove_owned(&mut txn, &o.record.commitment)
                         .map_err(err)?;
+                    self.store
+                        .remove_leaves(&mut txn, &o.record.commitment)
+                        .map_err(err)?;
                     None
                 }
                 _ => None,
@@ -388,18 +366,6 @@ impl Cli {
             }
         }
         txn.commit().map_err(err)
-    }
-
-    /// The tags of key indices below `end` (cached: computing each takes a
-    /// hash).
-    fn tags(&self, end: u32) -> HashMap<Tag, u32> {
-        let mut cache = self.tag_cache.lock().expect("tag cache");
-        if cache.end < end {
-            let more = self.wallet.tags(cache.end..end);
-            cache.map.extend(more);
-            cache.end = end;
-        }
-        cache.map.clone()
     }
 
     /// The wallet's unspent outputs (brought up to date first), each with
@@ -434,9 +400,9 @@ impl Cli {
                 Use::Spendable
             };
             out.push(Holding {
-                known_reward: self.store.is_reward(&txn, o.index).map_err(err)?,
+                known_reward: self.store.is_reward(&txn, &o.r).map_err(err)?,
                 coin: Coin {
-                    index: o.index,
+                    r: o.r,
                     position,
                     amount: o.amount,
                     record: o.record,
@@ -446,7 +412,7 @@ impl Cli {
                 state,
             });
         }
-        out.sort_by_key(|h| (h.owned.height, h.coin.index));
+        out.sort_by_key(|h| (h.owned.height, std::cmp::Reverse(h.coin.amount), h.coin.r));
         Ok(out)
     }
 
@@ -527,8 +493,8 @@ impl Cli {
             return Ok("no outputs".into());
         }
         let mut lines = vec![format!(
-            "{:>7}  {:>16}  {:>7}  {:>6}  {}",
-            "key", "coins", "height", "confs", "status"
+            "{:<8}  {:>16}  {:>7}  {:>6}  {}",
+            "output", "coins", "height", "confs", "status"
         )];
         for h in &held {
             let status = match h.state {
@@ -540,8 +506,8 @@ impl Cli {
                 Use::Spending => "being spent (in the mempool)".to_string(),
             };
             lines.push(format!(
-                "{:>7}  {:>16}  {:>7}  {:>6}  {status}{}",
-                h.coin.index,
+                "{:<8}  {:>16}  {:>7}  {:>6}  {status}{}",
+                &hex(&h.coin.record.commitment.0)[..8],
                 coins(h.coin.amount),
                 h.owned.height,
                 h.confirmations,
@@ -588,12 +554,7 @@ impl Cli {
         ))
     }
 
-    fn send(
-        &self,
-        amount: Amount,
-        fee: Amount,
-        file: &str,
-    ) -> Result<String, String> {
+    fn send(&self, amount: Amount, fee: Amount, file: &str) -> Result<String, String> {
         if amount == 0 {
             return Err("the amount must be more than 0".into());
         }
@@ -601,34 +562,21 @@ impl Cli {
             return Err(format!("{file} exists already"));
         }
         let need = amount.checked_add(fee).ok_or("too much")?;
-        // Coins are spent by key: every output at a key index together, so
-        // the one-time key signs once. A key with any output that
-        // can't be spent yet is left alone.
-        let held = self.holdings()?;
-        let mut groups: Vec<Vec<Coin>> = Vec::new();
-        for h in &held {
-            if held
-                .iter()
-                .any(|o| o.coin.index == h.coin.index && o.state != Use::Spendable)
-            {
-                continue;
-            }
-            match groups.iter_mut().find(|g| g[0].index == h.coin.index) {
-                Some(g) => g.push(h.coin),
-                None => groups.push(vec![h.coin]),
-            }
-        }
-        groups.sort_by_key(|g| std::cmp::Reverse(g.iter().map(|c| c.amount).sum::<Amount>()));
+        // The largest spendable coins first.
+        let mut spendable: Vec<Coin> = self
+            .holdings()?
+            .into_iter()
+            .filter(|h| h.state == Use::Spendable)
+            .map(|h| h.coin)
+            .collect();
+        spendable.sort_by_key(|c| std::cmp::Reverse(c.amount));
         let (mut picked, mut total) = (Vec::new(), 0u64);
-        for g in groups {
-            if total >= need {
+        for c in spendable {
+            if total >= need || picked.len() == MAX_INPUTS {
                 break;
             }
-            if picked.len() + g.len() > MAX_INPUTS {
-                continue;
-            }
-            total += g.iter().map(|c| c.amount).sum::<Amount>();
-            picked.extend(g);
+            total += c.amount;
+            picked.push(c);
         }
         if total < need {
             return Err(format!(
@@ -647,13 +595,13 @@ impl Cli {
         for chunk in id.chunks_exact_mut(4) {
             chunk.copy_from_slice(&rng.next_element().as_u32().to_le_bytes());
         }
-        let mut txn = self.ledger.env.write_txn().map_err(err)?;
         let change = total - need;
         let change = if change > 0 {
-            Some((self.store.take_index(&mut txn).map_err(err)?, change))
+            Some((self.wallet.new_keys().map_err(err)?.r, change))
         } else {
             None
         };
+        let mut txn = self.ledger.env.write_txn().map_err(err)?;
         let sent = Sent {
             id,
             amount,
@@ -661,14 +609,12 @@ impl Cli {
             coins: picked,
             change,
             created: now(),
+            cancelled: false,
             tx: None,
         };
         self.store.put_sent(&mut txn, &sent).map_err(err)?;
         txn.commit().map_err(err)?;
-        if let Err(e) = write_new(
-            file,
-            &Slate { id, amount, fee }.to_text(),
-        ) {
+        if let Err(e) = write_new(file, &Slate { id, amount, fee }.to_text()) {
             let _ = self.forget(&id);
             return Err(e);
         }
@@ -698,16 +644,16 @@ impl Cli {
         if Path::new(&out_file).exists() {
             return Err(format!("{out_file} exists already"));
         }
-        let mut txn = self.ledger.env.write_txn().map_err(err)?;
-        let index = self.store.take_index(&mut txn).map_err(err)?;
-        let output = self.wallet.key_for(index).pay(slate.amount);
+        let keys = self.wallet.new_keys().map_err(err)?;
+        let output = keys.pay(slate.amount);
         let commitment = output.commitment().ok_or("couldn't make the output")?;
+        let mut txn = self.ledger.env.write_txn().map_err(err)?;
         self.store
             .put_received(
                 &mut txn,
                 &Received {
                     id: slate.id,
-                    index,
+                    r: keys.r,
                     amount: slate.amount,
                     commitment,
                     created: now(),
@@ -745,12 +691,10 @@ impl Cli {
     fn finalize(&self, file: &str) -> Result<String, String> {
         let response = Response::from_text(&read(file)?)?;
         // Only a slate we sent, as we sent it.
-        let mut sent = self
-            .find(&hex(&response.id))?
-            .ok_or(
-                "unknown slate: we sent no payment with its id (it was modified, or isn't \
+        let mut sent = self.find(&hex(&response.id))?.ok_or(
+            "unknown slate: we sent no payment with its id (it was modified, or isn't \
                  ours); not finalized",
-            )?;
+        )?;
         if sent.tx.is_some() {
             return Err("that payment is finalized already (see txs)".into());
         }
@@ -778,31 +722,166 @@ impl Cli {
         {
             return Err("some of its coins are spent or moved; cancel it and send again".into());
         }
-        let (keys, inputs) = sent.coins.iter().map(|c| self.wallet.input(c)).unzip();
         let mut outputs = vec![response.output];
-        if let Some((index, amount)) = sent.change {
-            outputs.push(self.wallet.key_for(index).pay(amount));
+        if let Some((r, amount)) = sent.change {
+            outputs.push(self.wallet.keys_for(&r).pay(amount));
         }
+        let bytes = self.sign(&mut sent, outputs)?;
+        Ok(self.submitted(&sent, &bytes, "signed"))
+    }
+
+    /// Signs a spend of `sent`'s coins to `outputs`, each coin with a leaf
+    /// of its key tree that hasn't signed (as far as we know: we record
+    /// ours, and look in the mempool for others), and keeps it as `sent`'s
+    /// transaction. The leaves and the transaction are stored before the
+    /// signatures go anywhere, so no key ever signs twice.
+    fn sign(&self, sent: &mut Sent, outputs: Vec<Output>) -> Result<Vec<u8>, String> {
+        let mut rng = crate::rng::Rng::from_os().map_err(err)?;
+        let mut txn = self.ledger.env.write_txn().map_err(err)?;
+        let mut leaves = Vec::with_capacity(sent.coins.len());
+        for c in &sent.coins {
+            let commitment = &c.record.commitment;
+            let mut known = self.store.leaves(&txn, commitment).map_err(err)?;
+            if let Some(tx) = self.mempool.spender(commitment) {
+                for i in tx
+                    .body
+                    .inputs
+                    .iter()
+                    .filter(|i| i.commitment == *commitment)
+                {
+                    known = known.with(i.leaf);
+                }
+            }
+            let leaf = known.next(rng.next_element().as_u32()).ok_or(format!(
+                "every key of output {} has signed: it can't be re-signed",
+                &hex(&commitment.0)[..8]
+            ))?;
+            self.store
+                .set_leaves(&mut txn, commitment, known.with(leaf))
+                .map_err(err)?;
+            leaves.push(leaf);
+        }
+        let (keys, inputs) = sent
+            .coins
+            .iter()
+            .zip(leaves)
+            .map(|(c, leaf)| self.wallet.input(c, leaf))
+            .unzip();
         let tx = Transaction::sign(TxBody { inputs, outputs }, keys).map_err(err)?;
         let bytes = tx.to_bytes();
-        // Keep the signed transaction before it goes anywhere: its keys
-        // must never sign anything else.
         sent.tx = Some(bytes.clone());
-        let mut txn = self.ledger.env.write_txn().map_err(err)?;
-        self.store.put_sent(&mut txn, &sent).map_err(err)?;
+        self.store.put_sent(&mut txn, sent).map_err(err)?;
         txn.commit().map_err(err)?;
-        Ok(match self.submit(&bytes) {
+        Ok(bytes)
+    }
+
+    /// Submits `sent`'s transaction `bytes`, saying what happened.
+    fn submitted(&self, sent: &Sent, bytes: &[u8], what: &str) -> String {
+        match self.submit(bytes) {
             Ok(id) => format!(
-                "payment {} signed and submitted: transaction {}",
+                "payment {} {what} and submitted: transaction {}",
                 hex(&sent.id),
                 &hex(&crate::hash::to_bytes(&id))[..16]
             ),
             Err(e) => format!(
-                "payment {} signed, but the mempool turned it away: {e}\n\
+                "payment {} {what}, but the mempool turned it away: {e}\n\
                  it stays on record (txs) and is submitted again",
                 hex(&sent.id)
             ),
-        })
+        }
+    }
+
+    /// A signed payment not yet in a block, for replacing.
+    fn replaceable(&self, prefix: &str, fee: Amount) -> Result<Sent, String> {
+        let sent = self.find(prefix)?.ok_or("no payment of ours has that id")?;
+        if sent.tx.is_none() {
+            return Err("that payment isn't signed yet: cancel it and send again".into());
+        }
+        if !self.unconfirmed(&sent) {
+            return Err("that payment is in a block already".into());
+        }
+        if fee <= sent.fee {
+            return Err(format!(
+                "a replacement must pay a higher fee than its {}",
+                coins(sent.fee)
+            ));
+        }
+        // The mempool also wants more per byte: a replacement is at most
+        // the same size (the same inputs, no more outputs), so a higher fee
+        // pays that too.
+        Ok(sent)
+    }
+
+    fn bump(&self, prefix: &str, fee: Amount) -> Result<String, String> {
+        let mut sent = self.replaceable(prefix, fee)?;
+        if sent.cancelled {
+            return Err(
+                "that payment is being cancelled: cancel it again with a higher fee \
+                        to raise the cancellation's"
+                    .into(),
+            );
+        }
+        let more = fee - sent.fee;
+        let change = sent.change.map_or(0, |(_, a)| a);
+        if more > change {
+            return Err(format!(
+                "its change ({} coins) can't cover {} more in fees",
+                coins(change),
+                coins(more)
+            ));
+        }
+        let old = Transaction::from_bytes(sent.tx.as_ref().expect("signed"))
+            .ok_or("its stored transaction doesn't decode")?;
+        // The receiver's output, unchanged; the change, smaller, with new
+        // keys.
+        let mut outputs = vec![old.body.outputs[0]];
+        sent.change = if change > more {
+            let keys = self.wallet.new_keys().map_err(err)?;
+            outputs.push(keys.pay(change - more));
+            Some((keys.r, change - more))
+        } else {
+            None
+        };
+        sent.fee = fee;
+        let bytes = self.sign(&mut sent, outputs)?;
+        (self.log)(format!(
+            "wallet: payment {} re-signed with fee {}",
+            hex(&sent.id),
+            coins(fee)
+        ));
+        Ok(self.submitted(&sent, &bytes, &format!("re-signed with fee {}", coins(fee))))
+    }
+
+    /// Replaces signed payment `prefix` with a transaction paying its coins
+    /// back to the wallet, with fee `fee`.
+    fn cancel_signed(&self, prefix: &str, fee: Amount) -> Result<String, String> {
+        let mut sent = self.replaceable(prefix, fee)?;
+        let total: Amount = sent.coins.iter().map(|c| c.amount).sum();
+        if fee >= total {
+            return Err(format!(
+                "the fee must be less than its coins' {}",
+                coins(total)
+            ));
+        }
+        let keys = self.wallet.new_keys().map_err(err)?;
+        sent.change = Some((keys.r, total - fee));
+        sent.fee = fee;
+        sent.cancelled = true;
+        let bytes = self.sign(&mut sent, vec![keys.pay(total - fee)])?;
+        (self.log)(format!(
+            "wallet: payment {} replaced by one paying its coins back (fee {})",
+            hex(&sent.id),
+            coins(fee)
+        ));
+        Ok(self.submitted(
+            &sent,
+            &bytes,
+            &format!(
+                "replaced by a transaction paying its coins back (fee {}); if the payment \
+                 gets into a block first, it stands",
+                coins(fee)
+            ),
+        ))
     }
 
     /// Adds a transaction to the mempool and has the node announce it.
@@ -853,11 +932,33 @@ impl Cli {
                 None => "waiting for the receiver's response".to_string(),
                 Some(_) if !self.unconfirmed(s) => {
                     self.forget(&s.id)?;
-                    "confirmed (now dropped from this list)".to_string()
+                    // Cancelled: which spend won?
+                    let back = s
+                        .change
+                        .and_then(|(r, a)| self.wallet.keys_for(&r).pay(a).commitment());
+                    let owned = {
+                        let txn = self.ledger.env.read_txn().map_err(err)?;
+                        self.store.owned(&txn).map_err(err)?
+                    };
+                    let returned = back.is_some_and(|c| {
+                        self.ledger.unspent(&c).is_some()
+                            || owned.iter().any(|o| o.record.commitment == c)
+                    });
+                    match (s.cancelled, returned) {
+                        (true, true) => "cancelled: its coins came back (now dropped from this \
+                                         list)"
+                            .to_string(),
+                        (true, false) => "went through before its cancellation could (now \
+                                          dropped from this list)"
+                            .to_string(),
+                        _ => "confirmed (now dropped from this list)".to_string(),
+                    }
                 }
                 Some(tx) => {
                     let id = Transaction::id_of(tx);
-                    if self.mempool.knows(&id) {
+                    if self.mempool.knows(&id) && s.cancelled {
+                        "being cancelled: its coins paid back, waiting for a block".to_string()
+                    } else if self.mempool.knows(&id) {
                         "submitted, waiting for a block".to_string()
                     } else {
                         "signed, not in the mempool (submitted again at the next start)".to_string()
@@ -892,7 +993,7 @@ impl Cli {
         })
     }
 
-    fn cancel(&self, prefix: &str) -> Result<String, String> {
+    fn cancel(&self, prefix: &str, fee: Option<Amount>) -> Result<String, String> {
         let Some(sent) = self.find(prefix)? else {
             let got = self
                 .pending()?
@@ -908,9 +1009,15 @@ impl Cli {
             ));
         };
         if sent.tx.is_some() {
-            return Err("that payment is signed already, so it can't be cancelled: \
-                        its coins' keys are used, and only that transaction may spend them"
-                .into());
+            return match fee {
+                Some(fee) => self.cancel_signed(prefix, fee),
+                None => Err(format!(
+                    "that payment is signed already: cancelling it replaces it with a \
+                     transaction paying its coins back, which must pay a higher fee than its \
+                     {} (cancel <id> <fee>)",
+                    coins(sent.fee)
+                )),
+            };
         }
         self.forget(&sent.id)?;
         (self.log)(format!("wallet: payment {} cancelled", hex(&sent.id)));
@@ -990,7 +1097,6 @@ mod tests {
             wallet,
             synced: Arc::new(AtomicBool::new(true)),
             maturity: 3,
-            tag_cache: Mutex::default(),
             log: Box::new(|_| {}),
         };
         Node {
@@ -1035,26 +1141,40 @@ mod tests {
         (header, block)
     }
 
-    /// An output of `amount` for key `index` of `n`'s wallet.
-    fn pay_to(n: &Node, index: u32, amount: Amount) -> OutputRecord {
-        n.cli.wallet.key_for(index).pay(amount).record().unwrap()
+    /// An output of `amount` for `n`'s wallet, with key seed `r`.
+    fn pay_to(n: &Node, r: u8, amount: Amount) -> OutputRecord {
+        n.cli
+            .wallet
+            .keys_for(&[r; 16])
+            .pay(amount)
+            .record()
+            .unwrap()
     }
 
+    /// The `outputs` lines, without the header or each output's id.
     fn outputs(n: &Node) -> Vec<String> {
-        run(n, "outputs")
-            .unwrap()
-            .lines()
-            .skip(1)
-            .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        let text = run(n, "outputs").unwrap();
+        let lines: Vec<&str> = text.lines().skip(1).collect();
+        lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let words = l.split_whitespace();
+                let skip = usize::from(i + 1 < lines.len());
+                words.skip(skip).collect::<Vec<_>>().join(" ")
+            })
             .collect()
     }
 
-    /// An output of `amount` for a fresh key of `n`'s wallet.
+    /// An output of `amount` for new keys of `n`'s wallet.
     fn pay(n: &Node, amount: Amount) -> OutputRecord {
-        let mut txn = n.cli.ledger.env.write_txn().unwrap();
-        let i = n.cli.store.take_index(&mut txn).unwrap();
-        txn.commit().unwrap();
-        n.cli.wallet.key_for(i).pay(amount).record().unwrap()
+        n.cli
+            .wallet
+            .new_keys()
+            .unwrap()
+            .pay(amount)
+            .record()
+            .unwrap()
     }
 
     fn run(n: &Node, line: &str) -> Result<String, String> {
@@ -1087,21 +1207,20 @@ mod tests {
     fn rewards_mature_and_outputs_are_listed() {
         let g = genesis();
         let (alice, other) = (node(&g), node(&g));
-        // A reward of ours for key 0, and a payment for key 1.
+        // A reward of ours, and a payment.
         let mut txn = alice.cli.ledger.env.write_txn().unwrap();
-        let r = alice.cli.store.take_index(&mut txn).unwrap();
-        alice.cli.store.mark_reward(&mut txn, r).unwrap();
+        alice.cli.store.mark_reward(&mut txn, &[7; 16]).unwrap();
         txn.commit().unwrap();
         block(
             &[&alice, &other],
-            &[pay_to(&alice, r, 50 * COIN), pay(&alice, 2 * COIN)],
+            &[pay_to(&alice, 7, 50 * COIN), pay(&alice, 2 * COIN)],
             &[],
         );
         assert_eq!(
             outputs(&alice),
             [
-                "0 50 1 1 immature: 2 more blocks (mining reward)",
-                "1 2 1 1 spendable",
+                "50 1 1 immature: 2 more blocks (mining reward)",
+                "2 1 1 spendable",
                 "2 outputs, 52 coins"
             ]
         );
@@ -1146,15 +1265,15 @@ mod tests {
     }
 
     #[test]
-    fn a_restored_wallet_finds_its_outputs_and_skips_used_keys() {
+    fn a_restored_wallet_finds_its_outputs() {
         let g = genesis();
         let entropy = [42; 32];
         let alice = node_with(&g, entropy, false);
-        // Far-apart key indices, each within the scan gap of the last.
+        // Outputs with random keys: nothing to count up to.
         let created = [
-            pay_to(&alice, 3, COIN),
-            pay_to(&alice, 900, 2 * COIN),
-            pay_to(&alice, 1800, 4 * COIN),
+            pay(&alice, COIN),
+            pay(&alice, 2 * COIN),
+            pay(&alice, 4 * COIN),
         ];
         block(&[&alice], &created, &[]);
         let copy = node_with(&g, entropy, true);
@@ -1187,7 +1306,19 @@ mod tests {
         );
         let txn = copy.cli.ledger.env.read_txn().unwrap();
         assert!(!copy.cli.store.restoring(&txn).unwrap());
-        assert_eq!(copy.cli.store.next_index(&txn).unwrap(), 1801 + GAP);
+        // Their keys' history is unknown: their first spends take random
+        // leaves of the upper half.
+        for c in &created {
+            assert!(copy.cli.store.leaves(&txn, &c.commitment).unwrap().unknown);
+            assert!(
+                !alice
+                    .cli
+                    .store
+                    .leaves(&alice.cli.ledger.env.read_txn().unwrap(), &c.commitment)
+                    .unwrap()
+                    .unknown
+            );
+        }
         drop(txn);
         // The words print bare, so they paste straight back into a restore.
         let seed = run(&copy, "seed").unwrap();
@@ -1200,7 +1331,7 @@ mod tests {
         assert_eq!(spendable(&copy), "7");
         assert_eq!(
             outputs(&copy)[0],
-            "3 1 1 3 spendable (found on restore: may be a mining reward)"
+            "4 1 3 spendable (found on restore: may be a mining reward)"
         );
     }
 
@@ -1227,7 +1358,13 @@ mod tests {
         };
         // Changed on the way: the amount, the fee, the output's amount.
         for (r, name) in [
-            (Response { amount: 4 * COIN, ..good }, "amount"),
+            (
+                Response {
+                    amount: 4 * COIN,
+                    ..good
+                },
+                "amount",
+            ),
             (Response { fee: 0, ..good }, "fee"),
         ] {
             let e = finalize(r, name).unwrap_err();
@@ -1238,13 +1375,121 @@ mod tests {
         let e = finalize(Response { output, ..good }, "output").unwrap_err();
         assert!(e.starts_with("modified slate"), "{e}");
         // Not ours.
-        let e = finalize(Response { id: [9; 16], ..good }, "unknown").unwrap_err();
+        let e = finalize(
+            Response {
+                id: [9; 16],
+                ..good
+            },
+            "unknown",
+        )
+        .unwrap_err();
         assert!(e.starts_with("unknown slate"), "{e}");
         // As sent: it goes through.
         assert!(
             run(&alice, &format!("finalize {response}"))
                 .unwrap()
                 .contains("signed and submitted")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Mines the mempool's transactions into a block on every node.
+    fn mine(nodes: &[&Node]) {
+        let l = &nodes[0].cli.ledger;
+        let (mut created, mut spent) = (vec![], vec![]);
+        for (_, tx, _) in nodes[0].cli.mempool.select(&**l, usize::MAX) {
+            created.extend(tx.body.outputs.iter().map(|o| o.record().unwrap()));
+            spent.extend(tx.body.inputs.iter().map(|i| i.commitment));
+        }
+        block(nodes, &created, &spent);
+    }
+
+    /// The leaf the mempool's spend of `coin` signs with.
+    fn leaf_spending(n: &Node, coin: &OutputRecord) -> u8 {
+        let tx = n.cli.mempool.spender(&coin.commitment).unwrap();
+        tx.body.inputs[0].leaf
+    }
+
+    #[test]
+    fn a_signed_payment_can_be_bumped_or_cancelled() {
+        let g = genesis();
+        let (alice, bob) = (node(&g), node(&g));
+        let coin = pay(&alice, 5 * COIN);
+        block(&[&alice, &bob], &[coin], &[]);
+        let dir = std::env::temp_dir().join(format!("r-cli-b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let slate = dir.join("s").display().to_string();
+        let out = run(&alice, &format!("send 3 0.01 {slate}")).unwrap();
+        let id = out.split_whitespace().nth(1).unwrap().to_string();
+        assert!(
+            run(&alice, &format!("bump {id} 0.02"))
+                .unwrap_err()
+                .contains("isn't signed")
+        );
+        run(&bob, &format!("receive {slate}")).unwrap();
+        run(&alice, &format!("finalize {slate}.response")).unwrap();
+        assert_eq!(leaf_spending(&alice, &coin), 0);
+
+        // A higher fee, out of the change, signed with the next leaf: it
+        // replaces the first in the mempool.
+        assert!(
+            run(&alice, &format!("bump {id} 0.005"))
+                .unwrap_err()
+                .contains("higher fee")
+        );
+        assert!(
+            run(&alice, &format!("bump {id} 3"))
+                .unwrap_err()
+                .contains("can't cover")
+        );
+        assert!(
+            run(&alice, &format!("bump {id} 0.02"))
+                .unwrap()
+                .contains("re-signed with fee 0.02 and submitted")
+        );
+        assert_eq!(leaf_spending(&alice, &coin), 1);
+        assert_eq!(alice.cli.mempool.size(&*alice.cli.ledger).0, 1);
+        assert!(
+            run(&alice, "info")
+                .unwrap()
+                .contains("change      1.98 coins")
+        );
+
+        // Cancelling needs a fee above the bumped one.
+        assert!(
+            run(&alice, &format!("cancel {id}"))
+                .unwrap_err()
+                .contains("cancel <id> <fee>")
+        );
+        assert!(run(&alice, &format!("cancel {id} 0.02")).is_err());
+        // With the wallet's record of its leaves lost, the mempool's spend
+        // still keeps leaf 1 from signing again.
+        let mut txn = alice.cli.ledger.env.write_txn().unwrap();
+        alice
+            .cli
+            .store
+            .set_leaves(&mut txn, &coin.commitment, Leaves::default().with(0))
+            .unwrap();
+        txn.commit().unwrap();
+        run(&alice, &format!("cancel {id} 0.03")).unwrap();
+        assert_eq!(leaf_spending(&alice, &coin), 2);
+        assert!(run(&alice, "txs").unwrap().contains("being cancelled"));
+        let txn = alice.cli.ledger.env.read_txn().unwrap();
+        assert_eq!(
+            alice.cli.store.leaves(&txn, &coin.commitment).unwrap(),
+            Leaves::default().with(0).with(1).with(2)
+        );
+        drop(txn);
+
+        // Mined: the coins came back, less the fee.
+        mine(&[&alice, &bob]);
+        assert_eq!(spendable(&alice), "4.97");
+        assert_eq!(spendable(&bob), "0");
+        assert!(
+            run(&alice, "txs")
+                .unwrap()
+                .contains("cancelled: its coins came back")
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1273,8 +1518,8 @@ mod tests {
         assert_eq!(
             outputs(&copy),
             [
-                "0 1 2 3 spendable (found on restore: may be a mining reward)",
-                "1 2 3 2 immature: 1 more block (found on restore: may be a mining reward)",
+                "1 2 3 spendable (found on restore: may be a mining reward)",
+                "2 3 2 immature: 1 more block (found on restore: may be a mining reward)",
                 "2 outputs, 3 coins"
             ]
         );

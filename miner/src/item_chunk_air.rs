@@ -58,6 +58,17 @@ use crate::poseidon2_air::{self, OUTPUT_OFFSET};
 use crate::transaction::Transaction;
 
 const COMMIT_LEN: usize = HASH_LEN + AMOUNT_LIMBS + NONCE_LIMBS;
+/// Nonce limbs absorbed with the amount (`R0`), and after it (`R1`).
+const NONCE_A: usize = HASH_LEN - AMOUNT_LIMBS;
+const NONCE_B: usize = NONCE_LIMBS - NONCE_A;
+const _: () = assert!(COMMIT_LEN <= 3 * HASH_LEN && NONCE_B <= HASH_LEN);
+/// Fingerprint powers: enough for the longest element (an output's
+/// commitment and nonce).
+const POWERS: usize = if HASH_LEN + NONCE_LIMBS > 2 * HASH_LEN {
+    HASH_LEN + NONCE_LIMBS
+} else {
+    2 * HASH_LEN
+};
 const LIMB_BITS: usize = output::LIMB_BITS as usize;
 /// Net-value carries: bits per carry, enough for [`MAX_ITEMS`] items.
 const CARRY_BITS: usize = 15;
@@ -370,17 +381,21 @@ impl Air for ItemChunkAir {
         c.assert_zero(r0 * (l[13] - k(domain::OUTPUT)));
         c.assert_zero(r0 * (l[14] - k(COMMIT_LEN as u32)));
         c.assert_zero(r0 * l[15]);
-        for j in 0..WIDTH {
+        for (j, &x) in n[..WIDTH].iter().enumerate() {
             let absorbed = match j {
-                0..4 => l[AMT + j],
-                4..8 => l[NONCE + j - 4],
+                j if j < AMOUNT_LIMBS => l[AMT + j],
+                j if j < HASH_LEN => l[NONCE + j - AMOUNT_LIMBS],
                 _ => zero,
             };
-            c.assert_zero(r0 * (n[j] - out(j) - absorbed));
+            c.assert_zero(r0 * (x - out(j) - absorbed));
         }
         let r1 = p[R1] * io;
         for j in 0..WIDTH {
-            let absorbed = if j < 4 { l[NONCE + 4 + j] } else { zero };
+            let absorbed = if j < NONCE_B {
+                l[NONCE + NONCE_A + j]
+            } else {
+                zero
+            };
             c.assert_zero(r1 * (n[j] - out(j) - absorbed));
         }
         // Output amounts are 16-bit limbs (and the final row's bits are
@@ -402,7 +417,7 @@ impl Air for ItemChunkAir {
 
         // Fingerprints: commitments on R2 (the row's output), signatures on
         // R0 (an input's pkh is the row's input).
-        let mut powers = [[zero; 4]; 2 * HASH_LEN];
+        let mut powers = [[zero; 4]; POWERS];
         powers[0][0] = one;
         for j in 1..powers.len() {
             powers[j] = ext_mul(powers[j - 1], lambda);
@@ -590,7 +605,7 @@ pub fn stream(txs: &[Transaction]) -> Vec<Item> {
         });
         for input in &body.inputs {
             items.push(Item::Input {
-                pkh: input.pubkey.hash(),
+                pkh: input.key_root(),
                 amount: output::amount_limbs(input.amount),
                 nonce: output::nonce_limbs(&input.nonce),
                 position: input.position,
@@ -737,7 +752,7 @@ impl ItemChunkAir {
             txs,
             b: *entry,
         };
-        let powers: Vec<BabyBear4> = (0..2 * HASH_LEN)
+        let powers: Vec<BabyBear4> = (0..POWERS)
             .scan(BabyBear4::ONE, |pw, _| {
                 let v = *pw;
                 *pw *= lambda;
@@ -821,9 +836,11 @@ impl ItemChunkAir {
             let mut input = zeros;
             if kin || kout {
                 input = out0;
-                for j in 0..4 {
+                for j in 0..AMOUNT_LIMBS {
                     input[j] += amount[j];
-                    input[4 + j] += nonce[j];
+                }
+                for j in 0..NONCE_A {
+                    input[AMOUNT_LIMBS + j] += nonce[j];
                 }
             }
             let out1 = row_perm(1, input, &st);
@@ -842,8 +859,8 @@ impl ItemChunkAir {
             let mut input = zeros;
             if kin || kout {
                 input = out1;
-                for j in 0..4 {
-                    input[j] += nonce[4 + j];
+                for j in 0..NONCE_B {
+                    input[j] += nonce[NONCE_A + j];
                 }
             }
             let out2 = row_perm(2, input, &st);
@@ -970,7 +987,7 @@ mod tests {
     use crate::fri::FriParams;
     use crate::output::{Amount, NONCE_LEN, Nonce, Output};
     use crate::stark;
-    use crate::transaction::{Input, TxBody, pubkey_hash};
+    use crate::transaction::{Input, KeyTree, TxBody};
     use crate::wots::{PublicKey, SecretKey, keygen};
 
     const LAMBDA: BabyBear4 = BabyBear4::new([3, 5, 7, 11]);
@@ -986,13 +1003,16 @@ mod tests {
     fn input(n: u32, amount: Amount) -> (SecretKey, Input) {
         let (sk, pubkey) = key(n);
         let nonce: Nonce = [n as u8 + 1; NONCE_LEN];
-        let commitment = output::commit(&pubkey_hash(&pubkey), amount, &nonce).unwrap();
+        let tree = KeyTree::single(&pubkey);
+        let commitment = output::commit(&tree.output_hash(), amount, &nonce).unwrap();
         (
             sk,
             Input {
                 commitment,
                 position: 1000 + n as u64,
                 pubkey,
+                leaf: 0,
+                path: tree.path(0),
                 amount,
                 nonce,
             },
@@ -1038,7 +1058,7 @@ mod tests {
                 t.body
                     .inputs
                     .iter()
-                    .map(move |i| sig_element(LAMBDA, &i.pubkey.hash(), &msg))
+                    .map(move |i| sig_element(LAMBDA, &i.key_root(), &msg))
             }),
         );
         [p_in, p_out, p_sig]

@@ -5,6 +5,8 @@
 //! records, each in canonical order (ascending state-tree key, no
 //! duplicates), and one chain proof ([`crate::chain`]) covering its own
 //! transition and the whole history before it. Transactions stay private.
+//! No commitment may be in both lists: a block can't spend an output it
+//! creates, so every input was confirmed in an earlier block.
 //!
 //! Fees are implicit and there is no separate reward rule: transactions
 //! need not balance, and the only value rule is the block's, that
@@ -77,6 +79,10 @@ pub enum BlockError {
     /// The lists aren't in canonical order, repeat a commitment, or hold a
     /// commitment that isn't a valid key.
     NotCanonical,
+    /// A commitment is in both lists: the block spends an output it
+    /// creates, which isn't allowed (every input must be confirmed in an
+    /// earlier block).
+    SpendsItsOwnOutput,
     /// The state tree rejected an operation (a missing or spent input, a
     /// duplicate output).
     State(state::Error),
@@ -103,6 +109,7 @@ impl fmt::Display for BlockError {
             Self::Tx(i, e) => write!(f, "transaction {i}: {e:?}"),
             Self::Position(i) => write!(f, "transaction {i} names the wrong position for an input"),
             Self::NotCanonical => write!(f, "lists not in canonical order"),
+            Self::SpendsItsOwnOutput => write!(f, "spends an output it creates"),
             Self::State(e) => write!(f, "state: {e:?}"),
             Self::Proof(e) => write!(f, "proof: {e}"),
             Self::Net(n) => write!(f, "transactions create {n}, not the subsidy"),
@@ -124,6 +131,14 @@ impl Block {
     pub fn body_hash(&self) -> Hash {
         chunk::hash_of(domain::BLOCK_BODY, &encode_body(self))
     }
+}
+
+/// Whether a commitment is in both lists (a block spending an output it
+/// creates).
+pub(crate) fn spends_own_output(inputs: &[Commitment], outputs: &[OutputRecord]) -> bool {
+    let created: std::collections::HashSet<&Commitment> =
+        outputs.iter().map(|o| &o.commitment).collect();
+    inputs.iter().any(|c| created.contains(c))
 }
 
 /// The canonical order: ascending key, compared on canonical limbs.
@@ -336,6 +351,9 @@ pub fn apply(
     if tree.state(txn).map_err(BlockError::State)? != parent.state {
         return Err(BlockError::StateMismatch);
     }
+    if spends_own_output(&block.inputs, &block.outputs) {
+        return Err(BlockError::SpendsItsOwnOutput);
+    }
     let proofs = tree
         .apply_block(txn, header.height, &block.outputs, &block.inputs)
         .map_err(BlockError::State)?;
@@ -385,7 +403,7 @@ pub const ITEM_SHAPES: [ItemChunkAir; 2] =
 pub const SIG_SHAPES: [SigChunkAir; 3] = [
     SigChunkAir { slots: 7 },
     SigChunkAir { slots: 31 },
-    SigChunkAir { slots: 126 },
+    SigChunkAir { slots: 124 },
 ];
 
 /// Cuts `n` things into chunks: full chunks of the largest capacity, then
@@ -541,6 +559,9 @@ impl BlockProver {
             .ok_or(BlockError::NotCanonical)?;
         sort_canonical(&mut inputs, |c| c)?;
         sort_canonical(&mut outputs, |o| &o.commitment)?;
+        if spends_own_output(&inputs, &outputs) {
+            return Err(BlockError::SpendsItsOwnOutput);
+        }
         let prev = tree.state(txn).map_err(BlockError::State)?;
 
         // Apply the state changes natively, in segments: all inserts, then
@@ -649,6 +670,8 @@ impl BlockProver {
                     .zip(&tx.signatures)
                     .map(move |(input, sig)| SigItem {
                         pubkey: input.pubkey.clone(),
+                        leaf: input.leaf,
+                        path: input.path,
                         sig: sig.clone(),
                         msg,
                     })
@@ -691,7 +714,7 @@ impl BlockProver {
         for (shape, range) in &sig_chunks {
             let pairs: Vec<(Hash, Hash)> = sig_items[range.clone()]
                 .iter()
-                .map(|s| (s.pubkey.hash(), s.msg))
+                .map(|s| (s.root(), s.msg))
                 .collect();
             let b = blinding();
             leaves.push(sig_chunk_air::chunk_hash(&b, &pairs));
@@ -772,7 +795,7 @@ mod tests {
     use super::*;
     use crate::db::test::TempEnv;
     use crate::output::{self, NONCE_LEN, Nonce, Output};
-    use crate::transaction::{Input, TxBody, pubkey_hash};
+    use crate::transaction::{Input, KeyTree, TxBody};
     use crate::wots::{SecretKey, keygen};
 
     const SUBSIDY: Amount = 50;
@@ -797,16 +820,16 @@ mod tests {
 
     #[test]
     fn cuts_into_full_chunks_and_a_fitting_rest() {
-        let caps = [7, 31, 126];
+        let caps = [7, 31, 124];
         assert_eq!(cut(0, &caps), vec![]);
         assert_eq!(cut(1, &caps), vec![(0, 0..1)]);
         assert_eq!(cut(7, &caps), vec![(0, 0..7)]);
         assert_eq!(cut(8, &caps), vec![(1, 0..8)]);
-        assert_eq!(cut(126, &caps), vec![(2, 0..126)]);
-        assert_eq!(cut(130, &caps), vec![(2, 0..126), (0, 126..130)]);
+        assert_eq!(cut(124, &caps), vec![(2, 0..124)]);
+        assert_eq!(cut(128, &caps), vec![(2, 0..124), (0, 124..128)]);
         assert_eq!(
             cut(300, &caps),
-            vec![(2, 0..126), (2, 126..252), (2, 252..300)]
+            vec![(2, 0..124), (2, 124..248), (2, 248..300)]
         );
     }
 
@@ -819,7 +842,7 @@ mod tests {
     /// An output paying `amount` to key `n`.
     fn pay(n: u32, amount: Amount) -> Output {
         Output {
-            hash: pubkey_hash(&key(n).1),
+            hash: KeyTree::single(&key(n).1).output_hash(),
             amount,
             nonce: [n as u8; NONCE_LEN],
         }
@@ -827,13 +850,16 @@ mod tests {
 
     fn spend(n: u32, amount: Amount, nonce: Nonce, position: u64) -> (SecretKey, Input) {
         let (sk, pubkey) = key(n);
-        let commitment = output::commit(&pubkey_hash(&pubkey), amount, &nonce).unwrap();
+        let tree = KeyTree::single(&pubkey);
+        let commitment = output::commit(&tree.output_hash(), amount, &nonce).unwrap();
         (
             sk,
             Input {
                 commitment,
                 position,
                 pubkey,
+                leaf: 0,
+                path: tree.path(0),
                 amount,
                 nonce,
             },

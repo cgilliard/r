@@ -204,7 +204,7 @@ fn open(log: &Log, data_dir: &Path, snap_sync_limit: u64) -> Result<Opened, Box<
     let consensus = Consensus::DEFAULT;
     log.line(
         "setting up the provers and verifier (item chunks of 682/2730, signature chunks of \
-         7/31/126, 16-op segments, nodes at 2^15)",
+         7/31/124, 16-op segments, nodes at 2^15)",
     );
     let keys = KeyCache::open(cache.join("keys"));
     let chain = provers(consensus, genesis, pow_tree, &keys);
@@ -390,7 +390,6 @@ pub fn run(data_dir: &Path, net: &Net, opts: &Options) -> Result<(), Box<dyn Err
         wallet,
         synced,
         maturity: opts.coin_maturity,
-        tag_cache: Default::default(),
         log: {
             let log = log.clone();
             Box::new(move |line| log.line(line))
@@ -552,7 +551,7 @@ impl Miner<'_> {
         };
         // Blocks this run mined, to tell them from peers' blocks.
         let mut ours: Vec<Hash> = Vec::new();
-        let mut reward_index: Option<u32> = None;
+        let mut reward_keys: Option<crate::wallet::OutputKeys> = None;
         let whose = |ours: &[Hash], h: &Header| {
             if ours.contains(&h.hash()) {
                 "our"
@@ -591,21 +590,21 @@ impl Miner<'_> {
             let picked = mempool.select(&**ledger, room);
             let fees: Amount = picked.iter().map(|(_, _, fee)| fee).sum();
             let mut txs: Vec<Transaction> = picked.iter().map(|(_, tx, _)| tx.clone()).collect();
-            // One key for the reward until a block of ours is finished (an
-            // attempt that never finished published nothing, so its key is
-            // fine to use again).
-            let index = match reward_index {
-                Some(i) => i,
+            // The same keys for the reward until a block of ours is
+            // finished (an attempt that never finished published nothing,
+            // so its keys are fine to use again).
+            let keys = match reward_keys {
+                Some(k) => k,
                 None => {
+                    let k = wallet.new_keys()?;
                     let mut txn = env.write_txn()?;
-                    let i = wallet_store.take_index(&mut txn)?;
-                    wallet_store.mark_reward(&mut txn, i)?;
+                    wallet_store.mark_reward(&mut txn, &k.r)?;
                     txn.commit()?;
-                    reward_index = Some(i);
-                    i
+                    reward_keys = Some(k);
+                    k
                 }
             };
-            let reward = wallet.key_for(index).pay(subsidy + fees);
+            let reward = keys.pay(subsidy + fees);
             log.line(format!(
                 "{} transaction{} from the mempool (fees {}); reward {} to our wallet",
                 picked.len(),
@@ -789,8 +788,8 @@ impl Miner<'_> {
                 n
             };
             // Finished and stored, won or lost: its output may get out, so
-            // the next block takes a new key.
-            reward_index = None;
+            // the next block takes new keys.
+            reward_keys = None;
             log.line(match added {
                 Added::Extended | Added::Reorg { .. } => format!(
                     "our block {} won height {} ({on_main} of ours on the main chain this run)",

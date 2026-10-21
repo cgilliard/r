@@ -1,234 +1,242 @@
 //! Wallets: one-time keys, output nonces that carry the amount, and
 //! recovery from a seed.
 //!
-//! A wallet derives everything from a seed and a key index: the WOTS key
-//! (one-time: each index takes one output, and its key signs once) and a
-//! 16-byte view secret. A [`OneTimeKey`] is the key's hash plus the view
-//! secret: what an output is made from. Nothing is ever published for others
-//! to pay to; the receiver makes its own output ([`Response`]).
+//! Every output a wallet makes (received, change or reward) gets its own
+//! random 16-byte key seed `r`. Its keys are a [`KeyTree`] of
+//! [`KEY_LEAVES`] one-time WOTS keys derived from the wallet's seed, `r`
+//! and the leaf; the output's hash is the tree's root. A spend signs with
+//! one leaf; replacing it (a higher fee, or a cancellation) signs with
+//! another, and the [`WalletStore`] records which leaves each output has
+//! used, so no key signs twice (outputs found on restore, whose history
+//! is unknown, sign with random leaves of the upper half: [`Leaves`]).
+//! Because `r` is random, no two outputs share
+//! keys, whatever the wallet remembers: a wallet restored with history
+//! missing (a fast-synced node), or two copies of one wallet, never reuse
+//! a key. Nothing is ever published for others to pay to; the receiver
+//! makes its own output ([`Response`]).
 //!
-//! The payer builds the output's 16-byte nonce from the view secret:
+//! An output's 32-byte nonce is:
 //!
-//! - bytes `0..8`: a tag, `H(view, NONCE_TAG)`, which lets the wallet spot
-//!   its outputs with one table lookup each;
-//! - bytes `8..16`: the amount (little-endian) XORed with
-//!   `H(view, NONCE_MASK)`.
+//! - bytes `0..16`: `r`, in the clear;
+//! - bytes `16..24`: a tag, `H(view, r)`, from the wallet's view secret;
+//! - bytes `24..32`: the amount (little-endian) XORed with another hash of
+//!   the view secret and `r`.
 //!
-//! Without the view secret both halves look random. The nonce is part of
-//! the output's commitment and stored in the state tree, so a wallet
-//! restored from its seed recovers every unspent output it owns, with its
-//! amount and position, from the tree alone ([`Wallet::scan`]): it derives
-//! the tags of its key indices, looks each output's tag up, decrypts the
-//! amount, and confirms it by recomputing the commitment.
+//! Without the view secret the tag and amount look random. The nonce is
+//! part of the output's commitment and stored in the state tree, so a
+//! wallet restored from its seed recovers every unspent output it owns,
+//! with its amount and position, from the tree alone ([`Wallet::scan`]):
+//! one hash per output checks the tag, and a match is confirmed by
+//! recomputing the commitment from its key tree. There's no index to keep
+//! and no gap to guess.
 //!
 //! **Paying.** Payments are interactive, through files (slates), as in
 //! Grin. The sender picks coins and writes a [`Slate`] (an id, the amount
-//! and fee); the receiver makes an output for the amount with a fresh key
-//! of its own and writes it back in a [`Response`]; the sender then signs
-//! the transaction (its coins in, the receiver's output and its change out)
-//! and submits it. Every output, received, change or reward, gets a fresh
-//! key index, so each one-time key signs exactly once.
-//!
-//! The response repeats the slate (id, amount and fee), and the sender
-//! finalizes only a response to a slate it sent, unchanged. The
-//! [`WalletStore`] keeps the seed, the next index
-//! and the sender's side of each payment ([`Sent`]) in LMDB.
+//! and fee); the receiver makes an output for the amount with new keys of
+//! its own and writes it back in a [`Response`]; the sender then signs the
+//! transaction (its coins in, the receiver's output and its change out)
+//! and submits it. The response repeats the slate (id, amount and fee), and
+//! the sender finalizes only a response to a slate it sent, unchanged. The
+//! [`WalletStore`] keeps the seed and the wallet's records in LMDB.
 
 use std::collections::HashMap;
-use std::ops::Range;
 
 use heed::types::Bytes;
 use heed::{Database, Env, RoTxn, RwTxn};
 
-use crate::babybear::{BabyBear, P};
-use crate::hash::{self, HASH_LEN, Hash, domain};
+use crate::babybear::BabyBear;
+use crate::hash::{self, Hash, domain};
 use crate::output::{
-    self, Amount, COMMITMENT_LEN, Commitment, NONCE_LEN, Nonce, OUTPUT_HASH_LEN, Output,
-    OutputHash, OutputRecord,
+    self, Amount, COMMITMENT_LEN, Commitment, NONCE_LEN, OUTPUT_HASH_LEN, Output, OutputHash,
+    OutputRecord,
 };
-use crate::transaction::{Input, pubkey_hash};
+use crate::transaction::{Input, KEY_LEAVES, KeyTree};
 use crate::wots::{self, PublicKey, SecretKey};
 
-/// Bytes of a view secret: four field elements.
-pub const VIEW_LEN: usize = 16;
-const VIEW_ELEMS: usize = VIEW_LEN / 4;
-/// Bytes of the tag, and of the encrypted amount, in a nonce.
+/// Bytes of an output's key seed `r`.
+pub const KEY_SEED_LEN: usize = 16;
+/// Each output's own random value: its keys derive from it (with the
+/// wallet's spend secret), so no two outputs ever share a key.
+pub type KeySeed = [u8; KEY_SEED_LEN];
+/// Bytes of the tag, and of the masked amount, in a nonce.
 const TAG_LEN: usize = 8;
+const _: () = assert!(KEY_SEED_LEN + TAG_LEN + 8 == NONCE_LEN);
 
-/// The tag in an output's nonce, which names the key index it's for.
-pub type Tag = [u8; TAG_LEN];
-
-/// The tag of `record`'s nonce.
-pub fn tag_of(record: &OutputRecord) -> Tag {
-    record.nonce[..TAG_LEN].try_into().expect("tag bytes")
+/// The key seed in `record`'s nonce.
+pub fn key_seed_of(record: &OutputRecord) -> KeySeed {
+    record.nonce[..KEY_SEED_LEN].try_into().expect("seed bytes")
 }
 
-/// What an output is made from: a one-time key's hash and its view secret.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OneTimeKey {
-    pub hash: OutputHash,
-    pub view: [u8; VIEW_LEN],
+/// `r` as eight 16-bit limbs (injective, so distinct seeds hash apart).
+fn seed_limbs(r: &KeySeed) -> [BabyBear; KEY_SEED_LEN / 2] {
+    core::array::from_fn(|i| BabyBear::new(u16::from_le_bytes([r[2 * i], r[2 * i + 1]]) as u32))
 }
 
-impl OneTimeKey {
-    /// An output paying `amount` to this key, with its nonce built from
-    /// the view secret.
-    ///
-    /// # Panics
-    /// If the view secret isn't canonical (one from [`Wallet::key_for`]
-    /// always is).
-    pub fn pay(&self, amount: Amount) -> Output {
-        Output {
-            hash: self.hash,
-            amount,
-            nonce: nonce_for(&self.view, amount),
-        }
-    }
-}
-
-fn view_elems(view: &[u8; VIEW_LEN]) -> Option<[BabyBear; VIEW_ELEMS]> {
-    let mut out = [BabyBear::ZERO; VIEW_ELEMS];
-    for (x, chunk) in out.iter_mut().zip(view.chunks_exact(4)) {
-        let v = u32::from_le_bytes(chunk.try_into().expect("4 bytes"));
-        if v >= P {
-            return None;
-        }
-        *x = BabyBear::new(v);
-    }
-    Some(out)
-}
-
-/// Eight bytes derived from a view secret under `dom`: the low 16 bits of
-/// four hash elements (each element is uniform mod `p`, so these bits are
-/// uniform up to a negligible bias).
-fn derive8(view: &[u8; VIEW_LEN], dom: u32) -> [u8; TAG_LEN] {
-    let v = view_elems(view).expect("canonical view secret");
-    let h = hash::sponge(dom, &[], &[&v]);
-    let mut out = [0u8; TAG_LEN];
-    for (chunk, x) in out.chunks_exact_mut(2).zip(&h) {
+/// Eight bytes from a hash: the low 16 bits of four elements (each
+/// uniform mod `p`, so these bits are uniform up to a negligible bias).
+fn bytes8(h: &Hash) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    for (chunk, x) in out.chunks_exact_mut(2).zip(h) {
         chunk.copy_from_slice(&(x.as_u32() as u16).to_le_bytes());
     }
     out
 }
 
-/// The nonce for paying `amount` to a key with view secret `view`.
-pub fn nonce_for(view: &[u8; VIEW_LEN], amount: Amount) -> Nonce {
-    let mut nonce = [0u8; NONCE_LEN];
-    nonce[..TAG_LEN].copy_from_slice(&derive8(view, domain::NONCE_TAG));
-    let mask = u64::from_le_bytes(derive8(view, domain::NONCE_MASK));
-    nonce[TAG_LEN..].copy_from_slice(&(amount ^ mask).to_le_bytes());
-    nonce
+/// What an output is made from: its key seed, the hash of its key tree,
+/// and the tag and mask its nonce needs (from the view secret).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputKeys {
+    pub r: KeySeed,
+    pub hash: OutputHash,
+    tag: [u8; TAG_LEN],
+    mask: u64,
 }
 
-/// The amount in a nonce built for view secret `view`.
-pub fn amount_in(view: &[u8; VIEW_LEN], nonce: &Nonce) -> Amount {
-    let mask = u64::from_le_bytes(derive8(view, domain::NONCE_MASK));
-    u64::from_le_bytes(nonce[TAG_LEN..].try_into().expect("8 bytes")) ^ mask
+impl OutputKeys {
+    /// An output paying `amount` to these keys: its nonce is `r`, the tag
+    /// and the masked amount.
+    pub fn pay(&self, amount: Amount) -> Output {
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce[..KEY_SEED_LEN].copy_from_slice(&self.r);
+        nonce[KEY_SEED_LEN..KEY_SEED_LEN + TAG_LEN].copy_from_slice(&self.tag);
+        nonce[KEY_SEED_LEN + TAG_LEN..].copy_from_slice(&(amount ^ self.mask).to_le_bytes());
+        Output {
+            hash: self.hash,
+            amount,
+            nonce,
+        }
+    }
 }
 
 /// An unspent output the wallet owns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Coin {
-    /// The key index it was paid to.
-    pub index: u32,
+    /// The key seed in its nonce.
+    pub r: KeySeed,
     /// Its slot in the state tree.
     pub position: u64,
     pub amount: Amount,
     pub record: OutputRecord,
 }
 
-/// Keys derived from a seed.
+/// Keys derived from a seed: one-time keys from the spend side, tags and
+/// amount masks from the view side.
 #[derive(Clone, Copy, Debug)]
 pub struct Wallet {
     seed: Hash,
+    view: Hash,
 }
 
 impl Wallet {
     pub fn from_seed(seed: Hash) -> Self {
-        Self { seed }
-    }
-
-    fn derive(&self, dom: u32, index: u32) -> Hash {
-        hash::sponge(dom, &[], &[&self.seed, &[BabyBear::new(index)]])
-    }
-
-    /// The one-time key pair at `index`.
-    pub fn key(&self, index: u32) -> (SecretKey, PublicKey) {
-        wots::keygen(self.derive(domain::WALLET_KEY, index))
-    }
-
-    /// The view secret at `index`.
-    pub fn view(&self, index: u32) -> [u8; VIEW_LEN] {
-        let h = self.derive(domain::WALLET_VIEW, index);
-        let mut view = [0u8; VIEW_LEN];
-        for (chunk, x) in view.chunks_exact_mut(4).zip(&h[..VIEW_ELEMS]) {
-            chunk.copy_from_slice(&x.as_u32().to_le_bytes());
+        Self {
+            seed,
+            view: hash::sponge(domain::WALLET_VIEW, &[], &[&seed]),
         }
-        view
     }
 
-    /// What an output for key `index` is made from.
-    pub fn key_for(&self, index: u32) -> OneTimeKey {
-        OneTimeKey {
-            hash: pubkey_hash(&self.key(index).1),
-            view: self.view(index),
+    /// The one-time key pair at `leaf` of the key tree for `r`.
+    pub fn key(&self, r: &KeySeed, leaf: u8) -> (SecretKey, PublicKey) {
+        wots::keygen(hash::sponge(
+            domain::WALLET_KEY,
+            &[],
+            &[&self.seed, &seed_limbs(r), &[BabyBear::new(leaf as u32)]],
+        ))
+    }
+
+    /// The key tree for `r`: [`KEY_LEAVES`] key generations (in parallel).
+    pub fn key_tree(&self, r: &KeySeed) -> KeyTree {
+        let hashes = crate::par::par_map(KEY_LEAVES, 16, |leaf| self.key(r, leaf as u8).1.hash());
+        KeyTree(hashes.try_into().expect("a hash per leaf"))
+    }
+
+    /// The tag and amount mask for `r`.
+    fn tag_and_mask(&self, r: &KeySeed) -> ([u8; TAG_LEN], u64) {
+        let limbs = seed_limbs(r);
+        let tag = bytes8(&hash::sponge(domain::NONCE_TAG, &[], &[&self.view, &limbs]));
+        let mask = bytes8(&hash::sponge(
+            domain::NONCE_MASK,
+            &[],
+            &[&self.view, &limbs],
+        ));
+        (tag, u64::from_le_bytes(mask))
+    }
+
+    /// What an output with key seed `r` is made from.
+    pub fn keys_for(&self, r: &KeySeed) -> OutputKeys {
+        let (tag, mask) = self.tag_and_mask(r);
+        OutputKeys {
+            r: *r,
+            hash: self.key_tree(r).output_hash(),
+            tag,
+            mask,
         }
+    }
+
+    /// Keys for a new output, with a fresh random seed.
+    pub fn new_keys(&self) -> std::io::Result<OutputKeys> {
+        let mut r = [0u8; KEY_SEED_LEN];
+        std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut r)?;
+        Ok(self.keys_for(&r))
+    }
+
+    /// The amount of `record` if its tag is ours (one hash: cheap enough
+    /// to try on every output). Doesn't check the commitment.
+    pub fn recognize(&self, record: &OutputRecord) -> Option<Amount> {
+        let r = key_seed_of(record);
+        let (tag, mask) = self.tag_and_mask(&r);
+        let n = &record.nonce;
+        (n[KEY_SEED_LEN..KEY_SEED_LEN + TAG_LEN] == tag).then(|| {
+            u64::from_le_bytes(n[KEY_SEED_LEN + TAG_LEN..].try_into().expect("8 bytes")) ^ mask
+        })
+    }
+
+    /// The key seed and amount of `record` if it's ours: its tag matches
+    /// and it opens with our keys (a copied tag doesn't).
+    pub fn identify(&self, record: &OutputRecord) -> Option<(KeySeed, Amount)> {
+        let amount = self.recognize(record)?;
+        let r = key_seed_of(record);
+        let hash = self.key_tree(&r).output_hash();
+        (output::commit(&hash, amount, &record.nonce) == Some(record.commitment))
+            .then_some((r, amount))
     }
 
     /// The wallet's coins among `outputs` (slot and record, e.g. from
-    /// [`crate::state::StateTree::outputs`]), looking at key indices
-    /// `indices`.
-    pub fn scan(&self, outputs: &[(u64, OutputRecord)], indices: Range<u32>) -> Vec<Coin> {
-        let tags = self.tags(indices);
-        outputs
-            .iter()
-            .filter_map(|&(position, record)| {
-                let index = *tags.get(&tag_of(&record))?;
-                Some(Coin {
-                    index,
-                    position,
-                    amount: self.identify(index, &record)?,
-                    record,
-                })
+    /// [`crate::state::StateTree::outputs`]).
+    pub fn scan(&self, outputs: &[(u64, OutputRecord)]) -> Vec<Coin> {
+        crate::par::par_map(outputs.len(), 1024, |i| {
+            let (position, record) = outputs[i];
+            self.recognize(&record).map(|_| (position, record))
+        })
+        .into_iter()
+        .flatten()
+        .filter_map(|(position, record)| {
+            let (r, amount) = self.identify(&record)?;
+            Some(Coin {
+                r,
+                position,
+                amount,
+                record,
             })
-            .collect()
+        })
+        .collect()
     }
 
-    /// The nonce tag of key `index`.
-    pub fn tag(&self, index: u32) -> Tag {
-        derive8(&self.view(index), domain::NONCE_TAG)
-    }
-
-    /// The nonce tags of key indices `indices`, to look outputs up by.
-    pub fn tags(&self, indices: Range<u32>) -> HashMap<Tag, u32> {
-        indices
-            .map(|i| (derive8(&self.view(i), domain::NONCE_TAG), i))
-            .collect()
-    }
-
-    /// The amount of `record` if it was paid to key `index` (its tag
-    /// matched): decrypts the amount and checks the commitment.
-    pub fn identify(&self, index: u32, record: &OutputRecord) -> Option<Amount> {
-        let amount = amount_in(&self.view(index), &record.nonce);
-        let hash = pubkey_hash(&self.key(index).1);
-        (output::commit(&hash, amount, &record.nonce) == Some(record.commitment)).then_some(amount)
-    }
-
-    /// The input spending `coin`, with the key that signs it.
-    pub fn input(&self, coin: &Coin) -> (SecretKey, Input) {
-        let (sk, pubkey) = self.key(coin.index);
+    /// The input spending `coin` with the key at `leaf`, and that key.
+    pub fn input(&self, coin: &Coin, leaf: u8) -> (SecretKey, Input) {
+        let (sk, pubkey) = self.key(&coin.r, leaf);
         let input = Input {
             commitment: coin.record.commitment,
             position: coin.position,
             pubkey,
+            leaf,
+            path: self.key_tree(&coin.r).path(leaf as usize),
             amount: coin.amount,
             nonce: coin.record.nonce,
         };
         (sk, input)
     }
 }
-
-const _: () = assert!(HASH_LEN >= VIEW_ELEMS);
 
 /// A payment's id: 16 random bytes.
 pub type SlateId = [u8; 16];
@@ -372,12 +380,15 @@ pub struct Sent {
     pub fee: Amount,
     /// The coins it spends (locked until it's cancelled or confirmed).
     pub coins: Vec<Coin>,
-    /// The change output's key index and amount, if any.
-    pub change: Option<(u32, Amount)>,
+    /// The change output's key seed and amount, if any.
+    pub change: Option<(KeySeed, Amount)>,
     /// When it was made (Unix seconds).
     pub created: u64,
-    /// The signed transaction, once finalized: its keys are then used, so it
-    /// can only be resubmitted, never cancelled.
+    /// Replaced, after it was signed, by a transaction paying the coins
+    /// back to the wallet ([`Sent::tx`] is then that one).
+    pub cancelled: bool,
+    /// The signed transaction, once finalized (and its latest replacement,
+    /// after a bump or cancellation).
     pub tx: Option<Vec<u8>>,
 }
 
@@ -386,8 +397,8 @@ pub struct Sent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Received {
     pub id: SlateId,
-    /// The output's key index, amount and commitment.
-    pub index: u32,
+    /// The output's key seed, amount and commitment.
+    pub r: KeySeed,
     pub amount: Amount,
     pub commitment: Commitment,
     /// When it was made (Unix seconds).
@@ -397,7 +408,7 @@ pub struct Received {
 impl Received {
     fn to_bytes(self) -> Vec<u8> {
         let mut out = self.id.to_vec();
-        out.extend(self.index.to_le_bytes());
+        out.extend(self.r);
         out.extend(self.amount.to_le_bytes());
         out.extend(self.commitment.0);
         out.extend(self.created.to_le_bytes());
@@ -405,22 +416,23 @@ impl Received {
     }
 
     fn from_bytes(b: &[u8]) -> Option<Self> {
-        if b.len() != 16 + 4 + 8 + COMMITMENT_LEN + 8 {
+        const R: usize = 16 + KEY_SEED_LEN;
+        if b.len() != R + 8 + COMMITMENT_LEN + 8 {
             return None;
         }
-        let at = 28 + COMMITMENT_LEN;
+        let at = R + 8 + COMMITMENT_LEN;
         Some(Self {
             id: b[..16].try_into().ok()?,
-            index: u32::from_le_bytes(b[16..20].try_into().ok()?),
-            amount: u64::from_le_bytes(b[20..28].try_into().ok()?),
-            commitment: Commitment(b[28..at].try_into().ok()?),
+            r: b[16..R].try_into().ok()?,
+            amount: u64::from_le_bytes(b[R..R + 8].try_into().ok()?),
+            commitment: Commitment(b[R + 8..at].try_into().ok()?),
             created: u64::from_le_bytes(b[at..].try_into().ok()?),
         })
     }
 }
 
-/// Bytes in an encoded coin: index, position, amount, commitment, nonce.
-const COIN_BYTES: usize = 4 + 8 + 8 + COMMITMENT_LEN + NONCE_LEN;
+/// Bytes in an encoded coin: key seed, position, amount, commitment, nonce.
+const COIN_BYTES: usize = KEY_SEED_LEN + 8 + 8 + COMMITMENT_LEN + NONCE_LEN;
 
 impl Sent {
     fn to_bytes(&self) -> Vec<u8> {
@@ -430,20 +442,21 @@ impl Sent {
         out.extend(self.created.to_le_bytes());
         out.extend((self.coins.len() as u16).to_le_bytes());
         for c in &self.coins {
-            out.extend(c.index.to_le_bytes());
+            out.extend(c.r);
             out.extend(c.position.to_le_bytes());
             out.extend(c.amount.to_le_bytes());
             out.extend(c.record.commitment.0);
             out.extend(c.record.nonce);
         }
         match self.change {
-            Some((index, amount)) => {
+            Some((r, amount)) => {
                 out.push(1);
-                out.extend(index.to_le_bytes());
+                out.extend(r);
                 out.extend(amount.to_le_bytes());
             }
             None => out.push(0),
         }
+        out.push(self.cancelled as u8);
         if let Some(tx) = &self.tx {
             out.extend(tx);
         }
@@ -466,22 +479,25 @@ impl Sent {
         let mut coins = Vec::with_capacity(n);
         for _ in 0..n {
             let c = take(COIN_BYTES)?;
+            const K: usize = KEY_SEED_LEN;
             coins.push(Coin {
-                index: u32::from_le_bytes(c[..4].try_into().ok()?),
-                position: u64_of(&c[4..12]),
-                amount: u64_of(&c[12..20]),
+                r: c[..K].try_into().ok()?,
+                position: u64_of(&c[K..K + 8]),
+                amount: u64_of(&c[K + 8..K + 16]),
                 record: OutputRecord {
-                    commitment: Commitment(c[20..20 + COMMITMENT_LEN].try_into().ok()?),
-                    nonce: c[20 + COMMITMENT_LEN..].try_into().ok()?,
+                    commitment: Commitment(c[K + 16..K + 16 + COMMITMENT_LEN].try_into().ok()?),
+                    nonce: c[K + 16 + COMMITMENT_LEN..].try_into().ok()?,
                 },
             });
         }
         let change = match take(1)?[0] {
             0 => None,
-            1 => Some((
-                u32::from_le_bytes(take(4)?.try_into().ok()?),
-                u64_of(take(8)?),
-            )),
+            1 => Some((take(KEY_SEED_LEN)?.try_into().ok()?, u64_of(take(8)?))),
+            _ => return None,
+        };
+        let cancelled = match take(1)?[0] {
+            0 => false,
+            1 => true,
             _ => return None,
         };
         let tx = (!r.is_empty()).then(|| r.to_vec());
@@ -492,6 +508,7 @@ impl Sent {
             coins,
             change,
             created,
+            cancelled,
             tx,
         })
     }
@@ -500,7 +517,8 @@ impl Sent {
 /// One of the wallet's outputs, as found in a block (or the state).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Owned {
-    pub index: u32,
+    /// The key seed in its nonce.
+    pub r: KeySeed,
     pub amount: Amount,
     pub record: OutputRecord,
     /// The block that made it (for one found in the state, the tip then).
@@ -512,12 +530,11 @@ pub struct Owned {
     pub gone_since: u64,
 }
 
-const OWNED_BYTES: usize = 4 + 8 + NONCE_LEN + 8 + 1 + 8;
+const OWNED_BYTES: usize = 8 + NONCE_LEN + 8 + 1 + 8;
 
 impl Owned {
     fn to_bytes(self) -> Vec<u8> {
-        let mut out = self.index.to_le_bytes().to_vec();
-        out.extend(self.amount.to_le_bytes());
+        let mut out = self.amount.to_le_bytes().to_vec();
         out.extend(self.record.nonce);
         out.extend(self.height.to_le_bytes());
         out.push(self.reward as u8);
@@ -529,14 +546,15 @@ impl Owned {
         if b.len() != OWNED_BYTES {
             return None;
         }
-        let at = 12 + NONCE_LEN;
+        let at = 8 + NONCE_LEN;
+        let record = OutputRecord {
+            commitment,
+            nonce: b[8..at].try_into().ok()?,
+        };
         Some(Self {
-            index: u32::from_le_bytes(b[..4].try_into().ok()?),
-            amount: u64::from_le_bytes(b[4..12].try_into().ok()?),
-            record: OutputRecord {
-                commitment,
-                nonce: b[12..at].try_into().ok()?,
-            },
+            r: key_seed_of(&record),
+            amount: u64::from_le_bytes(b[..8].try_into().ok()?),
+            record,
             height: u64::from_le_bytes(b[at..at + 8].try_into().ok()?),
             reward: b[at + 8] == 1,
             gone_since: u64::from_le_bytes(b[at + 9..].try_into().ok()?),
@@ -544,14 +562,61 @@ impl Owned {
     }
 }
 
+/// Which leaves of an output's key tree have signed, as far as the wallet
+/// knows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Leaves {
+    /// One bit per leaf.
+    pub used: [u8; KEY_LEAVES / 8],
+    /// Found on restore: earlier signatures may exist that the wallet
+    /// doesn't know of, so it signs with a random leaf of the upper half,
+    /// not the lowest.
+    pub unknown: bool,
+}
+
+impl Leaves {
+    pub fn is_used(&self, leaf: u8) -> bool {
+        self.used[leaf as usize / 8] >> (leaf % 8) & 1 == 1
+    }
+
+    /// The leaf to sign with next, or `None` if every leaf has signed.
+    ///
+    /// A wallet signs from leaf 0 up, so an output whose history is
+    /// unknown (found on restore) signs with a random unused leaf of the
+    /// upper half (`random` picks): the earlier wallet's signatures are
+    /// almost surely in the lower half, and an earlier restore's (whose
+    /// spend never confirmed) match with odds of 1 in 128. When the upper
+    /// half is used up, it picks among the rest.
+    pub fn next(&self, random: u32) -> Option<u8> {
+        let unused = |from: usize| -> Vec<u8> {
+            (from..KEY_LEAVES)
+                .map(|l| l as u8)
+                .filter(|&l| !self.is_used(l))
+                .collect()
+        };
+        if !self.unknown {
+            return unused(0).first().copied();
+        }
+        let upper = unused(KEY_LEAVES / 2);
+        let pool = if upper.is_empty() { unused(0) } else { upper };
+        (!pool.is_empty()).then(|| pool[random as usize % pool.len()])
+    }
+
+    pub fn with(mut self, leaf: u8) -> Self {
+        self.used[leaf as usize / 8] |= 1 << (leaf % 8);
+        self
+    }
+}
+
 /// The node's wallet in LMDB (database `wallet`):
 /// - `entropy`: the 32 bytes behind the recovery words ([`crate::mnemonic`]);
-/// - `next`: the next unused key index;
 /// - `sent/<id>`, `recv/<id>`: payments being sent and received;
 /// - `out/<commitment>`: the wallet's outputs ([`Owned`]);
 /// - `synced`: the height its outputs are found up to, and `blk/<height>`
 ///   the hash of each block scanned (to notice a reorg);
-/// - `reward/<index>`: key indices our mining rewards went to;
+/// - `reward/<r>`: key seeds our mining rewards went to;
+/// - `leaf/<commitment>`: the leaves of an output's key tree that have
+///   signed ([`Leaves`]);
 /// - `restoring`: set while a restored wallet looks for its outputs.
 #[derive(Clone, Copy, Debug)]
 pub struct WalletStore {
@@ -564,7 +629,7 @@ const RESTORING_KEY: &[u8] = b"restoring";
 const OUT_PREFIX: &[u8] = b"out/";
 const BLK_PREFIX: &[u8] = b"blk/";
 const REWARD_PREFIX: &[u8] = b"reward/";
-const NEXT_KEY: &[u8] = b"next";
+const LEAF_PREFIX: &[u8] = b"leaf/";
 const SENT_PREFIX: &[u8] = b"sent/";
 const RECV_PREFIX: &[u8] = b"recv/";
 
@@ -648,17 +713,39 @@ impl WalletStore {
             .put(txn, &[BLK_PREFIX, &height.to_be_bytes()].concat(), hash)
     }
 
-    /// Records that key `index` holds a mining reward of ours.
-    pub fn mark_reward(&self, txn: &mut RwTxn, index: u32) -> heed::Result<()> {
-        self.db
-            .put(txn, &[REWARD_PREFIX, &index.to_be_bytes()].concat(), &[])
+    /// Records that the output with key seed `r` is a mining reward of
+    /// ours.
+    pub fn mark_reward(&self, txn: &mut RwTxn, r: &KeySeed) -> heed::Result<()> {
+        self.db.put(txn, &[REWARD_PREFIX, r].concat(), &[])
     }
 
-    pub fn is_reward(&self, txn: &RoTxn, index: u32) -> heed::Result<bool> {
+    pub fn is_reward(&self, txn: &RoTxn, r: &KeySeed) -> heed::Result<bool> {
+        Ok(self.db.get(txn, &[REWARD_PREFIX, r].concat())?.is_some())
+    }
+
+    /// What's known of which leaves of `c`'s key tree have signed.
+    pub fn leaves(&self, txn: &RoTxn, c: &Commitment) -> heed::Result<Leaves> {
         Ok(self
             .db
-            .get(txn, &[REWARD_PREFIX, &index.to_be_bytes()].concat())?
-            .is_some())
+            .get(txn, &[LEAF_PREFIX, &c.0].concat())?
+            .and_then(|b| b.try_into().ok())
+            .map_or(Leaves::default(), |b: [u8; KEY_LEAVES / 8 + 1]| Leaves {
+                used: b[..KEY_LEAVES / 8].try_into().expect("the leaf bits"),
+                unknown: b[KEY_LEAVES / 8] == 1,
+            }))
+    }
+
+    pub fn set_leaves(&self, txn: &mut RwTxn, c: &Commitment, l: Leaves) -> heed::Result<()> {
+        self.db.put(
+            txn,
+            &[LEAF_PREFIX, &c.0].concat(),
+            &[&l.used[..], &[l.unknown as u8]].concat(),
+        )
+    }
+
+    pub fn remove_leaves(&self, txn: &mut RwTxn, c: &Commitment) -> heed::Result<()> {
+        self.db.delete(txn, &[LEAF_PREFIX, &c.0].concat())?;
+        Ok(())
     }
 
     /// Whether a restored wallet is still looking for its outputs.
@@ -672,27 +759,6 @@ impl WalletStore {
         } else {
             self.db.delete(txn, RESTORING_KEY).map(|_| ())
         }
-    }
-
-    /// Sets the next unused key index.
-    pub fn set_next_index(&self, txn: &mut RwTxn, next: u32) -> heed::Result<()> {
-        self.db.put(txn, NEXT_KEY, &next.to_le_bytes())
-    }
-
-    /// The next unused key index.
-    pub fn next_index(&self, txn: &RoTxn) -> heed::Result<u32> {
-        Ok(self
-            .db
-            .get(txn, NEXT_KEY)?
-            .and_then(|b| b.try_into().ok())
-            .map_or(0, u32::from_le_bytes))
-    }
-
-    /// Takes a fresh key index.
-    pub fn take_index(&self, txn: &mut RwTxn) -> heed::Result<u32> {
-        let i = self.next_index(txn)?;
-        self.db.put(txn, NEXT_KEY, &(i + 1).to_le_bytes())?;
-        Ok(i)
     }
 
     fn sent_key(id: &SlateId) -> Vec<u8> {
@@ -759,59 +825,61 @@ mod tests {
         o.record().unwrap()
     }
 
+    fn r(n: u8) -> KeySeed {
+        [n; KEY_SEED_LEN]
+    }
+
     #[test]
     fn nonces_carry_amounts() {
-        let w = wallet(1);
+        let (alice, bob) = (wallet(1), wallet(2));
         for amount in [0, 1, 50, u64::MAX] {
-            let view = w.view(3);
-            let nonce = nonce_for(&view, amount);
-            assert_eq!(amount_in(&view, &nonce), amount);
-            // Another view secret reads something else.
-            assert_ne!(amount_in(&w.view(4), &nonce), amount);
+            let o = alice.keys_for(&r(3)).pay(amount);
+            assert_eq!(key_seed_of(&record(&o)), r(3));
+            assert_eq!(alice.recognize(&record(&o)), Some(amount));
+            assert_eq!(alice.identify(&record(&o)), Some((r(3), amount)));
+            // Another wallet doesn't see it.
+            assert_eq!(bob.recognize(&record(&o)), None);
         }
-        // Different key indices get different tags.
-        assert_ne!(
-            nonce_for(&w.view(1), 5)[..TAG_LEN],
-            nonce_for(&w.view(2), 5)[..TAG_LEN]
-        );
+        // Different seeds get different tags and keys.
+        let (a, b) = (alice.keys_for(&r(1)).pay(5), alice.keys_for(&r(2)).pay(5));
+        assert_ne!(a.nonce[KEY_SEED_LEN..], b.nonce[KEY_SEED_LEN..]);
+        assert_ne!(a.hash, b.hash);
+        assert_ne!(alice.keys_for(&r(1)).hash, bob.keys_for(&r(1)).hash);
+        assert_ne!(alice.new_keys().unwrap().r, alice.new_keys().unwrap().r);
     }
 
     #[test]
     fn scan_finds_own_outputs_with_amounts() {
         let (alice, bob) = (wallet(1), wallet(2));
         let outputs: Vec<(u64, OutputRecord)> = [
-            alice.key_for(0).pay(10),
-            bob.key_for(0).pay(20),
-            alice.key_for(5).pay(30),
-            bob.key_for(1).pay(40),
-            alice.key_for(50).pay(60),
+            alice.keys_for(&r(1)).pay(10),
+            bob.keys_for(&r(1)).pay(20),
+            alice.keys_for(&r(200)).pay(30),
+            bob.keys_for(&r(2)).pay(40),
         ]
         .iter()
         .enumerate()
         .map(|(i, o)| (i as u64 + 1, record(o)))
         .collect();
-        let coins = alice.scan(&outputs, 0..10);
-        let found: Vec<(u32, u64, Amount)> = coins
+        let found: Vec<(KeySeed, u64, Amount)> = alice
+            .scan(&outputs)
             .iter()
-            .map(|c| (c.index, c.position, c.amount))
+            .map(|c| (c.r, c.position, c.amount))
             .collect();
-        assert_eq!(found, [(0, 1, 10), (5, 3, 30)]);
-        // A wider range finds the far index too.
-        assert_eq!(alice.scan(&outputs, 0..100).len(), 3);
-        // Bob sees only his.
-        let bobs: Vec<Amount> = bob.scan(&outputs, 0..10).iter().map(|c| c.amount).collect();
+        assert_eq!(found, [(r(1), 1, 10), (r(200), 3, 30)]);
+        let bobs: Vec<Amount> = bob.scan(&outputs).iter().map(|c| c.amount).collect();
         assert_eq!(bobs, [20, 40]);
     }
 
     #[test]
     fn scan_rejects_a_matching_tag_with_the_wrong_commitment() {
-        // Someone who knows a key's view secret can copy its tag, but can't make the
-        // commitment check pass for another key.
+        // An output copying one of ours's nonce (its seed, tag and masked
+        // amount) to another key looks ours, but doesn't open with our keys.
         let alice = wallet(1);
-        let mut fake = wallet(9).key_for(0).pay(10);
-        fake.nonce = nonce_for(&alice.view(0), 10);
-        let outputs = [(1, record(&fake))];
-        assert!(alice.scan(&outputs, 0..5).is_empty());
+        let mut fake = wallet(9).keys_for(&r(4)).pay(10);
+        fake.nonce = alice.keys_for(&r(4)).pay(10).nonce;
+        assert_eq!(alice.recognize(&record(&fake)), Some(10));
+        assert!(alice.scan(&[(1, record(&fake))]).is_empty());
     }
 
     #[test]
@@ -827,7 +895,7 @@ mod tests {
             id: slate.id,
             amount: slate.amount,
             fee: slate.fee,
-            output: w.key_for(2).pay(slate.amount),
+            output: w.keys_for(&r(2)).pay(slate.amount),
         };
         assert_eq!(Response::from_text(&response.to_text()), Ok(response));
         // Each kind only reads its own.
@@ -843,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn the_store_keeps_payments_and_hands_out_fresh_indices() {
+    fn the_store_keeps_payments_and_outputs() {
         let env = crate::db::test::TempEnv::new();
         let store = WalletStore::open(env.env()).unwrap();
         let w = Wallet::from_seed(crate::mnemonic::seed_of(&[5; 32]));
@@ -851,22 +919,20 @@ mod tests {
         assert_eq!(store.entropy(&txn).unwrap(), None);
         store.set_entropy(&mut txn, &[5; 32]).unwrap();
         assert_eq!(store.entropy(&txn).unwrap(), Some([5; 32]));
-        assert_eq!(store.take_index(&mut txn).unwrap(), 0);
-        assert_eq!(store.take_index(&mut txn).unwrap(), 1);
-        assert_eq!(store.next_index(&txn).unwrap(), 2);
         let coin = Coin {
-            index: 0,
+            r: r(0),
             position: 5,
             amount: 70,
-            record: record(&w.key_for(0).pay(70)),
+            record: record(&w.keys_for(&r(0)).pay(70)),
         };
         let mut sent = Sent {
             id: [7; 16],
             amount: 50,
             fee: 3,
             coins: vec![coin],
-            change: Some((1, 17)),
+            change: Some((r(1), 17)),
             created: 1000,
+            cancelled: false,
             tx: None,
         };
         store.put_sent(&mut txn, &sent).unwrap();
@@ -874,6 +940,7 @@ mod tests {
             id: [1; 16],
             created: 10,
             change: None,
+            cancelled: true,
             tx: Some(vec![1, 2, 3]),
             ..sent.clone()
         };
@@ -888,7 +955,7 @@ mod tests {
         assert_eq!(store.sents(&txn).unwrap(), vec![sent]);
         let got = Received {
             id: [3; 16],
-            index: 9,
+            r: r(9),
             amount: 12,
             commitment: coin.record.commitment,
             created: 5,
@@ -900,7 +967,7 @@ mod tests {
         store.remove_received(&mut txn, &got.id).unwrap();
         assert!(store.receiveds(&txn).unwrap().is_empty());
         let owned = Owned {
-            index: 0,
+            r: r(0),
             amount: 70,
             record: coin.record,
             height: 4,
@@ -918,8 +985,18 @@ mod tests {
         store.set_block_hash(&mut txn, 7, &[1; 32]).unwrap();
         assert_eq!(store.synced(&txn).unwrap(), Some(7));
         assert_eq!(store.block_hash(&txn, 7).unwrap(), Some(vec![1; 32]));
-        store.mark_reward(&mut txn, 3).unwrap();
-        assert!(store.is_reward(&txn, 3).unwrap() && !store.is_reward(&txn, 4).unwrap());
+        store.mark_reward(&mut txn, &r(3)).unwrap();
+        assert!(store.is_reward(&txn, &r(3)).unwrap() && !store.is_reward(&txn, &r(4)).unwrap());
+        let c = coin.record.commitment;
+        assert_eq!(store.leaves(&txn, &c).unwrap(), Leaves::default());
+        let l = Leaves {
+            unknown: true,
+            ..Leaves::default().with(0).with(2).with(255)
+        };
+        store.set_leaves(&mut txn, &c, l).unwrap();
+        assert_eq!(store.leaves(&txn, &c).unwrap(), l);
+        store.remove_leaves(&mut txn, &c).unwrap();
+        assert_eq!(store.leaves(&txn, &c).unwrap(), Leaves::default());
         store.set_restoring(&mut txn, true).unwrap();
         assert!(store.restoring(&txn).unwrap());
         store.set_restoring(&mut txn, false).unwrap();
@@ -927,16 +1004,50 @@ mod tests {
     }
 
     #[test]
-    fn coins_spend_with_their_position() {
+    fn coins_spend_with_any_leaf_and_their_position() {
         let w = wallet(3);
         let coin = Coin {
-            index: 2,
+            r: r(2),
             position: 77,
             amount: 9,
-            record: record(&w.key_for(2).pay(9)),
+            record: record(&w.keys_for(&r(2)).pay(9)),
         };
-        let (_, input) = w.input(&coin);
-        assert!(input.opens_commitment());
-        assert_eq!(input.position, 77);
+        for leaf in [0, 5, 128, 255] {
+            let (_, input) = w.input(&coin, leaf);
+            assert!(input.opens_commitment());
+            assert_eq!((input.position, input.leaf), (77, leaf));
+        }
+    }
+
+    #[test]
+    fn leaves_are_taken_in_order_or_at_random_from_the_upper_half_when_history_is_unknown() {
+        let mut l = Leaves::default();
+        assert_eq!(l.next(7), Some(0));
+        l = l.with(0).with(1);
+        assert_eq!(l.next(7), Some(2));
+        l.unknown = true;
+        // Seven unused leaves along the upper half, skipping the used ones.
+        assert_eq!(l.next(7), Some(135));
+        l = l.with(130);
+        assert_eq!(l.next(7), Some(136));
+        assert_eq!(l.next(127), Some(128));
+        // The upper half used up, the rest.
+        for leaf in 128..=255 {
+            l = l.with(leaf);
+        }
+        assert_eq!(l.next(0), Some(2));
+        let full = Leaves {
+            used: [u8::MAX; KEY_LEAVES / 8],
+            unknown: true,
+        };
+        assert_eq!(full.next(0), None);
+        assert_eq!(
+            Leaves {
+                unknown: false,
+                ..full
+            }
+            .next(0),
+            None
+        );
     }
 }

@@ -1,7 +1,13 @@
-//! Transactions. Only pay-to-pubkey-hash inputs are supported for now.
+//! Transactions.
 //!
-//! An [`Input`] names the commitment it spends and reveals the WOTS public key,
-//! amount and nonce behind it. Each input signs the digest of the whole
+//! An output pays to a [`KeyTree`]: the Merkle root of [`KEY_LEAVES`]
+//! one-time WOTS keys' hashes, any one of which can spend it. A spend that
+//! needs replacing (a higher fee, or a cancellation) is signed again with
+//! another leaf, so no key ever signs twice.
+//!
+//! An [`Input`] names the commitment it spends and reveals the WOTS public
+//! key, its leaf and Merkle path, the amount and nonce behind it. Each input
+//! signs the digest of the whole
 //! [`TxBody`] (every input and output, nonces included) with the key it
 //! reveals. The fee is implicit: `sum(inputs) - sum(outputs)`.
 //!
@@ -27,9 +33,18 @@ use crate::output::{
 use crate::poseidon2::{self, WIDTH};
 use crate::wots::{self, NUM_CHAINS, PARAM_LEN, PublicKey, RAND_LEN, SecretKey, Signature};
 
+/// Levels of an output's key tree.
+pub const KEY_LEVELS: usize = 8;
+/// One-time keys an output can be spent with: every leaf byte is a leaf.
+pub const KEY_LEAVES: usize = 1 << KEY_LEVELS;
+const _: () = assert!(KEY_LEAVES == 1 << u8::BITS);
+/// A leaf's siblings, bottom up.
+pub type KeyPath = [Hash; KEY_LEVELS];
+
 /// Bytes in an encoded input: commitment, position, public key (parameter,
-/// root), amount, nonce.
-pub const INPUT_BYTES: usize = COMMITMENT_LEN + 8 + PARAM_LEN * 4 + HASH_BYTES + 8 + NONCE_LEN;
+/// root), leaf, path, amount, nonce.
+pub const INPUT_BYTES: usize =
+    COMMITMENT_LEN + 8 + PARAM_LEN * 4 + HASH_BYTES + 1 + KEY_LEVELS * HASH_BYTES + 8 + NONCE_LEN;
 /// Bytes in an encoded output: hash, amount, nonce.
 pub const OUTPUT_BYTES: usize = OUTPUT_HASH_LEN + 8 + NONCE_LEN;
 /// Bytes in an encoded signature: randomizer, chains.
@@ -37,9 +52,60 @@ pub const SIGNATURE_BYTES: usize = RAND_LEN * 4 + NUM_CHAINS * HASH_BYTES;
 /// The largest transaction nodes relay.
 pub const MAX_TX_BYTES: usize = 100_000;
 
-/// The pubkey hash an output pays to: `H(pubkey)` as bytes.
-pub fn pubkey_hash(pubkey: &PublicKey) -> OutputHash {
-    hash::to_bytes(&pubkey.hash())
+/// The hashes of an output's one-time keys (`H(pubkey)` each): its hash
+/// is their Merkle root ([`hash::merge`]; the depth is fixed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyTree(pub [Hash; KEY_LEAVES]);
+
+impl KeyTree {
+    /// A tree whose only usable key is `pubkey`, at leaf 0 (for tests).
+    pub fn single(pubkey: &PublicKey) -> Self {
+        let mut leaves = [[BabyBear::ZERO; HASH_LEN]; KEY_LEAVES];
+        leaves[0] = pubkey.hash();
+        Self(leaves)
+    }
+
+    pub fn root(&self) -> Hash {
+        let mut level = self.0.to_vec();
+        while level.len() > 1 {
+            level = level
+                .chunks_exact(2)
+                .map(|p| hash::merge(&p[0], &p[1]))
+                .collect();
+        }
+        level[0]
+    }
+
+    /// The hash an output paying to these keys has.
+    pub fn output_hash(&self) -> OutputHash {
+        hash::to_bytes(&self.root())
+    }
+
+    /// Leaf `leaf`'s siblings, bottom up.
+    pub fn path(&self, leaf: usize) -> KeyPath {
+        let mut level = self.0.to_vec();
+        let mut i = leaf;
+        core::array::from_fn(|_| {
+            let sibling = level[i ^ 1];
+            level = level
+                .chunks_exact(2)
+                .map(|p| hash::merge(&p[0], &p[1]))
+                .collect();
+            i >>= 1;
+            sibling
+        })
+    }
+}
+
+/// The root reached from key hash `pkh` at `leaf` along `path`.
+pub fn key_root(pkh: &Hash, leaf: u8, path: &KeyPath) -> Hash {
+    path.iter().enumerate().fold(*pkh, |h, (d, s)| {
+        if leaf >> d & 1 == 0 {
+            hash::merge(&h, s)
+        } else {
+            hash::merge(s, &h)
+        }
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,14 +117,25 @@ pub struct Input {
     /// later (which lands in a new slot).
     pub position: u64,
     pub pubkey: PublicKey,
+    /// The key's leaf in the output's key tree (below [`KEY_LEAVES`]), and
+    /// its path to the root.
+    pub leaf: u8,
+    pub path: KeyPath,
     pub amount: Amount,
     pub nonce: Nonce,
 }
 
 impl Input {
-    /// Returns `true` if the revealed pubkey, amount and nonce open `commitment`.
+    /// The output hash the key and path lead to.
+    pub fn key_root(&self) -> Hash {
+        key_root(&self.pubkey.hash(), self.leaf, &self.path)
+    }
+
+    /// Returns `true` if the revealed key, path, amount and nonce open
+    /// `commitment`.
     pub fn opens_commitment(&self) -> bool {
-        output::commit_field(&self.pubkey.hash(), self.amount, &self.nonce) == self.commitment
+        (self.leaf as usize) < KEY_LEAVES
+            && output::commit_field(&self.key_root(), self.amount, &self.nonce) == self.commitment
     }
 }
 
@@ -216,6 +293,10 @@ impl Transaction {
             out.extend(i.position.to_le_bytes());
             put_elems(&mut out, &i.pubkey.param);
             put_elems(&mut out, &i.pubkey.root);
+            out.push(i.leaf);
+            for h in &i.path {
+                put_elems(&mut out, h);
+            }
             out.extend(i.amount.to_le_bytes());
             out.extend(i.nonce);
         }
@@ -257,9 +338,20 @@ impl Transaction {
                     param: get_elems(take(PARAM_LEN * 4)?)?,
                     root: get_elems(take(HASH_BYTES)?)?,
                 },
+                leaf: take(1)?[0],
+                path: {
+                    let mut path = [[BabyBear::ZERO; HASH_LEN]; KEY_LEVELS];
+                    for h in &mut path {
+                        *h = get_elems(take(HASH_BYTES)?)?;
+                    }
+                    path
+                },
                 amount: u64::from_le_bytes(take(8)?.try_into().ok()?),
                 nonce: take(NONCE_LEN)?.try_into().ok()?,
             });
+        }
+        if inputs.iter().any(|i| i.leaf as usize >= KEY_LEAVES) {
+            return None;
         }
         let mut outputs = Vec::with_capacity(n_out);
         for _ in 0..n_out {
@@ -371,13 +463,18 @@ mod tests {
     fn input(n: u32, amount: Amount) -> (SecretKey, Input) {
         let (sk, pubkey) = key(n);
         let nonce = [n as u8; NONCE_LEN];
-        let commitment = output::commit(&pubkey_hash(&pubkey), amount, &nonce).unwrap();
+        // Leaf 1 of a tree of four keys (the rest unused here).
+        let mut tree = KeyTree::single(&key(n + 50).1);
+        tree.0[1] = pubkey.hash();
+        let commitment = output::commit(&tree.output_hash(), amount, &nonce).unwrap();
         (
             sk,
             Input {
                 commitment,
                 position: n as u64,
                 pubkey,
+                leaf: 1,
+                path: tree.path(1),
                 amount,
                 nonce,
             },
@@ -535,6 +632,25 @@ mod tests {
         let mut body = tx().body;
         body.inputs[0].pubkey = key(3).1;
         assert_eq!(resign(body).validate(), Err(TxError::CommitmentMismatch(0)));
+        // The key at another leaf, or a wrong path.
+        let mut body = tx().body;
+        body.inputs[0].leaf = 0;
+        assert_eq!(resign(body).validate(), Err(TxError::CommitmentMismatch(0)));
+        let mut body = tx().body;
+        body.inputs[0].path[2][0] += BabyBear::ONE;
+        assert_eq!(resign(body).validate(), Err(TxError::CommitmentMismatch(0)));
+    }
+
+    #[test]
+    fn key_trees_have_a_path_per_leaf() {
+        let tree = KeyTree(core::array::from_fn(|i| key(i as u32).1.hash()));
+        for leaf in 0..KEY_LEAVES {
+            assert_eq!(
+                key_root(&tree.0[leaf], leaf as u8, &tree.path(leaf)),
+                tree.root()
+            );
+        }
+        assert_ne!(key_root(&tree.0[3], 2, &tree.path(3)), tree.root());
     }
 
     #[test]

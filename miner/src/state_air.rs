@@ -331,8 +331,8 @@ impl Air for StateSegmentAir {
             c.assert_zero(p[SAME_OP] * (n[col] - l[col]));
         }
 
-        // Leaf hash rows: sponge(STATE_LEAF, [], [key, nonce, next key, lo,
-        // hi]), one block per row.
+        // Leaf hash rows: sponge(STATE_LEAF, [], [key, nonce head, next
+        // key, lo, hi, nonce tail]), one block per row.
         let h1 = p[H1];
         for j in 0..HASH_LEN {
             c.assert_zero(h1 * (l[j] - l[LEAF_K + j]));
@@ -356,17 +356,18 @@ impl Air for StateSegmentAir {
             let absorbed = match j {
                 0 => l[LEAF_LO],
                 1 => l[LEAF_HI],
+                j if j < 2 + state::NONCE_TAIL => l[LEAF_N + HASH_LEN + j - 2],
                 _ => zero,
             };
             c.assert_zero(p[H3] * (x - out(j) - absorbed));
         }
         // Which leaf: (selector, key, nonce, next key, next index lo, hi).
-        type Kind<V> = (usize, [V; 8], [V; 8], [V; 8], V, V);
+        type Kind<V> = (usize, [V; 8], usize, [V; 8], V, V);
         let kinds: [Kind<V>; 6] = [
             (
                 K_INS_OLD,
                 ext8(l, LK),
-                ext8(l, LN),
+                LN,
                 ext8(l, LNK),
                 l[LNI_LO],
                 l[LNI_HI],
@@ -374,7 +375,7 @@ impl Air for StateSegmentAir {
             (
                 K_INS_RELINK,
                 ext8(l, LK),
-                ext8(l, LN),
+                LN,
                 ext8(l, KEY),
                 l[SIZE_LO],
                 l[SIZE_HI],
@@ -382,7 +383,7 @@ impl Air for StateSegmentAir {
             (
                 K_INS_NEW,
                 ext8(l, KEY),
-                ext8(l, NONCE),
+                NONCE,
                 ext8(l, LNK),
                 l[LNI_LO],
                 l[LNI_HI],
@@ -390,7 +391,7 @@ impl Air for StateSegmentAir {
             (
                 K_PRED_OLD,
                 ext8(l, LK),
-                ext8(l, LN),
+                LN,
                 ext8(l, KEY),
                 l[POS_LO],
                 l[POS_HI],
@@ -398,7 +399,7 @@ impl Air for StateSegmentAir {
             (
                 K_PRED_NEW,
                 ext8(l, LK),
-                ext8(l, LN),
+                LN,
                 ext8(l, RNK),
                 l[RNI_LO],
                 l[RNI_HI],
@@ -406,22 +407,27 @@ impl Air for StateSegmentAir {
             (
                 K_REMOVED,
                 ext8(l, KEY),
-                ext8(l, NONCE),
+                NONCE,
                 ext8(l, RNK),
                 l[RNI_LO],
                 l[RNI_HI],
             ),
         ];
         for j in 0..HASH_LEN {
-            let (mut dk, mut dn, mut dnk) = (zero, zero, zero);
-            for (kind, key, nonce, nk, ..) in &kinds {
+            let (mut dk, mut dnk) = (zero, zero);
+            for (kind, key, _, nk, ..) in &kinds {
                 dk = dk + p[*kind] * (l[LEAF_K + j] - key[j]);
-                dn = dn + p[*kind] * (l[LEAF_N + j] - nonce[j]);
                 dnk = dnk + p[*kind] * (l[LEAF_NK + j] - nk[j]);
             }
             c.assert_zero(dk);
-            c.assert_zero(dn);
             c.assert_zero(dnk);
+        }
+        for j in 0..NONCE_LIMBS {
+            let mut dn = zero;
+            for (kind, _, nonce, ..) in &kinds {
+                dn = dn + p[*kind] * (l[LEAF_N + j] - l[*nonce + j]);
+            }
+            c.assert_zero(dn);
         }
         let (mut dlo, mut dhi) = (zero, zero);
         for (kind, _, _, _, lo, hi) in &kinds {
@@ -1064,7 +1070,13 @@ fn leaf_rows(m: &mut RowMajorMatrix, at: usize, leaf: &Leaf) -> Hash {
     input[13] = BabyBear::new(domain::STATE_LEAF);
     input[14] = BabyBear::new(LEAF_LEN as u32);
     let mut state = poseidon2_air::generate(input, m.row_mut(at));
-    for (offset, block) in [(1, &nonce[..]), (2, &leaf.next_key[..]), (3, &[lo, hi][..])] {
+    let mut last = vec![lo, hi];
+    last.extend(&nonce[HASH_LEN..]);
+    for (offset, block) in [
+        (1, &nonce[..HASH_LEN]),
+        (2, &leaf.next_key[..]),
+        (3, &last[..]),
+    ] {
         let mut input = state;
         for (x, &v) in input.iter_mut().zip(block) {
             *x += v;

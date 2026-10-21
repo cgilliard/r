@@ -2854,7 +2854,9 @@ mod tests {
         // The next block on B's side settles it.
         b.mine(1000, 3);
         nb.events.send(Event::NewTip).unwrap();
-        wait_for("A to follow B's branch", 10, || a.tip().hash == b.tip().hash);
+        wait_for("A to follow B's branch", 10, || {
+            a.tip().hash == b.tip().hash
+        });
         assert_eq!(a.height(), 7);
     }
 
@@ -3155,7 +3157,11 @@ mod tests {
         let mut session = 100;
         while n.book.len() < MAX_BOOK {
             session += 1;
-            asked(&mut n, session, &format!("10.201.{}.{}:1", session >> 8, session & 255));
+            asked(
+                &mut n,
+                session,
+                &format!("10.201.{}.{}:1", session >> 8, session & 255),
+            );
             n.on_peers(session, &addrs(100_000 + session * 100, MAX_ADDRS as u32));
         }
         asked(&mut n, 1, "10.202.0.1:1");

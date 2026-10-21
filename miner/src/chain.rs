@@ -598,7 +598,8 @@ impl Chain {
     }
 
     /// Checks `block` as the body of `header`: it fits [`MAX_BLOCK_SIZE`],
-    /// its lists are canonical, the header commits to it, and its chain
+    /// its lists are canonical and share no commitment (no input is created
+    /// in the same block), the header commits to it, and its chain
     /// proof holds. Header rules ([`header::check`]) and applying the lists
     /// ([`block::apply`]) are separate.
     pub fn verify_block(
@@ -615,6 +616,9 @@ impl Chain {
             || !block::is_canonical(block.outputs.iter().map(|o| &o.commitment))
         {
             return Err(BlockError::NotCanonical);
+        }
+        if block::spends_own_output(&block.inputs, &block.outputs) {
+            return Err(BlockError::SpendsItsOwnOutput);
         }
         if block.body_hash() != header.body {
             return Err(BlockError::Body);
@@ -656,7 +660,7 @@ mod tests {
 
     /// A transaction spending `coins` into `outputs`.
     fn spend(wallet: &Wallet, coins: &[Coin], outputs: Vec<Output>) -> Transaction {
-        let (keys, inputs) = coins.iter().map(|c| wallet.input(c)).unzip();
+        let (keys, inputs) = coins.iter().map(|c| wallet.input(c, 0)).unzip();
         Transaction::sign(TxBody { inputs, outputs }, keys).unwrap()
     }
 
@@ -696,10 +700,10 @@ mod tests {
 
         let (early, late) = (consensus.first_subsidy, consensus.second_subsidy);
         let wallet = Wallet::from_seed(BabyBear::new_array([9, 8, 7, 6, 5, 4, 3, 2]));
-        let pay = |i: u32, amount| wallet.key_for(i).pay(amount);
+        let pay = |i: u8, amount| wallet.keys_for(&[i; 16]).pay(amount);
         let coins = |tree: &StateTree| {
             let outputs = tree.outputs(&env.env().read_txn().unwrap()).unwrap();
-            wallet.scan(&outputs, 0..20)
+            wallet.scan(&outputs)
         };
 
         let mut headers = vec![genesis];
@@ -777,7 +781,7 @@ mod tests {
 
         // The wallet's coins are recovered from the state with amounts:
         // block 3's two outputs.
-        let mut held: Vec<(u32, u64)> = coins(&tree).iter().map(|c| (c.index, c.amount)).collect();
+        let mut held: Vec<(u8, u64)> = coins(&tree).iter().map(|c| (c.r[0], c.amount)).collect();
         held.sort();
         assert_eq!(held, [(4, 100), (5, late)]);
 

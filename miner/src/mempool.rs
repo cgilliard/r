@@ -4,7 +4,11 @@
 //! mints nothing (any fee, even none, is fine), spends only outputs that
 //! are unspent in the main chain's state at the slots its inputs sign,
 //! creates no output that exists already, and shares no input or output with
-//! a transaction in the pool. Inputs must be confirmed: an input signs its
+//! a transaction in the pool, unless it replaces those by fee: a
+//! transaction spending inputs that pool transactions spend replaces them
+//! if it pays more than all of them together and more per byte than each.
+//! (Wallets re-sign a spend with another of the output's one-time keys to
+//! raise its fee or cancel it.) Inputs must be confirmed: an input signs its
 //! output's slot, which a block assigns only when it's applied.
 //!
 //! The pool re-checks every transaction against the state whenever the tip
@@ -21,7 +25,7 @@ use std::sync::Mutex;
 
 use crate::babybear::BabyBear;
 use crate::block;
-use crate::hash::{HASH_LEN, Hash};
+use crate::hash::{self, HASH_LEN, Hash};
 use crate::ledger::Ledger;
 use crate::output::{Amount, Commitment};
 use crate::state::key_of;
@@ -149,8 +153,36 @@ impl Mempool {
         let checked = check(bytes);
         let mut p = self.lock(chain);
         let result = checked.and_then(|(tx, fee)| {
-            p.fits(chain, &tx)?;
-            p.make_room(self.capacity, fee, bytes.len())?;
+            // Replace by fee: pool transactions spending its inputs give way
+            // if it pays more than all of them, and more per byte than each.
+            let replaced = p.conflicts(&tx);
+            let (sum, len) = (
+                replaced.iter().map(|r| p.txs[r].fee as u128).sum::<u128>(),
+                bytes.len(),
+            );
+            if !replaced.is_empty()
+                && (fee as u128 <= sum
+                    || replaced.iter().any(|r| !p.txs[r].pays_less_than(fee, len)))
+            {
+                return Err(Refused::Unfit(
+                    "spends an output a pool transaction spends, and doesn't pay enough more \
+                     to replace it (more in all, and more per byte)"
+                        .into(),
+                ));
+            }
+            let old: Vec<(Hash, Entry)> = replaced
+                .iter()
+                .filter_map(|r| Some((*r, p.remove(r)?)))
+                .collect();
+            let added = p
+                .fits(chain, &tx)
+                .and_then(|()| p.make_room(self.capacity, fee, len));
+            if let Err(e) = added {
+                for (r, e) in old {
+                    p.insert(r, e.tx, e.bytes, e.fee);
+                }
+                return Err(e);
+            }
             p.insert(id, tx, bytes.to_vec(), fee);
             Ok((id, true))
         });
@@ -183,6 +215,12 @@ impl Mempool {
     pub fn spends(&self, c: &Commitment) -> bool {
         let p = self.pool.lock().expect("mempool lock");
         p.spends.contains_key(c)
+    }
+
+    /// The pool transaction spending commitment `c`, if any.
+    pub fn spender(&self, c: &Commitment) -> Option<Transaction> {
+        let p = self.pool.lock().expect("mempool lock");
+        p.spends.get(c).map(|id| p.txs[id].tx.clone())
     }
 
     /// Whether a pool transaction creates commitment `c`.
@@ -308,6 +346,19 @@ impl Pool {
                 self.mined.push_back((id, e));
             }
         }
+    }
+
+    /// The pool transactions spending any of `tx`'s inputs.
+    fn conflicts(&self, tx: &Transaction) -> Vec<Hash> {
+        let mut ids: Vec<Hash> = tx
+            .body
+            .inputs
+            .iter()
+            .filter_map(|i| self.spends.get(&i.commitment).copied())
+            .collect();
+        ids.sort_by_key(hash::to_bytes);
+        ids.dedup();
+        ids
     }
 
     /// Whether `tx` fits the state and conflicts with nothing in the pool.
@@ -458,10 +509,10 @@ mod tests {
         let w = wallet();
         let coins: Vec<Coin> = (0..n)
             .map(|i| Coin {
-                index: i,
+                r: [i as u8; 16],
                 position: i as u64 + 1,
                 amount,
-                record: w.key_for(i).pay(amount).record().unwrap(),
+                record: w.keys_for(&[i as u8; 16]).pay(amount).record().unwrap(),
             })
             .collect();
         let unspent = coins
@@ -477,12 +528,17 @@ mod tests {
         )
     }
 
-    /// Spends `coins` to a new key `to`, paying `fee`.
-    fn spend(coins: &[Coin], to: u32, fee: Amount) -> Vec<u8> {
+    /// Spends `coins` to new keys `to`, paying `fee`.
+    fn spend(coins: &[Coin], to: u8, fee: Amount) -> Vec<u8> {
+        spend_with(coins, to, fee, 0)
+    }
+
+    /// [`spend`] signing with the keys at `leaf`.
+    fn spend_with(coins: &[Coin], to: u8, fee: Amount, leaf: u8) -> Vec<u8> {
         let w = wallet();
-        let (keys, inputs) = coins.iter().map(|c| w.input(c)).unzip();
+        let (keys, inputs) = coins.iter().map(|c| w.input(c, leaf)).unzip();
         let total: Amount = coins.iter().map(|c| c.amount).sum();
-        let outputs: Vec<Output> = vec![w.key_for(to).pay(total - fee)];
+        let outputs: Vec<Output> = vec![w.keys_for(&[to; 16]).pay(total - fee)];
         Transaction::sign(TxBody { inputs, outputs }, keys)
             .unwrap()
             .to_bytes()
@@ -522,10 +578,37 @@ mod tests {
         moved.position = 99;
         let wrong = spend(&[moved], 102, FEE);
         assert!(matches!(pool.add(&chain, &wrong), Err(Refused::Unfit(_))));
-        // A double spend of a pool transaction's input.
-        pool.add(&chain, &spend(&coins[..1], 103, FEE)).unwrap();
-        let again = spend(&coins[..1], 104, 2 * FEE);
+        // A double spend of a pool transaction's input, not paying more.
+        let (first, _) = pool.add(&chain, &spend(&coins[..1], 103, FEE)).unwrap();
+        let again = spend_with(&coins[..1], 104, FEE, 1);
         assert!(matches!(pool.add(&chain, &again), Err(Refused::Unfit(_))));
+        assert_eq!(pool.size(&chain).0, 1);
+        assert!(pool.knows(&first));
+    }
+
+    #[test]
+    fn a_better_paying_spend_of_the_same_inputs_replaces_the_old() {
+        let (chain, coins) = chain(3, COIN);
+        let pool = Mempool::new();
+        let (a, _) = pool.add(&chain, &spend(&coins[..1], 100, FEE)).unwrap();
+        let (b, _) = pool.add(&chain, &spend(&coins[1..2], 101, FEE)).unwrap();
+        // Re-signed with another leaf, paying more: it replaces the first.
+        let bumped = spend_with(&coins[..1], 102, 2 * FEE, 1);
+        let (c, new) = pool.add(&chain, &bumped).unwrap();
+        assert!(new && pool.get(&a).is_none() && pool.get(&c).is_some());
+        let spender = pool.spender(&coins[0].record.commitment).unwrap();
+        assert_eq!(spender.body.inputs[0].leaf, 1);
+        // One spending both pool transactions' inputs must pay more than
+        // both together, and more per byte than each (it's about twice
+        // their size).
+        let both = spend_with(&coins[..2], 103, 3 * FEE, 2);
+        assert!(matches!(pool.add(&chain, &both), Err(Refused::Unfit(_))));
+        let both = spend_with(&coins[..2], 103, 3 * FEE + 1, 2);
+        assert!(matches!(pool.add(&chain, &both), Err(Refused::Unfit(_))));
+        assert!(pool.get(&b).is_some() && pool.get(&c).is_some());
+        let both = spend_with(&coins[..2], 104, 5 * FEE, 2);
+        pool.add(&chain, &both).unwrap();
+        assert!(pool.get(&b).is_none() && pool.get(&c).is_none());
         assert_eq!(pool.size(&chain).0, 1);
     }
 
@@ -570,7 +653,7 @@ mod tests {
     fn miners_take_the_best_paying_first_and_a_full_pool_pushes_out_the_worst() {
         let (chain, coins) = chain(4, COIN);
         let txs: Vec<Vec<u8>> = (0..4)
-            .map(|i| spend(&coins[i..=i], 100 + i as u32, FEE * (1 + i as u64)))
+            .map(|i| spend(&coins[i..=i], 100 + i as u8, FEE * (1 + i as u64)))
             .collect();
         // Room for three.
         let pool = Mempool::with_capacity(3 * txs[0].len());

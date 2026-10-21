@@ -1,18 +1,22 @@
 //! The signature chunk circuit: proves a run of WOTS signatures, revealing
-//! only a multiset fingerprint of the `(pkh, message)` pairs they sign and
-//! a blinded hash of them.
+//! only a multiset fingerprint of the `(key root, message)` pairs they sign
+//! and a blinded hash of them.
 //!
-//! The aggregation matches the fingerprint against the item chunks' (each
-//! input contributes `(pkh, its transaction's digest)`,
-//! [`crate::item_chunk_air`]), so every input is signed by its key. The
-//! hash fixes the pairs before the block's challenges are derived.
+//! A key root is the root of the output's key tree
+//! ([`crate::transaction::KeyTree`]) that the signing key is a leaf of. The
+//! aggregation matches the fingerprint against the item chunks' (each input
+//! contributes `(its output's hash, its transaction's digest)`,
+//! [`crate::item_chunk_air`]), so every input is signed by one of its
+//! output's keys. The hash fixes the pairs before the block's challenges
+//! are derived.
 //!
 //! Rows: `slots` slots, each a WOTS region verifying a signature on the
-//! slot's message ([`wots_air`]), a `PKH` row hashing the public key, and
-//! two rows absorbing `pkh` then the message into the pair-hash sponge
-//! (whose initial capacity is a random blinding); then a final row. Each
-//! slot has an active flag; inactive slots (dummy signatures) contribute
-//! nothing.
+//! slot's message ([`wots_air`]), a `PKH` row hashing the public key,
+//! [`KEY_LEVELS`] merge rows walking the key's path to the root (a bit and
+//! a sibling per row), and two rows absorbing the root then the message
+//! into the pair-hash sponge (whose initial capacity is a random blinding);
+//! then a final row. Each slot has an active flag; inactive slots (dummy
+//! signatures) contribute nothing.
 //!
 //! Public values: `lambda (4) | r (4) | P_sig (4) | hash (8)`.
 
@@ -25,11 +29,12 @@ use crate::matrix::RowMajorMatrix;
 use crate::poseidon2::{self, WIDTH};
 use crate::poseidon2_air::{self, OUTPUT_OFFSET};
 use crate::rng::Rng;
+use crate::transaction::{KEY_LEVELS, KeyPath, key_root};
 use crate::wots::{self, PARAM_LEN, PublicKey, Signature};
 use crate::wots_air;
 
-/// Rows per slot: the WOTS region, `PKH`, two hash rows.
-pub const SLOT_ROWS: usize = wots_air::NUM_ROWS + 3;
+/// Rows per slot: the WOTS region, `PKH`, the merges, two hash rows.
+pub const SLOT_ROWS: usize = wots_air::NUM_ROWS + 1 + KEY_LEVELS + 2;
 /// `x^4 = W` in the extension field.
 const EXT_W: BabyBear = BabyBear::new(11);
 
@@ -41,7 +46,11 @@ const ACT: usize = T;
 const SIGS: usize = ACT + 1;
 /// The fingerprint product, carried.
 const PSIG: usize = SIGS + WIDTH;
-pub const NUM_COLS: usize = PSIG + 4;
+/// On merge rows: the path's bit (1: the running node is the right child)
+/// and sibling.
+const BIT: usize = PSIG + 4;
+const SIB: usize = BIT + 1;
+pub const NUM_COLS: usize = SIB + HASH_LEN;
 
 // Preprocessed columns after the WOTS region's.
 const PW: usize = wots_air::PRE_WIDTH;
@@ -54,7 +63,12 @@ const SAME_SLOT: usize = PW + 3;
 const SLOTS: usize = PW + 4;
 const FIRST: usize = PW + 5;
 const FINAL: usize = PW + 6;
-pub const PRE_WIDTH: usize = PW + 7;
+/// Merge rows; rows followed by one (`PKH` and all merges but the last);
+/// the last (whose result is the root).
+const MERGE: usize = PW + 7;
+const STEP: usize = PW + 8;
+const ROOT: usize = PW + 9;
+pub const PRE_WIDTH: usize = PW + 10;
 
 /// Offsets of the public values.
 pub mod public {
@@ -87,16 +101,26 @@ impl SigChunkAir {
     }
 }
 
-/// A signature to prove: `pubkey` signed `msg`.
+/// A signature to prove: `pubkey`, at `leaf` of a key tree (with `path`),
+/// signed `msg`.
 #[derive(Clone, Debug)]
 pub struct SigItem {
     pub pubkey: PublicKey,
+    pub leaf: u8,
+    pub path: KeyPath,
     pub sig: Signature,
     pub msg: Hash,
 }
 
+impl SigItem {
+    /// The root of the key tree.
+    pub fn root(&self) -> Hash {
+        key_root(&self.pubkey.hash(), self.leaf, &self.path)
+    }
+}
+
 /// The pair hash of a chunk: a sponge with `blinding` as initial capacity,
-/// absorbing each signature's `pkh` then message.
+/// absorbing each signature's key root then message.
 pub fn chunk_hash(blinding: &Hash, pairs: &[(Hash, Hash)]) -> Hash {
     let mut s = [BabyBear::ZERO; WIDTH];
     s[HASH_LEN..].copy_from_slice(blinding);
@@ -145,8 +169,16 @@ impl Air for SigChunkAir {
             }
             let tail = base + wots_air::NUM_ROWS;
             m.row_mut(tail)[PKH] = one;
-            m.row_mut(tail + 1)[H1] = one;
-            m.row_mut(tail + 2)[H2] = one;
+            m.row_mut(tail)[STEP] = one;
+            for d in 1..=KEY_LEVELS {
+                m.row_mut(tail + d)[MERGE] = one;
+                if d < KEY_LEVELS {
+                    m.row_mut(tail + d)[STEP] = one;
+                }
+            }
+            m.row_mut(tail + KEY_LEVELS)[ROOT] = one;
+            m.row_mut(tail + KEY_LEVELS + 1)[H1] = one;
+            m.row_mut(tail + KEY_LEVELS + 2)[H2] = one;
             for r in base..base + SLOT_ROWS {
                 m.row_mut(r)[SLOTS] = one;
                 if r + 1 < base + SLOT_ROWS {
@@ -196,15 +228,28 @@ impl Air for SigChunkAir {
         c.assert_zero(pkh_row * (l[13] - k(domain::PUBLIC_KEY_HASH)));
         c.assert_zero(pkh_row * l[14]);
         c.assert_zero(pkh_row * l[15]);
-        let pkh: [V; HASH_LEN] = core::array::from_fn(|j| out(j) + l[j]);
+        // A compression's result (PKH and merge rows): output + input.
+        let cur: [V; HASH_LEN] = core::array::from_fn(|j| out(j) + l[j]);
 
-        // The fingerprint, on PKH.
+        // Merges: the next row hashes the running node with its sibling,
+        // in the order the bit gives.
+        let step = p[STEP];
+        let (bit, sib) = (n[BIT], &n[SIB..SIB + HASH_LEN]);
+        c.assert_zero(p[MERGE] * l[BIT] * (l[BIT] - one));
+        for j in 0..HASH_LEN {
+            c.assert_zero(step * (n[j] - cur[j] - bit * (sib[j] - cur[j])));
+            c.assert_zero(step * (n[HASH_LEN + j] - sib[j] - bit * (cur[j] - sib[j])));
+        }
+        let root = cur;
+        let root_row = p[ROOT];
+
+        // The fingerprint, on the root.
         let mut powers = [[zero; 4]; 2 * HASH_LEN];
         powers[0][0] = one;
         for j in 1..powers.len() {
             powers[j] = ext_mul(powers[j - 1], lambda);
         }
-        let e = pkh
+        let e = root
             .iter()
             .chain(&l[wots_air::MSG..wots_air::MSG + HASH_LEN])
             .zip(&powers)
@@ -217,15 +262,15 @@ impl Air for SigChunkAir {
         });
         let next = ext_mul(core::array::from_fn(|b| l[PSIG + b]), factor);
         for b in 0..4 {
-            c.assert_zero(pkh_row * (n[PSIG + b] - next[b]));
-            c.assert_zero_transition(slots * (one - pkh_row) * (n[PSIG + b] - l[PSIG + b]));
+            c.assert_zero(root_row * (n[PSIG + b] - next[b]));
+            c.assert_zero_transition(slots * (one - root_row) * (n[PSIG + b] - l[PSIG + b]));
         }
 
-        // Pair hash: an active slot's H1 absorbs pkh into the sponge, H2 its
-        // message; H2's output is the new sponge state.
+        // Pair hash: an active slot's H1 absorbs the root into the sponge,
+        // H2 its message; H2's output is the new sponge state.
         for j in 0..WIDTH {
-            let absorbed = if j < HASH_LEN { pkh[j] } else { zero };
-            c.assert_zero(pkh_row * act * (n[j] - l[SIGS + j] - absorbed));
+            let absorbed = if j < HASH_LEN { root[j] } else { zero };
+            c.assert_zero(root_row * act * (n[j] - l[SIGS + j] - absorbed));
             let absorbed = if j < HASH_LEN {
                 l[wots_air::MSG + j]
             } else {
@@ -294,42 +339,57 @@ impl SigChunkAir {
             input[HASH_LEN..HASH_LEN + PARAM_LEN].copy_from_slice(&item.pubkey.param);
             input[13] = BabyBear::new(domain::PUBLIC_KEY_HASH);
             let out = poseidon2_air::generate(input, m.row_mut(tail));
-            let pkh: Hash = core::array::from_fn(|j| out[j] + input[j]);
-            debug_assert_eq!(pkh, item.pubkey.hash());
+            let mut cur: Hash = core::array::from_fn(|j| out[j] + input[j]);
+            debug_assert_eq!(cur, item.pubkey.hash());
+            for (d, sib) in item.path.iter().enumerate() {
+                let bit = item.leaf >> d & 1 == 1;
+                let (left, right) = if bit { (sib, &cur) } else { (&cur, sib) };
+                let mut input = [BabyBear::ZERO; WIDTH];
+                input[..HASH_LEN].copy_from_slice(left);
+                input[HASH_LEN..].copy_from_slice(right);
+                let row = m.row_mut(tail + 1 + d);
+                row[BIT] = BabyBear::from(bit);
+                row[SIB..SIB + HASH_LEN].copy_from_slice(sib);
+                let out = poseidon2_air::generate(input, row);
+                cur = core::array::from_fn(|j| out[j] + input[j]);
+            }
+            let root = cur;
+            debug_assert_eq!(root, item.root());
+            let (h1_row, h2_row) = (tail + KEY_LEVELS + 1, tail + KEY_LEVELS + 2);
             let mut h1 = [BabyBear::ZERO; WIDTH];
             let mut h2 = [BabyBear::ZERO; WIDTH];
             if active {
                 h1 = sponge;
-                for (x, &v) in h1.iter_mut().zip(&pkh) {
+                for (x, &v) in h1.iter_mut().zip(&root) {
                     *x += v;
                 }
             }
-            let out1 = poseidon2_air::generate(h1, m.row_mut(tail + 1));
+            let out1 = poseidon2_air::generate(h1, m.row_mut(h1_row));
             if active {
                 h2 = out1;
                 for (x, &v) in h2.iter_mut().zip(&item.msg) {
                     *x += v;
                 }
             }
-            let out2 = poseidon2_air::generate(h2, m.row_mut(tail + 2));
+            let out2 = poseidon2_air::generate(h2, m.row_mut(h2_row));
             for r in base..base + SLOT_ROWS {
                 let row = m.row_mut(r);
                 row[ACT] = BabyBear::from(active);
                 row[wots_air::MSG..wots_air::MSG + HASH_LEN].copy_from_slice(&item.msg);
                 row[wots_air::PARAM..wots_air::PARAM + PARAM_LEN]
                     .copy_from_slice(&item.pubkey.param);
-                // The carried values change after PKH (product) and H2
-                // (sponge).
-                if r <= tail {
+                // The carried values change after the root (product) and
+                // H2 (sponge).
+                if r <= tail + KEY_LEVELS {
                     write(row, &sponge, psig);
                 }
             }
             let new_psig = if active {
-                psig * (r - sig_element(lambda, &pkh, &item.msg))
+                psig * (r - sig_element(lambda, &root, &item.msg))
             } else {
                 psig
             };
-            for row in [tail + 1, tail + 2] {
+            for row in [h1_row, h2_row] {
                 write(m.row_mut(row), &sponge, new_psig);
             }
             psig = new_psig;
@@ -360,6 +420,8 @@ fn dummy(rng: &mut Rng) -> SigItem {
     SigItem {
         sig: sk.sign(&msg),
         pubkey,
+        leaf: 0,
+        path: [[BabyBear::ZERO; HASH_LEN]; KEY_LEVELS],
         msg,
     }
 }
@@ -371,6 +433,7 @@ mod tests {
     use crate::fri::FriParams;
     use crate::item_chunk_air::product;
     use crate::stark;
+    use crate::transaction::KeyTree;
 
     const LAMBDA: BabyBear4 = BabyBear4::new([3, 5, 7, 11]);
     const R: BabyBear4 = BabyBear4::new([13, 17, 19, 23]);
@@ -381,15 +444,23 @@ mod tests {
             n * 31 + i as u32
         })));
         let msg = [BabyBear::new(msg); HASH_LEN];
+        // At leaf `n * 37 % 256` of a tree of made-up hashes.
+        let leaf = (n * 37 % 256) as u8;
+        let mut tree = KeyTree(core::array::from_fn(|i| {
+            BabyBear::new_array([n * 1000 + i as u32; HASH_LEN])
+        }));
+        tree.0[leaf as usize] = pubkey.hash();
         SigItem {
             sig: sk.sign(&msg),
             pubkey,
+            leaf,
+            path: tree.path(leaf as usize),
             msg,
         }
     }
 
     fn expected(sigs: &[SigItem]) -> (BabyBear4, Hash) {
-        let pairs: Vec<(Hash, Hash)> = sigs.iter().map(|s| (s.pubkey.hash(), s.msg)).collect();
+        let pairs: Vec<(Hash, Hash)> = sigs.iter().map(|s| (s.root(), s.msg)).collect();
         (
             product(R, pairs.iter().map(|(p, m)| sig_element(LAMBDA, p, m))),
             chunk_hash(&BLINDING, &pairs),
@@ -421,6 +492,16 @@ mod tests {
         sigs[1].msg = [BabyBear::new(21); HASH_LEN];
         let (t, public) = air.trace(&sigs, &BLINDING, LAMBDA, R, &mut Rng::from_seed(1));
         assert!(check_constraints(&air, &t, &public).is_err());
+        // A path bit or sibling changed in the trace (the root stays).
+        let sigs = [signed(1, 10), signed(2, 20)];
+        let (t, public) = air.trace(&sigs, &BLINDING, LAMBDA, R, &mut Rng::from_seed(1));
+        let merge = wots_air::NUM_ROWS + 2;
+        for col in [BIT, SIB + 3] {
+            let mut bad = t.clone();
+            let v = bad.row_mut(merge)[col];
+            bad.row_mut(merge)[col] = v + BabyBear::ONE;
+            assert!(check_constraints(&air, &bad, &public).is_err(), "col {col}");
+        }
     }
 
     #[test]

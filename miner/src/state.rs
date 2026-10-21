@@ -58,6 +58,10 @@ const LIMB_BITS: u32 = 30;
 
 /// Elements in a leaf hash: key, nonce limbs, next key, next index lo/hi.
 pub const LEAF_LEN: usize = 2 * HASH_LEN + NONCE_LIMBS + 2;
+/// Nonce limbs after the first block's worth, hashed last (so each part of
+/// a leaf starts a sponge block).
+pub const NONCE_TAIL: usize = NONCE_LIMBS - HASH_LEN;
+const _: () = assert!(NONCE_LIMBS >= HASH_LEN && 2 + NONCE_TAIL <= HASH_LEN);
 
 pub type Siblings = [Hash; DEPTH];
 
@@ -79,17 +83,20 @@ impl Leaf {
         next_index: END,
     };
 
-    /// `sponge(STATE_LEAF, [key, nonce limbs, next key, next index lo, hi])`.
+    /// `sponge(STATE_LEAF, [key, nonce limbs 0..8, next key, next index
+    /// lo, hi, nonce limbs 8..])`.
     pub fn hash(&self) -> Hash {
         let (lo, hi) = split(self.next_index);
+        let nonce = output::nonce_limbs(&self.nonce);
         sponge(
             domain::STATE_LEAF,
             &[],
             &[
                 &self.key,
-                &output::nonce_limbs(&self.nonce),
+                &nonce[..HASH_LEN],
                 &self.next_key,
                 &[lo, hi],
+                &nonce[HASH_LEN..],
             ],
         )
     }

@@ -86,7 +86,9 @@ impl fmt::Display for LedgerError {
             Self::UnknownParent => f.write_str("unknown parent"),
             Self::KnownInvalid => f.write_str("known to be invalid"),
             Self::BeforeBase => f.write_str("forks below this node's fast-sync base"),
-            Self::TooDeep => f.write_str("forks too far below the tip (beyond the snap-sync limit)"),
+            Self::TooDeep => {
+                f.write_str("forks too far below the tip (beyond the snap-sync limit)")
+            }
             Self::BadSnapshot => f.write_str("the state snapshot doesn't match its header"),
             Self::NotFresh => f.write_str("the chain isn't new (only genesis)"),
             Self::Header(e) => write!(f, "header: {e}"),
@@ -825,6 +827,31 @@ pub(crate) mod tests {
         l.add(&h, &b).unwrap();
         let o3 = ok.next(&[32], &[]);
         assert!(matches!(l.add(&o3.0, &o3.1), Err(LedgerError::TooDeep)));
+    }
+
+    #[test]
+    fn a_block_cant_spend_what_it_creates() {
+        let genesis = Header {
+            timestamp: now() - 1_000_000,
+            state: crate::state::empty_state(),
+            ..Header::default()
+        };
+        let env = TempEnv::new();
+        let l = ledger(&env, &genesis);
+        let mut a = Branch::new(genesis);
+        let a1 = a.next(&[1, 2], &[1]);
+        let e = l.add(&a1.0, &a1.1).unwrap_err();
+        assert!(
+            matches!(e, LedgerError::Block(BlockError::SpendsItsOwnOutput)),
+            "{e}"
+        );
+        assert_eq!(l.tip().unwrap().0, genesis);
+        // A block later, it can.
+        let mut b = Branch::new(genesis);
+        let b1 = b.next(&[1, 2], &[]);
+        let b2 = b.next(&[3], &[1]);
+        l.add(&b1.0, &b1.1).unwrap();
+        assert_eq!(l.add(&b2.0, &b2.1).unwrap(), Added::Extended);
     }
 
     #[test]

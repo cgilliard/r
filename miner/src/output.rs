@@ -19,20 +19,25 @@ pub const OUTPUT_HASH_LEN: usize = HASH_BYTES;
 /// little-endian `u32`s (see [`hash::to_bytes`]), each below `p`.
 pub type OutputHash = [u8; OUTPUT_HASH_LEN];
 
-pub const NONCE_LEN: usize = 16;
+pub const NONCE_LEN: usize = 32;
 
 /// Per-output value, committed to and also stored in the clear so a wallet can
 /// recognise its own outputs (e.g. during recovery). Distinct nonces also keep
 /// two outputs with the same hash and amount from sharing a commitment.
 pub type Nonce = [u8; NONCE_LEN];
 
+/// Bytes per nonce limb: 24 bits, always below `p`, so the encoding is
+/// injective without range checks.
+pub const NONCE_LIMB_BYTES: usize = 3;
+
 pub const COMMITMENT_LEN: usize = HASH_BYTES;
 
-/// Amounts and nonces are hashed as 16-bit limbs, little-endian, which a
-/// circuit can range-check and sum without overflowing the field.
+/// Amounts are hashed as 16-bit limbs, little-endian, which a circuit can
+/// range-check and sum without overflowing the field.
 pub const LIMB_BITS: u32 = 16;
 pub const AMOUNT_LIMBS: usize = (Amount::BITS / LIMB_BITS) as usize;
-pub const NONCE_LIMBS: usize = NONCE_LEN / 2;
+/// Nonces are hashed as 3-byte limbs (the last one shorter).
+pub const NONCE_LIMBS: usize = NONCE_LEN.div_ceil(NONCE_LIMB_BYTES);
 
 /// `units` as a decimal number of coins ("1.5", "1000").
 pub fn format_coins(units: u128) -> String {
@@ -115,7 +120,8 @@ impl Output {
 }
 
 /// `H(hash || amount || nonce)`: a sponge over the hash's 8 elements, the
-/// amount's 4 limbs and the nonce's 8 limbs, 20 elements in all. `None` if
+/// amount's 4 limbs and the nonce's 11 limbs, 23 elements in all (three
+/// permutations). `None` if
 /// `hash` is not a canonical encoding.
 pub fn commit(hash: &OutputHash, amount: Amount, nonce: &Nonce) -> Option<Commitment> {
     let hash = hash::from_bytes(hash)?;
@@ -161,10 +167,16 @@ pub fn net_value(limbs: &[BabyBear]) -> i128 {
     v as i128 - NET_OFFSET as i128
 }
 
-/// `nonce` as 16-bit limbs: byte pairs, little-endian.
+/// `nonce` as limbs: 3-byte groups, little-endian.
 pub fn nonce_limbs(nonce: &Nonce) -> [BabyBear; NONCE_LIMBS] {
     core::array::from_fn(|i| {
-        BabyBear::new(u16::from_le_bytes([nonce[2 * i], nonce[2 * i + 1]]) as u32)
+        let group = &nonce[NONCE_LIMB_BYTES * i..(NONCE_LIMB_BYTES * (i + 1)).min(NONCE_LEN)];
+        BabyBear::new(
+            group
+                .iter()
+                .rev()
+                .fold(0u32, |acc, &b| (acc << 8) | b as u32),
+        )
     })
 }
 
@@ -175,7 +187,7 @@ mod tests {
     use super::*;
     use crate::babybear::P;
 
-    const NONCE: Nonce = *b"0123456789abcdef";
+    const NONCE: Nonce = *b"0123456789abcdef0123456789ABCDEF";
 
     #[test]
     fn coins_format_and_parse() {
@@ -290,7 +302,8 @@ mod tests {
         assert_eq!(back, amount);
         assert!(limbs.iter().all(|l| l.as_u32() < 1 << 16));
         let n = nonce_limbs(&NONCE);
-        assert_eq!(n[0].as_u32(), u16::from_le_bytes(*b"01") as u32);
+        assert_eq!(n[0].as_u32(), u32::from_le_bytes(*b"012\0"));
+        assert_eq!(n[NONCE_LIMBS - 1].as_u32(), u32::from_le_bytes(*b"EF\0\0"));
     }
 
     #[test]
