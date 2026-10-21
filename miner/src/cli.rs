@@ -1213,7 +1213,7 @@ mod tests {
             &[pay(&alice, 5 * COIN), pay(&alice, 5 * COIN)],
             &[],
         );
-        let dir = std::env::temp_dir().join(format!("r-cli-m-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("r-cli-f-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = |n: &str| dir.join(n).display().to_string();

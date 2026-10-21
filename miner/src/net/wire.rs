@@ -23,7 +23,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use crate::hash::{self, Hash};
 use crate::header::{HEADER_BYTES, Header};
 
-pub const VERSION: u8 = 1;
+/// Stays 0 until launch: during development nothing older needs to talk
+/// to anything newer.
+pub const VERSION: u8 = 0;
 /// Largest datagram sent or accepted.
 pub const MAX_PACKET: usize = 1200;
 pub const HEADER_LEN: usize = 16;
@@ -59,6 +61,9 @@ pub struct Tip {
     pub hash: Hash,
     /// Total work through the tip ([`crate::header::work`] units).
     pub work: u128,
+    /// The lowest height whose state it serves for fast sync (its history
+    /// window, or its own fast-sync base if that's higher); 0 if none.
+    pub state_from: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -287,6 +292,7 @@ fn put_tip(out: &mut Vec<u8>, tip: &Tip) {
     out.extend(tip.height.to_le_bytes());
     out.extend(hash::to_bytes(&tip.hash));
     out.extend(tip.work.to_le_bytes());
+    out.extend(tip.state_from.to_le_bytes());
 }
 
 fn put_hash(out: &mut Vec<u8>, h: &Hash) {
@@ -485,6 +491,7 @@ impl<'a> Reader<'a> {
             height: self.u64()?,
             hash: self.hash()?,
             work: u128::from_le_bytes(self.array()?),
+            state_from: self.u64()?,
         })
     }
 
@@ -699,6 +706,7 @@ mod tests {
             height: 5,
             hash: h(5),
             work: u128::MAX - 3,
+            state_from: 2,
         }
     }
 

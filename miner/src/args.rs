@@ -16,7 +16,7 @@ transactions, and mines (unless --no-mine) once caught up. Its log goes to
 through files, with send, receive and finalize.
 
 Options:
-      --data-dir <PATH>      Directory for the database [default: target/data]
+      --data-dir <PATH>      Directory for the database [default: ~/.tabernacle]
       --listen <ADDR>        Accept peers on this UDP address (such as
                              0.0.0.0:7333)
       --peer <ADDR>          Connect to a peer (may be repeated)
@@ -42,7 +42,13 @@ Options:
   -h, --help                 Print help
   -V, --version              Print version";
 
-pub const DEFAULT_DATA_DIR: &str = "target/data";
+/// `~/.tabernacle` (`.tabernacle` in the current directory if `HOME` isn't
+/// set).
+pub fn default_data_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map_or_else(PathBuf::new, PathBuf::from)
+        .join(".tabernacle")
+}
 pub const DEFAULT_SYNC_DEPTH: u64 = 100;
 pub const DEFAULT_MAX_PEERS: usize = 64;
 pub const DEFAULT_COIN_MATURITY: u64 = crate::cli::DEFAULT_MATURITY;
@@ -234,7 +240,7 @@ impl Args {
         }
 
         Ok(Command::Run(Args {
-            data_dir: data_dir.unwrap_or_else(|| DEFAULT_DATA_DIR.into()),
+            data_dir: data_dir.unwrap_or_else(default_data_dir),
             no_mine,
             status,
             listen,
@@ -264,7 +270,7 @@ mod tests {
         Args::parse(args.iter().copied())
     }
 
-    fn run(dir: &str) -> Result<Command, ArgsError> {
+    fn run(dir: impl Into<PathBuf>) -> Result<Command, ArgsError> {
         Ok(Command::Run(Args {
             data_dir: dir.into(),
             no_mine: false,
@@ -281,7 +287,7 @@ mod tests {
 
     #[test]
     fn defaults() {
-        assert_eq!(parse(&[]), run(DEFAULT_DATA_DIR));
+        assert_eq!(parse(&[]), run(default_data_dir()));
     }
 
     #[test]
@@ -298,7 +304,7 @@ mod tests {
     fn mode_flags() {
         let want = |no_mine, status| {
             Ok(Command::Run(Args {
-                data_dir: DEFAULT_DATA_DIR.into(),
+                data_dir: default_data_dir(),
                 no_mine,
                 status,
                 listen: None,
@@ -412,7 +418,7 @@ mod tests {
         let a: SocketAddr = "127.0.0.1:7333".parse().unwrap();
         let b: SocketAddr = "10.0.0.2:9".parse().unwrap();
         let want = Ok(Command::Run(Args {
-            data_dir: DEFAULT_DATA_DIR.into(),
+            data_dir: default_data_dir(),
             no_mine: false,
             status: false,
             listen: Some(a),

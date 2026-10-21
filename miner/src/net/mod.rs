@@ -38,6 +38,11 @@ impl Backend for LedgerBackend {
             height: tip.height,
             hash: tip.hash(),
             work,
+            state_from: if tip.height == 0 {
+                0
+            } else {
+                self.ledger.servable_from().unwrap_or(0)
+            },
         }
     }
 
@@ -69,6 +74,14 @@ impl Backend for LedgerBackend {
             if l.store.is_invalid(&txn, &h).map_err(|e| e.to_string())? {
                 return Err("known to be invalid".into());
             }
+        }
+        // A parent still queued was checked when it was.
+        if l.store
+            .header_by_hash(&txn, &parent.hash())
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            l.check_fork(&txn, parent).map_err(|e| e.to_string())?;
         }
         header::check_new(&l.consensus, l.data, parent, header, now()).map_err(|e| e.to_string())
     }

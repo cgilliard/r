@@ -5,7 +5,11 @@
 //! its parent (link, time, ASERT target, PoW) and its body and chain proof
 //! against its header ([`Chain::verify_block`]); the proof covers the whole
 //! history, so a branch's blocks can be checked before the branch is
-//! applied. Valid blocks are stored whichever branch they're on.
+//! applied. Valid blocks are stored whichever branch they're on, as long
+//! as the branch leaves the main chain at most [`Ledger::snap_sync_limit`]
+//! blocks below the tip ([`Ledger::check_fork`]): no deeper reorg is
+//! followed (a node that needs one resyncs), and side blocks forking far
+//! back, where the work was cheap, are never stored.
 //!
 //! The main chain is the branch with the most total work; on a tie the one
 //! seen first stays. When a block makes another branch heaviest, the ledger
@@ -62,6 +66,9 @@ pub enum LedgerError {
     KnownInvalid,
     /// The branch leaves the main chain below the fast-sync base.
     BeforeBase,
+    /// The branch leaves the main chain more than
+    /// [`Ledger::snap_sync_limit`] blocks below the tip.
+    TooDeep,
     /// A downloaded state tree doesn't match its header.
     BadSnapshot,
     /// Fast sync needs a ledger with only genesis.
@@ -79,6 +86,7 @@ impl fmt::Display for LedgerError {
             Self::UnknownParent => f.write_str("unknown parent"),
             Self::KnownInvalid => f.write_str("known to be invalid"),
             Self::BeforeBase => f.write_str("forks below this node's fast-sync base"),
+            Self::TooDeep => f.write_str("forks too far below the tip (beyond the snap-sync limit)"),
             Self::BadSnapshot => f.write_str("the state snapshot doesn't match its header"),
             Self::NotFresh => f.write_str("the chain isn't new (only genesis)"),
             Self::Header(e) => write!(f, "header: {e}"),
@@ -205,9 +213,49 @@ impl Ledger {
             .store
             .header_by_hash(&txn, &header.prev)?
             .ok_or(LedgerError::UnknownParent)?;
+        self.check_fork(&txn, &parent)?;
         header::check_new(&self.consensus, self.data, &parent, header, now())
             .map_err(LedgerError::Header)?;
         Ok(parent)
+    }
+
+    /// Refuses a block on `parent` (stored) whose branch leaves the main
+    /// chain more than [`Ledger::snap_sync_limit`] blocks below the tip, or
+    /// below the fast-sync base. Side blocks cost their work at the
+    /// difficulty where they fork, so this keeps cheap ones, forking far
+    /// back where the work was low, out; a reorg that deep isn't followed
+    /// anyway (a node that needs one resyncs).
+    pub fn check_fork(&self, txn: &heed::RoTxn, parent: &Header) -> Result<(), LedgerError> {
+        let tip = self.store.tip(txn)?.ok_or(store::Error::Corrupt)?;
+        let base = self.store.base(txn)?;
+        let floor = tip.height.saturating_sub(self.snap_sync_limit).max(base);
+        let mut h = *parent;
+        loop {
+            if self.store.height_of(txn, &h.hash())?.is_some() {
+                // On the main chain: the fork point.
+                return if h.height < floor {
+                    Err(if h.height < base {
+                        LedgerError::BeforeBase
+                    } else {
+                        LedgerError::TooDeep
+                    })
+                } else {
+                    Ok(())
+                };
+            }
+            if h.height <= floor {
+                // The fork point is lower still.
+                return Err(if h.height <= base {
+                    LedgerError::BeforeBase
+                } else {
+                    LedgerError::TooDeep
+                });
+            }
+            h = self
+                .store
+                .header_by_hash(txn, &h.prev)?
+                .ok_or(store::Error::Corrupt)?;
+        }
     }
 
     /// Checks and stores `block` under `header`, and makes it (and its
@@ -742,6 +790,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn branches_forking_beyond_the_limit_are_refused() {
+        let genesis = Header {
+            timestamp: now() - 1_000_000,
+            state: crate::state::empty_state(),
+            ..Header::default()
+        };
+        let env = TempEnv::new();
+        let l = ledger_keeping(&env, &genesis, 2);
+        let mut a = Branch::new(genesis);
+        for n in 1..=5 {
+            let (h, b) = a.next(&[n], &[]);
+            l.add(&h, &b).unwrap();
+        }
+        // The tip is at 5: branches may leave from block 3 up.
+        let fork_at = |k: u32| {
+            let mut b = Branch::new(genesis);
+            for n in 1..=k {
+                b.next(&[n], &[]);
+            }
+            b
+        };
+        let mut deep = fork_at(2);
+        let d = deep.next(&[20], &[]);
+        assert!(matches!(l.add(&d.0, &d.1), Err(LedgerError::TooDeep)));
+        assert!(matches!(l.check_header(&d.0), Err(LedgerError::TooDeep)));
+        let mut ok = fork_at(3);
+        let o1 = ok.next(&[30], &[]);
+        assert_eq!(l.add(&o1.0, &o1.1).unwrap(), Added::Side);
+        let o2 = ok.next(&[31], &[]);
+        assert_eq!(l.add(&o2.0, &o2.1).unwrap(), Added::Side);
+        // The main chain moves on: the branch at 3 is now too deep to grow.
+        let (h, b) = a.next(&[6], &[]);
+        l.add(&h, &b).unwrap();
+        let o3 = ok.next(&[32], &[]);
+        assert!(matches!(l.add(&o3.0, &o3.1), Err(LedgerError::TooDeep)));
+    }
+
+    #[test]
     fn a_block_that_doesnt_apply_changes_nothing() {
         let genesis = Header {
             timestamp: now() - 1_000_000,
@@ -935,13 +1021,10 @@ pub(crate) mod tests {
         );
         assert_eq!(sorted(outputs(&third)), sorted(outputs(&full)));
 
-        // A heavier branch from below the base can't be followed.
+        // A branch from below the base isn't even stored.
         let mut b = Branch::new(genesis);
-        let others: Vec<_> = (0..5).map(|i| b.next(&[100 + i], &[])).collect();
-        for (h, blk) in &others[..4] {
-            assert_eq!(new.add(h, blk).unwrap(), Added::Side);
-        }
-        let e = new.add(&others[4].0, &others[4].1).unwrap_err();
+        let (h, blk) = b.next(&[100], &[]);
+        let e = new.add(&h, &blk).unwrap_err();
         assert!(matches!(e, LedgerError::BeforeBase), "{e}");
         assert_eq!(new.tip().unwrap().0, blocks[3].0);
     }

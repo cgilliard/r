@@ -18,7 +18,11 @@
 //! [`cap::LISTENING`], and addresses learned from peers (`GET_PEERS` /
 //! `PEERS`, asked of every new outbound peer and now and then of a random
 //! one). Learned addresses are tried, and dropped after a few failures; the
-//! ones that worked are saved to [`Config::peer_file`]. At most
+//! ones that worked are saved to [`Config::peer_file`]. So that one hostile
+//! peer can't fill the book with made-up addresses, a `PEERS` we didn't ask
+//! for is ignored, one peer's IP can have at most `MAX_FROM_ONE`
+//! untried addresses in it, and when it's full, new addresses push out
+//! untried ones (never ones that worked). At most
 //! [`Config::max_peers`] sessions are open.
 //!
 //! **Sync.** A following node asks a peer whose tip is ahead for headers
@@ -232,6 +236,8 @@ const MAX_FAILURES: u32 = 3;
 const BOOK_DIAL_EVERY: Duration = Duration::from_millis(500);
 /// Most addresses kept in the book.
 const MAX_BOOK: usize = 1000;
+/// Most untried addresses one peer (by IP) can have in the book.
+const MAX_FROM_ONE: usize = 64;
 /// Ask a random peer for addresses this often.
 const PEERS_EVERY: Duration = Duration::from_secs(300);
 /// Save the book (when it changed) at most this often.
@@ -289,6 +295,8 @@ struct Peer {
     outbound: bool,
     /// Where it accepts connections, if it does.
     listen: Option<SocketAddr>,
+    /// We asked it for addresses and haven't had its answer.
+    asked_peers: bool,
     last_seen: Instant,
     last_ping: Instant,
 }
@@ -305,6 +313,8 @@ struct Dial {
 struct Known {
     /// We've had a session with it.
     verified: bool,
+    /// The peer that told us of it, while it's untried.
+    source: Option<IpAddr>,
     failures: u32,
     next_try: Instant,
 }
@@ -491,6 +501,7 @@ impl<B: Backend> Node<B> {
                         addr,
                         Known {
                             verified: true,
+                            source: None,
                             failures: 0,
                             next_try: now,
                         },
@@ -669,7 +680,7 @@ impl<B: Backend> Node<B> {
             } if packet.session != 0 => {
                 if self.dials.remove(&addr).is_some() && !self.peers.contains_key(&packet.session) {
                     self.add_peer(packet.session, addr, capabilities, tip, true, Some(addr));
-                    self.send_peer(packet.session, &Message::GetPeers);
+                    self.ask_peers(packet.session);
                 }
             }
             msg => {
@@ -703,12 +714,13 @@ impl<B: Backend> Node<B> {
         ));
         if let Some(l) = listen
             && dialable(&l)
-            && (self.book.contains_key(&l) || self.book.len() < MAX_BOOK)
+            && (self.book.contains_key(&l) || self.make_room(None))
         {
             self.book.insert(
                 l,
                 Known {
                     verified: true,
+                    source: None,
                     failures: 0,
                     next_try: now,
                 },
@@ -723,6 +735,7 @@ impl<B: Backend> Node<B> {
                 tip,
                 outbound,
                 listen,
+                asked_peers: false,
                 last_seen: now,
                 last_ping: now,
             },
@@ -1021,23 +1034,69 @@ impl<B: Backend> Node<B> {
         self.send_peer(session, &Message::Peers { addrs: verified });
     }
 
+    fn ask_peers(&mut self, session: u32) {
+        if let Some(p) = self.peers.get_mut(&session) {
+            p.asked_peers = true;
+            self.send_peer(session, &Message::GetPeers);
+        }
+    }
+
+    /// Whether the book has room for one more address, pushing out a
+    /// random untried one (not one `adding` told us of) if it's full.
+    fn make_room(&mut self, adding: Option<IpAddr>) -> bool {
+        if self.book.len() < MAX_BOOK {
+            return true;
+        }
+        let untried: Vec<SocketAddr> = self
+            .book
+            .iter()
+            .filter(|(_, k)| !k.verified && (adding.is_none() || k.source != adding))
+            .map(|(a, _)| *a)
+            .collect();
+        if untried.is_empty() {
+            return false;
+        }
+        let i = self.rng.next_element().as_u32() as usize % untried.len();
+        self.book.remove(&untried[i]);
+        true
+    }
+
     fn on_peers(&mut self, session: u32, addrs: &[SocketAddr]) {
+        let Some(peer) = self.peers.get_mut(&session) else {
+            return;
+        };
+        if !std::mem::take(&mut peer.asked_peers) {
+            // Unasked: ignored.
+            return;
+        }
+        let source = peer.addr.ip();
         let now = Instant::now();
+        let mut from_it = self
+            .book
+            .values()
+            .filter(|k| k.source == Some(source))
+            .count();
         let mut learned = 0;
         for a in addrs {
-            if self.book.len() >= MAX_BOOK {
+            if from_it >= MAX_FROM_ONE {
                 break;
             }
-            if dialable(a) && !self.ours.contains(a) && !self.book.contains_key(a) {
+            if dialable(a)
+                && !self.ours.contains(a)
+                && !self.book.contains_key(a)
+                && self.make_room(Some(source))
+            {
                 self.book.insert(
                     *a,
                     Known {
                         verified: false,
+                        source: Some(source),
                         failures: 0,
                         next_try: now,
                     },
                 );
                 learned += 1;
+                from_it += 1;
             }
         }
         if learned > 0 {
@@ -1333,21 +1392,52 @@ impl<B: Backend> Node<B> {
             .map(|(h, _)| h)
             .filter(|&h| h <= tip);
         let height = match resume {
-            Some(h) => {
-                (self.log)(format!(
-                    "fast sync: asking {addr} for the state at height {h}, to resume its download"
-                ));
-                h
-            }
+            Some(h) => h,
             None if tip <= depth => return false,
-            None => {
-                let height = tip - depth;
-                (self.log)(format!(
-                    "fast sync: asking {addr} for the state at height {height} ({depth} below its tip at {tip})"
-                ));
-                height
+            None => tip - depth,
+        };
+        // Ask a peer whose advertised history covers it (the best one if
+        // it does).
+        let serves = |p: &Peer| {
+            p.tip.state_from != 0 && p.tip.state_from <= height && height <= p.tip.height
+        };
+        let session = if self.peers.get(&session).is_some_and(serves) {
+            session
+        } else {
+            match self
+                .peers
+                .iter()
+                .find(|(s, p)| !exclude.contains(s) && serves(p))
+            {
+                Some((&s, _)) => s,
+                None => {
+                    (self.log)(format!(
+                        "fast sync: {addr} has no state at height {height}{}",
+                        if resume.is_some() {
+                            "; starting a new download"
+                        } else {
+                            ""
+                        }
+                    ));
+                    if resume.is_some() {
+                        self.resume_failed = true;
+                    } else {
+                        self.no_snapshot.insert(session);
+                    }
+                    return false;
+                }
             }
         };
+        let asked = self.peers[&session].addr;
+        (self.log)(match resume {
+            Some(_) => format!(
+                "fast sync: asking {asked} for the state at height {height}, to resume its download"
+            ),
+            None => format!(
+                "fast sync: asking {asked} for the state at height {height} ({depth} below the \
+                 best tip, at {tip})"
+            ),
+        });
         self.fast = Some(FastSync::Asking {
             session,
             height,
@@ -1696,7 +1786,13 @@ impl<B: Backend> Node<B> {
         let mut load: HashMap<u32, usize> = self
             .peers
             .iter()
-            .filter(|(id, p)| p.tip.height >= s.info.base.height && !s.refused.contains(id))
+            .filter(|(id, p)| {
+                let h = s.info.base.height;
+                p.tip.state_from != 0
+                    && p.tip.state_from <= h
+                    && p.tip.height >= h
+                    && !s.refused.contains(id)
+            })
             .map(|(&id, _)| (id, 0))
             .collect();
         for (sid, _) in s.inflight.values() {
@@ -2083,7 +2179,7 @@ impl<B: Backend> Node<B> {
             self.last_peers_ask = now;
             let sessions: Vec<u32> = self.peers.keys().copied().collect();
             let s = sessions[self.rng.next_element().as_u32() as usize % sessions.len()];
-            self.send_peer(s, &Message::GetPeers);
+            self.ask_peers(s);
         }
         if self.book_dirty && now - self.last_save >= SAVE_EVERY {
             self.save_book();
@@ -2373,6 +2469,11 @@ mod tests {
                 height: h.height,
                 hash: h.hash(),
                 work: *work,
+                state_from: if h.height == 0 {
+                    0
+                } else {
+                    h.height.saturating_sub(c.limit).max(c.base).max(1)
+                },
             }
         }
 
@@ -2735,7 +2836,7 @@ mod tests {
         let na = start(a.clone(), true, vec![], 0);
         let nb = start(b.clone(), true, vec![na.addr], 0);
         // A reorganizes onto B's heavier branch; B keeps its own.
-        wait_for("A to reorg", 20, || a.tip() == b.tip());
+        wait_for("A to reorg", 20, || a.tip().hash == b.tip().hash);
         assert_eq!(a.height(), 5);
         // A's old blocks are still stored, on a side branch.
         assert_eq!(a.0.lock().unwrap().blocks.len(), 1 + 3 + 5);
@@ -2753,7 +2854,7 @@ mod tests {
         // The next block on B's side settles it.
         b.mine(1000, 3);
         nb.events.send(Event::NewTip).unwrap();
-        wait_for("A to follow B's branch", 10, || a.tip() == b.tip());
+        wait_for("A to follow B's branch", 10, || a.tip().hash == b.tip().hash);
         assert_eq!(a.height(), 7);
     }
 
@@ -2793,7 +2894,7 @@ mod tests {
             cfg(vec![na.addr], 10),
             Arc::new(Mutex::new(vec![])),
         );
-        wait_for("B to fast sync", 20, || b.tip() == a.tip());
+        wait_for("B to fast sync", 20, || b.tip().hash == a.tip().hash);
         // B has the blocks from its base (height 20) up, none before.
         let hash_at = |m: &Mock, h: u64| m.0.lock().unwrap().main[h as usize];
         assert_eq!(b.body(&hash_at(&a, 19)), None);
@@ -2803,14 +2904,14 @@ mod tests {
         // It follows new blocks, and a newer node can fast sync from it.
         a.mine(5000, 77);
         na.events.send(Event::NewTip).unwrap();
-        wait_for("B to follow", 10, || b.tip() == a.tip());
+        wait_for("B to follow", 10, || b.tip().hash == a.tip().hash);
         let c = Mock::new();
         let _nc = start_with(
             c.clone(),
             cfg(vec![nb.addr], 5),
             Arc::new(Mutex::new(vec![])),
         );
-        wait_for("C to fast sync from B", 20, || c.tip() == a.tip());
+        wait_for("C to fast sync from B", 20, || c.tip().hash == a.tip().hash);
         assert_eq!(c.0.lock().unwrap().base, 26);
 
         // Asked for a state below its base, B has none: D syncs every
@@ -2821,7 +2922,7 @@ mod tests {
             cfg(vec![nb.addr, na.addr], 25),
             Arc::new(Mutex::new(vec![])),
         );
-        wait_for("D to sync", 30, || d.tip() == a.tip());
+        wait_for("D to sync", 30, || d.tip().hash == a.tip().hash);
         assert!(d.0.lock().unwrap().base >= 6);
     }
 
@@ -2841,7 +2942,7 @@ mod tests {
         let ng = start(g.clone(), true, vec![na.addr], 0);
         let ne = start(e.clone(), true, vec![na.addr], 0);
         wait_for("G and E to sync", 30, || {
-            g.tip() == a.tip() && e.tip() == a.tip()
+            g.tip().hash == a.tip().hash && e.tip().hash == a.tip().hash
         });
         e.0.lock().unwrap().corrupt = true;
 
@@ -2856,7 +2957,7 @@ mod tests {
             },
             lines.clone(),
         );
-        wait_for("F to fast sync", 30, || f.tip() == a.tip());
+        wait_for("F to fast sync", 30, || f.tip().hash == a.tip().hash);
         assert_eq!(f.base(), 190);
         // 190 hashes: a root node and 24 groups, spread over the peers.
         assert!(
@@ -2904,7 +3005,7 @@ mod tests {
             },
             lines.clone(),
         );
-        wait_for("F to resume", 20, || f.tip() == a.tip());
+        wait_for("F to resume", 20, || f.tip().hash == a.tip().hash);
         assert!(has_line(&lines, "at height 50, to resume its download"));
         assert_eq!(f.base(), 50);
         // Only the 6 groups it didn't have were fetched.
@@ -2924,7 +3025,7 @@ mod tests {
             },
             lines.clone(),
         );
-        wait_for("H to sync", 20, || h.tip() == a.tip());
+        wait_for("H to sync", 20, || h.tip().hash == a.tip().hash);
         assert_eq!(h.base(), 0);
         assert!(has_line(&lines, "has no state at height 50"));
     }
@@ -3000,6 +3101,71 @@ mod tests {
         wait_for("C to connect to B", 15, || connected(&c_log, nb.addr));
     }
 
+    /// A session with a peer at `addr` that we've asked for addresses.
+    fn asked(n: &mut Node<Mock>, session: u32, addr: &str) {
+        let now = Instant::now();
+        n.peers.insert(
+            session,
+            Peer {
+                addr: addr.parse().unwrap(),
+                capabilities: 0,
+                tip: n.backend.tip(),
+                outbound: true,
+                listen: None,
+                asked_peers: true,
+                last_seen: now,
+                last_ping: now,
+            },
+        );
+    }
+
+    #[test]
+    fn a_hostile_peer_cant_fill_the_address_book() {
+        let mut n = Node::new(
+            UdpSocket::bind("127.0.0.1:0").unwrap(),
+            Config::new(*b"test"),
+            Mock::new(),
+            Box::new(|_| {}),
+        );
+        let addrs = |first: u32, count: u32| -> Vec<SocketAddr> {
+            (first..first + count)
+                .map(|i| SocketAddr::from(([10, (i >> 16) as u8, (i >> 8) as u8, i as u8], 7333)))
+                .collect()
+        };
+        // Unasked: ignored. Asked: taken, once.
+        asked(&mut n, 1, "10.200.0.1:1");
+        n.peers.get_mut(&1).unwrap().asked_peers = false;
+        n.on_peers(1, &addrs(1, 5));
+        assert!(n.book.is_empty());
+        n.peers.get_mut(&1).unwrap().asked_peers = true;
+        n.on_peers(1, &addrs(1, MAX_ADDRS as u32));
+        n.on_peers(1, &addrs(1000, 5));
+        assert_eq!(n.book.len(), MAX_ADDRS);
+        // One peer adds at most MAX_FROM_ONE untried addresses.
+        for k in 0..10 {
+            n.peers.get_mut(&1).unwrap().asked_peers = true;
+            n.on_peers(1, &addrs(2000 + k * 100, MAX_ADDRS as u32));
+        }
+        assert_eq!(n.book.len(), MAX_FROM_ONE);
+        // A full book: new addresses push out untried ones, never ones
+        // that worked.
+        let worked = n.book.keys().next().copied().unwrap();
+        n.book.get_mut(&worked).unwrap().verified = true;
+        n.book.get_mut(&worked).unwrap().source = None;
+        let mut session = 100;
+        while n.book.len() < MAX_BOOK {
+            session += 1;
+            asked(&mut n, session, &format!("10.201.{}.{}:1", session >> 8, session & 255));
+            n.on_peers(session, &addrs(100_000 + session * 100, MAX_ADDRS as u32));
+        }
+        asked(&mut n, 1, "10.202.0.1:1");
+        let fresh = addrs(900_000, MAX_ADDRS as u32);
+        n.on_peers(1, &fresh);
+        assert_eq!(n.book.len(), MAX_BOOK);
+        assert!(fresh.iter().all(|a| n.book.contains_key(a)));
+        assert!(n.book[&worked].verified);
+    }
+
     #[test]
     fn the_address_book_is_saved_and_loaded() {
         let dir = std::env::temp_dir().join(format!("r-peers-{}", std::process::id()));
@@ -3018,7 +3184,8 @@ mod tests {
         );
         assert_eq!(n.book.keys().copied().collect::<Vec<_>>(), vec![a]);
         let b: SocketAddr = "[2001:db8::1]:9".parse().unwrap();
-        n.on_peers(0, &[b, a]);
+        asked(&mut n, 1, "10.9.9.9:1");
+        n.on_peers(1, &[b, a]);
         // Only addresses that have worked are saved.
         n.save_book();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), format!("{a}\n"));
