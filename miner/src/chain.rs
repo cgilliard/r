@@ -53,13 +53,11 @@ use crate::fri::FriParams;
 use crate::hash::{HASH_LEN, Hash, domain};
 use crate::header::{self, Consensus, Header, WORK_LIMBS};
 use crate::item_chunk_air::Boundary;
-use crate::pow::DatasetTree;
 use crate::output;
+use crate::pow::DatasetTree;
 use crate::pow_circuit::{self, HeaderCells};
 use crate::recursion_air::RecursionAir;
-use crate::stark::{
-    self, KeyCache, PreprocessedCommitment, StarkError, StarkProof, VerifyingKey,
-};
+use crate::stark::{self, KeyCache, PreprocessedCommitment, StarkError, StarkProof, VerifyingKey};
 use crate::state::{self, StateTree, Undo};
 use crate::symbolic::{Program, compile};
 use crate::verifier_circuit::{self, Inner, ProofCells};
@@ -638,8 +636,7 @@ pub const KEYS: ChainKeys = ChainKeys {
         780211085, 867189719, 1490953196, 617223248, 485687576, 909532308, 895215005, 647430773,
     ]),
     wrap: BabyBear::new_array([
-        342833832, 1304694754, 961309630, 1987511813, 777483746, 1662147403, 1020515416,
-        1107749614,
+        342833832, 1304694754, 961309630, 1987511813, 777483746, 1662147403, 1020515416, 1107749614,
     ]),
 };
 

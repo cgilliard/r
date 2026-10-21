@@ -225,8 +225,7 @@ impl Ledger {
             .header_by_hash(&txn, &header.prev)?
             .ok_or(LedgerError::UnknownParent)?;
         self.check_fork(&txn, &parent)?;
-        header::check_new(&self.consensus, &parent, header, now())
-            .map_err(LedgerError::Header)?;
+        header::check_new(&self.consensus, &parent, header, now()).map_err(LedgerError::Header)?;
         Ok(parent)
     }
 

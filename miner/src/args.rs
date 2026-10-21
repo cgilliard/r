@@ -18,8 +18,10 @@ through files, with send, receive and finalize.
 
 Options:
       --data-dir <PATH>      Directory for the database [default: ~/.tabernacle]
-      --listen <ADDR>        Accept peers on this UDP address (such as
-                             0.0.0.0:3737)
+      --listen <ADDR>        Accept peers on this UDP address
+                             [default: 0.0.0.0:3737]
+      --no-listen            Don't accept peers: only dial out (such as a
+                             second node on the same machine)
       --peer <ADDR>          Connect to a peer (may be repeated)
       --sync-depth <BLOCKS>  A new node downloads the state at BLOCKS below
                              the best peer's tip, then the blocks from there,
@@ -50,6 +52,12 @@ pub fn default_data_dir() -> PathBuf {
         .map_or_else(PathBuf::new, PathBuf::from)
         .join(".tabernacle")
 }
+/// Where a node accepts peers unless told otherwise: every interface, on
+/// the network's port (the seeds').
+pub const DEFAULT_LISTEN: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
+    std::net::Ipv4Addr::UNSPECIFIED,
+    3737,
+));
 pub const DEFAULT_SYNC_DEPTH: u64 = 100;
 pub const DEFAULT_MAX_PEERS: usize = 64;
 pub const DEFAULT_COIN_MATURITY: u64 = crate::cli::DEFAULT_MATURITY;
@@ -96,6 +104,8 @@ pub enum ArgsError {
     UnexpectedValue(&'static str),
     /// An option's value doesn't parse.
     InvalidValue(&'static str),
+    /// Two options that can't go together.
+    Conflict(&'static str, &'static str),
     Unknown(OsString),
 }
 
@@ -106,6 +116,7 @@ impl fmt::Display for ArgsError {
             Self::Duplicate(opt) => write!(f, "option '{opt}' was given more than once"),
             Self::UnexpectedValue(opt) => write!(f, "option '{opt}' does not take a value"),
             Self::InvalidValue(opt) => write!(f, "invalid value for option '{opt}'"),
+            Self::Conflict(a, b) => write!(f, "options '{a}' and '{b}' can't be used together"),
             Self::Unknown(arg) => write!(f, "unexpected argument '{}'", arg.to_string_lossy()),
         }
     }
@@ -133,6 +144,7 @@ impl Args {
         let mut no_mine = false;
         let mut status = false;
         let mut listen: Option<SocketAddr> = None;
+        let mut no_listen = false;
         let mut peers: Vec<SocketAddr> = Vec::new();
         let mut sync_depth: Option<u64> = None;
         let mut max_peers: Option<usize> = None;
@@ -165,9 +177,10 @@ impl Args {
                     }
                     data_dir = Some(value.into());
                 }
-                "--no-mine" | "--status" | "--restore" => {
+                "--no-mine" | "--no-listen" | "--status" | "--restore" => {
                     let (opt, set) = match name {
                         "--no-mine" => ("--no-mine", &mut no_mine),
+                        "--no-listen" => ("--no-listen", &mut no_listen),
                         "--status" => ("--status", &mut status),
                         _ => ("--restore", &mut restore),
                     };
@@ -240,11 +253,14 @@ impl Args {
             }
         }
 
+        if no_listen && listen.is_some() {
+            return Err(ArgsError::Conflict("--listen", "--no-listen"));
+        }
         Ok(Command::Run(Args {
             data_dir: data_dir.unwrap_or_else(default_data_dir),
             no_mine,
             status,
-            listen,
+            listen: (!no_listen).then(|| listen.unwrap_or(DEFAULT_LISTEN)),
             peers,
             sync_depth: sync_depth.unwrap_or(DEFAULT_SYNC_DEPTH),
             max_peers: max_peers.unwrap_or(DEFAULT_MAX_PEERS),
@@ -276,7 +292,7 @@ mod tests {
             data_dir: dir.into(),
             no_mine: false,
             status: false,
-            listen: None,
+            listen: Some(DEFAULT_LISTEN),
             peers: vec![],
             sync_depth: DEFAULT_SYNC_DEPTH,
             max_peers: DEFAULT_MAX_PEERS,
@@ -308,7 +324,7 @@ mod tests {
                 data_dir: default_data_dir(),
                 no_mine,
                 status,
-                listen: None,
+                listen: Some(DEFAULT_LISTEN),
                 peers: vec![],
                 sync_depth: DEFAULT_SYNC_DEPTH,
                 max_peers: DEFAULT_MAX_PEERS,
@@ -450,6 +466,18 @@ mod tests {
             parse(&["--listen", "127.0.0.1:1", "--listen", "127.0.0.1:2"]),
             Err(Duplicate("--listen"))
         );
+        // Listening is the default; --no-listen turns it off.
+        let listen = |args: &[&str]| match parse(args) {
+            Ok(Command::Run(a)) => Ok(a.listen),
+            Ok(c) => panic!("{c:?}"),
+            Err(e) => Err(e),
+        };
+        assert_eq!(listen(&[]), Ok(Some("0.0.0.0:3737".parse().unwrap())));
+        assert_eq!(listen(&["--no-listen"]), Ok(None));
+        assert_eq!(
+            listen(&["--no-listen", "--listen", "127.0.0.1:1"]),
+            Err(Conflict("--listen", "--no-listen"))
+        );
     }
 
     #[test]
@@ -497,7 +525,7 @@ mod tests {
                 data_dir: raw.into(),
                 no_mine: false,
                 status: false,
-                listen: None,
+                listen: Some(DEFAULT_LISTEN),
                 peers: vec![],
                 sync_depth: DEFAULT_SYNC_DEPTH,
                 max_peers: DEFAULT_MAX_PEERS,

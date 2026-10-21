@@ -176,12 +176,45 @@ impl fmt::Display for Rejected {
 }
 
 /// Events from the rest of the program.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum Event {
     /// The local chain has a new tip (a block mined here): announce it.
     NewTip,
     /// A transaction was added to the mempool here: announce it.
     NewTx(Hash),
+    /// Send a [`PeerReport`] to the given channel.
+    Peers(std::sync::mpsc::Sender<PeerReport>),
+}
+
+/// The node's peers as of a moment: what the `peers` command shows.
+#[derive(Clone, Debug, Default)]
+pub struct PeerReport {
+    pub connected: Vec<PeerInfo>,
+    /// Addresses being dialed, not answering yet.
+    pub dialing: Vec<SocketAddr>,
+    /// The address book.
+    pub book: Vec<BookEntry>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PeerInfo {
+    pub addr: SocketAddr,
+    /// Whether we dialed it.
+    pub outbound: bool,
+    /// Where it accepts connections, if it does.
+    pub listen: Option<SocketAddr>,
+    pub tip: Tip,
+    /// Seconds since we last heard from it.
+    pub idle: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct BookEntry {
+    pub addr: SocketAddr,
+    /// We've had a session with it.
+    pub verified: bool,
+    /// Dials that went unanswered.
+    pub failures: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -593,6 +626,9 @@ impl<B: Backend> Node<B> {
                 match event {
                     Event::NewTip => self.announce_tip(None),
                     Event::NewTx(id) => self.announce_txs(&[id], None),
+                    Event::Peers(reply) => {
+                        let _ = reply.send(self.peer_report());
+                    }
                 }
             }
             self.tick();
@@ -1144,6 +1180,39 @@ impl<B: Backend> Node<B> {
         }
         self.book_dirty = false;
         self.last_save = Instant::now();
+    }
+
+    fn peer_report(&self) -> PeerReport {
+        let now = Instant::now();
+        let mut connected: Vec<PeerInfo> = self
+            .peers
+            .values()
+            .map(|p| PeerInfo {
+                addr: p.addr,
+                outbound: p.outbound,
+                listen: p.listen,
+                tip: p.tip,
+                idle: (now - p.last_seen).as_secs(),
+            })
+            .collect();
+        connected.sort_by_key(|p| p.addr);
+        let mut dialing: Vec<SocketAddr> = self.dials.keys().copied().collect();
+        dialing.sort();
+        let mut book: Vec<BookEntry> = self
+            .book
+            .iter()
+            .map(|(a, k)| BookEntry {
+                addr: *a,
+                verified: k.verified,
+                failures: k.failures,
+            })
+            .collect();
+        book.sort_by_key(|b| (!b.verified, b.addr));
+        PeerReport {
+            connected,
+            dialing,
+            book,
+        }
     }
 
     /// Looks up the seed nodes' addresses and dials them (once each, not

@@ -317,11 +317,7 @@ impl std::error::Error for HeaderError {}
 
 /// Checks `header` as the child of `parent`: the rules a chain proof can
 /// also enforce (height, link, increasing time, PoW).
-pub fn check(
-    c: &Consensus,
-    parent: &Header,
-    header: &Header,
-) -> Result<(), HeaderError> {
+pub fn check(c: &Consensus, parent: &Header, header: &Header) -> Result<(), HeaderError> {
     if header.height != parent.height + 1 {
         return Err(HeaderError::Height);
     }

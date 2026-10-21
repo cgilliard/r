@@ -231,9 +231,11 @@ fn open(
                 log.line(format!("couldn't save the key cache: {e}"));
             }
             if chain.verifier().keys() != chain::KEYS {
-                return Err("the circuits' keys aren't the pinned ones (chain::KEYS): this build \
+                return Err(
+                    "the circuits' keys aren't the pinned ones (chain::KEYS): this build \
                             can't make proofs other nodes accept"
-                    .into());
+                        .into(),
+                );
             }
             let ([first_rows, chain_rows, wrap_rows], log_height) = chain.used_rows();
             log.line(format!(
@@ -284,10 +286,15 @@ fn node(
     net: &Net,
     mempool: Arc<Mempool>,
 ) -> Result<Node<LedgerBackend>, Box<dyn Error>> {
-    let socket = UdpSocket::bind(
-        net.listen
-            .unwrap_or_else(|| "0.0.0.0:0".parse().expect("address")),
-    )?;
+    let addr = net
+        .listen
+        .unwrap_or_else(|| "0.0.0.0:0".parse().expect("address"));
+    let socket = UdpSocket::bind(addr).map_err(|e| {
+        format!(
+            "can't listen on {addr}: {e} (another node on this machine needs its own --listen \
+             address, or --no-listen)"
+        )
+    })?;
     let cfg = Config {
         capabilities: if net.listen.is_some() {
             cap::LISTENING
@@ -368,11 +375,11 @@ pub fn run(data_dir: &Path, net: &Net, opts: &Options) -> Result<(), Box<dyn Err
         log_path.display(),
     );
     println!(
-        "starting up ({} take a moment)...",
+        "starting up{}...",
         if mine {
-            "the PoW dataset and provers"
+            " (the PoW dataset and provers take a moment)"
         } else {
-            "the provers"
+            ""
         }
     );
     log.line(format!(

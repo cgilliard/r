@@ -87,6 +87,8 @@ commands:
                                tracking one being received); a signed one
                                needs a higher fee, and pays its coins back
   status                       the node: tip, sync, mempool
+  peers [all]                  connected peers, dials, and the address book
+                               (all: every address in it)
   help                         this list
   quit                         stop the node";
 
@@ -178,6 +180,8 @@ impl Cli {
             ["outputs" | "output"] => self.outputs()?,
             ["seed"] => self.seed()?,
             ["status"] => self.status()?,
+            ["peers"] => self.peers(false)?,
+            ["peers", "all"] => self.peers(true)?,
             ["send", amount, fee, file] => {
                 let amount = parse_coins(amount).ok_or("bad amount")?;
                 let fee = parse_coins(fee).ok_or("bad fee")?;
@@ -536,6 +540,60 @@ impl Cli {
              restore with: r --restore --data-dir <a new directory>",
             words_block(&entropy)
         ))
+    }
+
+    /// The network thread's peers: connected ones with their tips, dials
+    /// in progress, and the address book (counts, or every entry).
+    fn peers(&self, all: bool) -> Result<String, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.events
+            .send(Event::Peers(tx))
+            .map_err(|_| "the network isn't running")?;
+        let r = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| "the network didn't answer")?;
+        let mut out = format!("connected: {}\n", r.connected.len());
+        if !r.connected.is_empty() {
+            out += &format!(
+                "  {:<22}  {:<3}  {:>8}  {:<22}  {}\n",
+                "address", "dir", "height", "accepts peers on", "idle"
+            );
+        }
+        for p in &r.connected {
+            out += &format!(
+                "  {:<22}  {:<3}  {:>8}  {:<22}  {}s\n",
+                p.addr.to_string(),
+                if p.outbound { "out" } else { "in" },
+                p.tip.height,
+                p.listen.map_or("-".into(), |a| a.to_string()),
+                p.idle
+            );
+        }
+        if !r.dialing.is_empty() {
+            let list: Vec<String> = r.dialing.iter().map(|a| a.to_string()).collect();
+            out += &format!("dialing: {}\n", list.join(", "));
+        }
+        let worked = r.book.iter().filter(|b| b.verified).count();
+        out += &format!(
+            "address book: {} ({worked} worked, {} untried)",
+            r.book.len(),
+            r.book.len() - worked
+        );
+        if all {
+            for b in &r.book {
+                out += &format!(
+                    "\n  {:<22}  {}",
+                    b.addr.to_string(),
+                    match (b.verified, b.failures) {
+                        (true, 0) => "worked".to_string(),
+                        (true, f) => format!("worked; {f} failed dial(s) since"),
+                        (false, 0) => "untried".to_string(),
+                        (false, f) => format!("untried; {f} failed dial(s)"),
+                    }
+                );
+            }
+        }
+        Ok(out)
     }
 
     fn status(&self) -> Result<String, String> {
@@ -1206,6 +1264,77 @@ mod tests {
             state: crate::state::empty_state(),
             ..Header::default()
         }
+    }
+
+    #[test]
+    fn peers_shows_the_networks_report() {
+        use crate::babybear::BabyBear;
+        use crate::net::node::{BookEntry, PeerInfo, PeerReport};
+        let g = genesis();
+        // Taking the receiver out of a node, not destructuring it: the node
+        // must drop its CLI (holding the database) before its database.
+        let mut lone = node(&g);
+        // No network thread: the request goes unanswered.
+        drop(std::mem::replace(&mut lone.events, channel().1));
+        assert_eq!(
+            run(&lone, "peers").unwrap_err(),
+            "the network isn't running"
+        );
+
+        let mut n = node(&g);
+        let events = std::mem::replace(&mut n.events, channel().1);
+        let a: std::net::SocketAddr = "1.2.3.4:3737".parse().unwrap();
+        let b: std::net::SocketAddr = "5.6.7.8:9000".parse().unwrap();
+        let network = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok(Event::Peers(reply)) = events.recv() else {
+                    panic!("not a peers request");
+                };
+                reply
+                    .send(PeerReport {
+                        connected: vec![PeerInfo {
+                            addr: a,
+                            outbound: true,
+                            listen: Some(a),
+                            tip: crate::net::wire::Tip {
+                                height: 42,
+                                hash: [BabyBear::ZERO; crate::hash::HASH_LEN],
+                                work: 0,
+                                state_from: 0,
+                            },
+                            idle: 3,
+                        }],
+                        dialing: vec![b],
+                        book: vec![
+                            BookEntry {
+                                addr: a,
+                                verified: true,
+                                failures: 0,
+                            },
+                            BookEntry {
+                                addr: b,
+                                verified: false,
+                                failures: 2,
+                            },
+                        ],
+                    })
+                    .unwrap();
+            }
+        });
+        let out = run(&n, "peers").unwrap();
+        assert!(out.starts_with("connected: 1\n"), "{out}");
+        assert!(out.contains("1.2.3.4:3737") && out.contains("out") && out.contains("42"));
+        assert!(out.contains("dialing: 5.6.7.8:9000"));
+        assert!(
+            out.ends_with("address book: 2 (1 worked, 1 untried)"),
+            "{out}"
+        );
+        let all = run(&n, "peers all").unwrap();
+        assert!(
+            all.contains("5.6.7.8:9000            untried; 2 failed dial(s)"),
+            "{all}"
+        );
+        network.join().unwrap();
     }
 
     #[test]
