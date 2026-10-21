@@ -10,7 +10,8 @@ Usage: r [OPTIONS]
 
 Runs a node on the chain in <PATH>/chain (creating it if needed): it finds
 peers (from --peer, the peer list saved in <PATH>/peers, and what peers pass
-on), syncs the chain, verifies and follows peers' blocks, relays
+on; with none of those, from the seed nodes tabernacle1.root.sx:3737 and
+tabernacle2.root.sx:3737), syncs the chain, verifies and follows peers' blocks, relays
 transactions, and mines (unless --no-mine) once caught up. Its log goes to
 <PATH>/node.log; the terminal takes wallet commands (type help): payments go
 through files, with send, receive and finalize.
@@ -18,7 +19,7 @@ through files, with send, receive and finalize.
 Options:
       --data-dir <PATH>      Directory for the database [default: ~/.tabernacle]
       --listen <ADDR>        Accept peers on this UDP address (such as
-                             0.0.0.0:7333)
+                             0.0.0.0:3737)
       --peer <ADDR>          Connect to a peer (may be repeated)
       --sync-depth <BLOCKS>  A new node downloads the state at BLOCKS below
                              the best peer's tip, then the blocks from there,

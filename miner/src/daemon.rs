@@ -7,7 +7,8 @@
 //! Three threads share the ledger and the mempool:
 //!
 //! - the network node ([`crate::net`]) finds peers (from `--peer`, the saved
-//!   peer list in `<data dir>/peers`, and what peers tell it), syncs the
+//!   peer list in `<data dir>/peers`, and what peers tell it, or else the
+//!   [`SEEDS`]), syncs the
 //!   chain (a new node fast-syncs from `--sync-depth` blocks below the best
 //!   tip), serves it, relays transactions, and adds peers' blocks to the
 //!   ledger, which follows the branch with the most work;
@@ -240,8 +241,12 @@ fn open(log: &Log, data_dir: &Path, snap_sync_limit: u64) -> Result<Opened, Box<
     })
 }
 
+/// The seed nodes a node dials when it has no one else to: a new node with
+/// no `--peer`, or one whose saved peers are all gone.
+pub const SEEDS: [&str; 2] = ["tabernacle1.root.sx:3737", "tabernacle2.root.sx:3737"];
+
 /// A node on `net.listen` (or any port), dialing `net.peers` and the saved
-/// peer list, serving the ledger and mempool and adding peers' blocks and
+/// peer list (or the [`SEEDS`], when it has no one else to dial), serving the ledger and mempool and adding peers' blocks and
 /// transactions to them.
 fn node(
     log: &Log,
@@ -261,6 +266,7 @@ fn node(
             0
         },
         peers: net.peers.clone(),
+        seeds: SEEDS.map(String::from).to_vec(),
         peer_file: Some(data_dir.join("peers")),
         sync_depth: Some(net.sync_depth),
         max_peers: net.max_peers,
@@ -277,7 +283,10 @@ fn node(
         if net.listen.is_some() { "listening" } else { "not accepting peers; sending" },
         node.local_addr(),
         if net.peers.is_empty() {
-            "from the saved list and other peers".to_string()
+            format!(
+                "from the saved list and other peers, or the seeds ({})",
+                SEEDS.join(", ")
+            )
         } else {
             net.peers.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
         },

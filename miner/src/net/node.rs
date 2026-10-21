@@ -23,7 +23,11 @@
 //! for is ignored, one peer's IP can have at most `MAX_FROM_ONE`
 //! untried addresses in it, and when it's full, new addresses push out
 //! untried ones (never ones that worked). At most
-//! [`Config::max_peers`] sessions are open.
+//! [`Config::max_peers`] sessions are open. A node that's cut off (no
+//! session and nothing to dial: a new node with an empty book, or one whose
+//! saved addresses have all gone) looks up its [`Config::seeds`] by name and
+//! dials them, at most every `SEED_EVERY`; once connected it learns other
+//! peers from them, so the seeds aren't kept as connections.
 //!
 //! **Sync.** A following node asks a peer whose tip is ahead for headers
 //! after its own last one (`GET_HEADERS`), checks each against its parent
@@ -191,6 +195,9 @@ pub struct Config {
     pub follow: bool,
     /// Peers to dial, and redial whenever they're lost.
     pub peers: Vec<SocketAddr>,
+    /// Seed nodes (`host:port` names, looked up when dialed), for when
+    /// there's no one else to dial.
+    pub seeds: Vec<String>,
     /// Outbound connections to keep, configured peers included.
     pub outbound: usize,
     /// Where to keep the address book, if anywhere.
@@ -212,6 +219,7 @@ impl Config {
             capabilities: 0,
             follow: true,
             peers: vec![],
+            seeds: vec![],
             outbound: 8,
             max_peers: 64,
             peer_file: None,
@@ -234,6 +242,8 @@ const DIAL_TRIES: u32 = 5;
 const MAX_FAILURES: u32 = 3;
 /// Wait at least this long between starting dials to learned addresses.
 const BOOK_DIAL_EVERY: Duration = Duration::from_millis(500);
+/// The least time between dials of the seed nodes.
+const SEED_EVERY: Duration = Duration::from_secs(60);
 /// Most addresses kept in the book.
 const MAX_BOOK: usize = 1000;
 /// Most untried addresses one peer (by IP) can have in the book.
@@ -431,6 +441,8 @@ pub struct Node<B: Backend> {
     book_dirty: bool,
     last_save: Instant,
     last_book_dial: Instant,
+    /// When the seed nodes were last dialed.
+    last_seed: Option<Instant>,
     last_peers_ask: Instant,
     served: VecDeque<(Hash, Served)>,
     served_txs: VecDeque<(Hash, Served)>,
@@ -526,6 +538,7 @@ impl<B: Backend> Node<B> {
             book_dirty: false,
             last_save: now,
             last_book_dial: long_ago,
+            last_seed: None,
             last_peers_ask: now,
             served: VecDeque::new(),
             served_txs: VecDeque::new(),
@@ -1133,6 +1146,33 @@ impl<B: Backend> Node<B> {
         self.last_save = Instant::now();
     }
 
+    /// Looks up the seed nodes' addresses and dials them (once each, not
+    /// redialing them when lost).
+    fn dial_seeds(&mut self) {
+        let mut dialed = Vec::new();
+        for name in self.cfg.seeds.clone() {
+            let addrs = match std::net::ToSocketAddrs::to_socket_addrs(name.as_str()) {
+                Ok(addrs) => addrs,
+                Err(e) => {
+                    (self.log)(format!("seed {name}: can't look it up: {e}"));
+                    continue;
+                }
+            };
+            for addr in addrs.filter(|a| dialable(a) && !self.ours.contains(a)) {
+                self.dials.entry(addr).or_insert(Dial {
+                    last_sent: None,
+                    cookie: None,
+                    tries: 0,
+                    persistent: false,
+                });
+                dialed.push(format!("{name} ({addr})"));
+            }
+        }
+        if !dialed.is_empty() {
+            (self.log)(format!("no peers: dialing seeds {}", dialed.join(", ")));
+        }
+    }
+
     /// Dials configured peers we aren't connected to, and learned ones up
     /// to the outbound target; resends `HELLO`s; gives up on learned
     /// addresses that don't answer.
@@ -1178,6 +1218,15 @@ impl<B: Backend> Node<B> {
                     },
                 );
             }
+        }
+        // Cut off: ask the seeds.
+        if self.peers.is_empty()
+            && self.dials.is_empty()
+            && !self.cfg.seeds.is_empty()
+            && self.last_seed.is_none_or(|t| now - t >= SEED_EVERY)
+        {
+            self.last_seed = Some(now);
+            self.dial_seeds();
         }
 
         let mut gave_up = Vec::new();
@@ -3118,6 +3167,55 @@ mod tests {
                 last_seen: now,
                 last_ping: now,
             },
+        );
+    }
+
+    #[test]
+    fn a_node_with_no_one_to_dial_finds_the_network_through_its_seeds() {
+        let a = Mock::new();
+        for i in 0..3 {
+            a.mine(1000, i + 1);
+        }
+        let na = start(a.clone(), false, vec![], 0);
+        let seeds = vec![format!("localhost:{}", na.addr.port())];
+        // A new node, alone: it looks the seed up by name and syncs from it.
+        let b = Mock::new();
+        let lines = Arc::new(Mutex::new(vec![]));
+        let _nb = start_with(
+            b.clone(),
+            Config {
+                seeds: seeds.clone(),
+                ..Config::new(*b"test")
+            },
+            lines.clone(),
+        );
+        wait_for("sync through the seed", 20, || b.height() == 3);
+        assert!(
+            lines
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("dialing seeds localhost:"))
+        );
+        // One with a peer to dial leaves the seeds alone.
+        let c = Mock::new();
+        let lines = Arc::new(Mutex::new(vec![]));
+        let _nc = start_with(
+            c.clone(),
+            Config {
+                peers: vec![na.addr],
+                seeds,
+                ..Config::new(*b"test")
+            },
+            lines.clone(),
+        );
+        wait_for("sync through the peer", 20, || c.height() == 3);
+        assert!(
+            !lines
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("dialing seeds"))
         );
     }
 
