@@ -39,6 +39,8 @@ pub const MAX_RANGES: usize = 64;
 pub const COOKIE_LEN: usize = 8;
 /// Addresses in one `PEERS` message.
 pub const MAX_ADDRS: usize = 32;
+/// Ids in one `TX_INV` message.
+pub const MAX_TX_IDS: usize = 32;
 /// Longest `STATE` data: what's left of a datagram after its fields.
 pub const MAX_STATE_DATA: usize = MAX_PACKET - HEADER_LEN - 32 - 1 - 8 - 2;
 const _: () = assert!(crate::state::MAX_SYNC_REPLY <= MAX_STATE_DATA);
@@ -170,6 +172,22 @@ pub enum Message {
     NoState {
         base: Hash,
     },
+    /// Ids of transactions the sender has in its mempool (up to
+    /// [`MAX_TX_IDS`]).
+    TxInv {
+        ids: Vec<Hash>,
+    },
+    /// The transaction with this id.
+    GetTx {
+        id: Hash,
+    },
+    /// Its encoding's size and chunk root, which hash to the id; its chunks
+    /// are fetched with `GET_BLOCK_CHUNKS` under the id.
+    TxInfo {
+        id: Hash,
+        size: u32,
+        root: Hash,
+    },
 }
 
 impl Message {
@@ -197,6 +215,9 @@ impl Message {
             Self::GetState { .. } => 20,
             Self::State { .. } => 21,
             Self::NoState { .. } => 22,
+            Self::TxInv { .. } => 23,
+            Self::GetTx { .. } => 24,
+            Self::TxInfo { .. } => 25,
         }
     }
 
@@ -225,6 +246,9 @@ impl Message {
             Self::GetState { .. } => "GET_STATE",
             Self::State { .. } => "STATE",
             Self::NoState { .. } => "NO_STATE",
+            Self::TxInv { .. } => "TX_INV",
+            Self::GetTx { .. } => "GET_TX",
+            Self::TxInfo { .. } => "TX_INFO",
         }
     }
 }
@@ -397,6 +421,19 @@ pub fn encode(magic: [u8; 4], packet: Packet, msg: &Message) -> Vec<u8> {
             out.extend(data);
         }
         Message::NoState { base } => put_hash(&mut out, base),
+        Message::TxInv { ids } => {
+            assert!(ids.len() <= MAX_TX_IDS, "too many ids");
+            out.push(ids.len() as u8);
+            for id in ids {
+                put_hash(&mut out, id);
+            }
+        }
+        Message::GetTx { id } => put_hash(&mut out, id),
+        Message::TxInfo { id, size, root } => {
+            put_hash(&mut out, id);
+            out.extend(size.to_le_bytes());
+            put_hash(&mut out, root);
+        }
     }
     assert!(
         out.len() <= MAX_PACKET,
@@ -616,6 +653,20 @@ pub fn decode(magic: [u8; 4], bytes: &[u8]) -> Result<(Packet, Message), WireErr
             }
         }
         22 => Message::NoState { base: r.hash()? },
+        23 => {
+            let n = r.u8()? as usize;
+            if n > MAX_TX_IDS {
+                return Err(WireError::Malformed);
+            }
+            let ids = (0..n).map(|_| r.hash()).collect::<Result<_, _>>()?;
+            Message::TxInv { ids }
+        }
+        24 => Message::GetTx { id: r.hash()? },
+        25 => Message::TxInfo {
+            id: r.hash()?,
+            size: r.u32()?,
+            root: r.hash()?,
+        },
         t => return Err(WireError::UnknownType(t)),
     };
     r.end()?;
@@ -744,6 +795,16 @@ mod tests {
                 data: vec![7; MAX_STATE_DATA],
             },
             Message::NoState { base: h(4) },
+            Message::TxInv { ids: vec![] },
+            Message::TxInv {
+                ids: (0..MAX_TX_IDS as u32).map(h).collect(),
+            },
+            Message::GetTx { id: h(6) },
+            Message::TxInfo {
+                id: h(6),
+                size: 2400,
+                root: h(7),
+            },
         ];
         let packet = Packet {
             session: 0xdead,

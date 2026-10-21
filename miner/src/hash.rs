@@ -57,6 +57,11 @@ pub mod domain {
     pub const BODY_CHUNK: u32 = 30;
     /// Not consensus: handshake cookies ([`crate::net`]).
     pub const NET_COOKIE: u32 = 31;
+    /// Not consensus: a relayed transaction's id ([`crate::transaction`]).
+    pub const TX_ID: u32 = 32;
+    /// Not consensus: a wallet's seed from its recovery entropy
+    /// ([`crate::mnemonic`]).
+    pub const WALLET_SEED: u32 = 33;
 
     #[cfg(test)]
     pub const ALL: &[u32] = &[
@@ -91,6 +96,8 @@ pub mod domain {
         KEY_CACHE,
         BODY_CHUNK,
         NET_COOKIE,
+        TX_ID,
+        WALLET_SEED,
     ];
 }
 

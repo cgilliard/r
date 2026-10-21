@@ -696,7 +696,7 @@ mod tests {
 
         let (early, late) = (consensus.first_subsidy, consensus.second_subsidy);
         let wallet = Wallet::from_seed(BabyBear::new_array([9, 8, 7, 6, 5, 4, 3, 2]));
-        let pay = |i: u32, amount| wallet.address(i).pay(amount);
+        let pay = |i: u32, amount| wallet.key_for(i).pay(amount);
         let coins = |tree: &StateTree| {
             let outputs = tree.outputs(&env.env().read_txn().unwrap()).unwrap();
             wallet.scan(&outputs, 0..20)

@@ -50,6 +50,13 @@
 //! node syncs block by block from the base. A peer serves the state at its
 //! last few blocks only (as many as it keeps history for), answering
 //! `NO_SNAPSHOT` or `NO_STATE` otherwise.
+//!
+//! **Transactions.** A node announces the ids of transactions it adds to
+//! its mempool (`TX_INV`: on connecting, everything in it; then each new
+//! one, to every peer but the one it came from). A peer that doesn't know
+//! an id fetches it (`GET_TX`, then its chunks, checked against the id),
+//! several at a time, and adds it through [`Backend::add_tx`]; a peer whose
+//! transaction is invalid in itself is dropped.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -62,7 +69,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::wire::{
     self, COOKIE_LEN, MAX_ADDRS, MAX_HEADERS, MAX_LOCATOR, MAX_PACKET, MAX_RANGES, MAX_STATE_DATA,
-    Message, Packet, Tip, cap,
+    MAX_TX_IDS, Message, Packet, Tip, cap,
 };
 use crate::babybear::BabyBear;
 use crate::block::MAX_BLOCK_SIZE;
@@ -127,6 +134,17 @@ pub trait Backend {
         base: &Header,
         body: &[u8],
     ) -> Result<(), Rejected>;
+    /// The encoding of mempool transaction `id`.
+    fn tx(&self, id: &Hash) -> Option<Vec<u8>>;
+    /// Whether transaction `id` needn't be fetched: it's in the mempool, or
+    /// was turned away lately.
+    fn knows_tx(&self, id: &Hash) -> bool;
+    /// Checks a peer's transaction and adds it to the mempool: whether it's
+    /// new. `Invalid` if it's bad in itself; `Failed` if it just doesn't
+    /// fit (our state may differ from the peer's).
+    fn add_tx(&self, bytes: &[u8]) -> Result<bool, Rejected>;
+    /// The mempool's transaction ids.
+    fn tx_ids(&self) -> Vec<Hash>;
 }
 
 /// A state-tree node's level and index, and a peer's reply for it.
@@ -154,6 +172,8 @@ impl fmt::Display for Rejected {
 pub enum Event {
     /// The local chain has a new tip (a block mined here): announce it.
     NewTip,
+    /// A transaction was added to the mempool here: announce it.
+    NewTx(Hash),
 }
 
 #[derive(Clone, Debug)]
@@ -251,6 +271,12 @@ const MAX_SERVE: usize = 256;
 const MAX_PENDING: usize = 4096;
 /// Bodies kept ready to serve.
 const SERVED_CACHE: usize = 4;
+/// Transactions kept ready to serve.
+const SERVED_TX_CACHE: usize = 64;
+/// Transactions fetched at once, at most.
+const MAX_TX_FETCHES: usize = 64;
+/// Times to ask for a transaction before trying another peer that has it.
+const TX_TRIES: u32 = 3;
 /// Packets handled between timer runs, at most, so a flood can't starve
 /// the timers.
 const PACKETS_PER_TICK: usize = 1024;
@@ -310,6 +336,16 @@ struct Download {
     asked: Instant,
     started: Instant,
     last_progress: Instant,
+}
+
+/// A transaction being fetched.
+struct TxFetch {
+    session: u32,
+    /// Other peers that announced it, to try next.
+    others: Vec<u32>,
+    asm: Option<Assembly>,
+    asked: Instant,
+    tries: u32,
 }
 
 /// A fast-sync base, from `SNAPSHOT_INFO`.
@@ -387,6 +423,8 @@ pub struct Node<B: Backend> {
     last_book_dial: Instant,
     last_peers_ask: Instant,
     served: VecDeque<(Hash, Served)>,
+    served_txs: VecDeque<(Hash, Served)>,
+    tx_fetches: HashMap<Hash, TxFetch>,
     pending: VecDeque<Header>,
     download: Option<Download>,
     header_request: Option<(u32, Instant)>,
@@ -479,6 +517,8 @@ impl<B: Backend> Node<B> {
             last_book_dial: long_ago,
             last_peers_ask: now,
             served: VecDeque::new(),
+            served_txs: VecDeque::new(),
+            tx_fetches: HashMap::new(),
             pending: VecDeque::new(),
             download: None,
             header_request: None,
@@ -528,6 +568,7 @@ impl<B: Backend> Node<B> {
             while let Ok(event) = events.try_recv() {
                 match event {
                     Event::NewTip => self.announce_tip(None),
+                    Event::NewTx(id) => self.announce_txs(&[id], None),
                 }
             }
             self.tick();
@@ -686,6 +727,15 @@ impl<B: Backend> Node<B> {
                 last_ping: now,
             },
         );
+        let ids = self.backend.tx_ids();
+        for batch in ids.chunks(MAX_TX_IDS) {
+            self.send_peer(
+                session,
+                &Message::TxInv {
+                    ids: batch.to_vec(),
+                },
+            );
+        }
         self.maybe_sync();
     }
 
@@ -766,6 +816,18 @@ impl<B: Backend> Node<B> {
         }
         self.lacks.remove(&session);
         self.no_snapshot.remove(&session);
+        let fetches: Vec<Hash> = self
+            .tx_fetches
+            .iter()
+            .filter(|(_, f)| f.session == session)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in fetches {
+            self.next_tx_source(id);
+        }
+        for f in self.tx_fetches.values_mut() {
+            f.others.retain(|&s| s != session);
+        }
     }
 
     fn on_message(&mut self, session: u32, msg: Message) {
@@ -805,6 +867,13 @@ impl<B: Backend> Node<B> {
             }
             Message::BlockChunk { hash, index, data } => self.on_chunk(session, hash, index, &data),
             Message::NotFound { hash } => {
+                if self
+                    .tx_fetches
+                    .get(&hash)
+                    .is_some_and(|f| f.session == session)
+                {
+                    self.next_tx_source(hash);
+                }
                 if self
                     .download
                     .as_ref()
@@ -913,6 +982,12 @@ impl<B: Backend> Node<B> {
                     self.maybe_sync();
                 }
             }
+            Message::TxInv { ids } => self.on_tx_inv(session, &ids),
+            Message::GetTx { id } => match self.serve(&id) {
+                Some((size, root)) => self.send_peer(session, &Message::TxInfo { id, size, root }),
+                None => self.send_peer(session, &Message::NotFound { hash: id }),
+            },
+            Message::TxInfo { id, size, root } => self.on_tx_info(session, id, size, root),
             Message::Hello { .. } | Message::Cookie { .. } | Message::Welcome { .. } => {}
         }
     }
@@ -1083,15 +1158,28 @@ impl<B: Backend> Node<B> {
     // Serving.
 
     /// The body with header hash `hash`, ready to serve: its size and root.
+    /// (Or the mempool transaction with id `hash`.)
     fn serve(&mut self, hash: &Hash) -> Option<(u32, Hash)> {
-        if !self.served.iter().any(|(h, _)| h == hash) {
-            let body = self.backend.body(hash)?;
-            if self.served.len() == SERVED_CACHE {
-                self.served.pop_front();
+        let cached = |c: &VecDeque<(Hash, Served)>| c.iter().any(|(h, _)| h == hash);
+        if !cached(&self.served) && !cached(&self.served_txs) {
+            if let Some(body) = self.backend.body(hash) {
+                if self.served.len() == SERVED_CACHE {
+                    self.served.pop_front();
+                }
+                self.served.push_back((*hash, Served::new(body)));
+            } else {
+                let tx = self.backend.tx(hash)?;
+                if self.served_txs.len() == SERVED_TX_CACHE {
+                    self.served_txs.pop_front();
+                }
+                self.served_txs.push_back((*hash, Served::new(tx)));
             }
-            self.served.push_back((*hash, Served::new(body)));
         }
-        let (_, s) = self.served.iter().find(|(h, _)| h == hash)?;
+        let (_, s) = self
+            .served
+            .iter()
+            .chain(&self.served_txs)
+            .find(|(h, _)| h == hash)?;
         Some((s.bytes.len() as u32, s.root))
     }
 
@@ -1109,6 +1197,7 @@ impl<B: Backend> Node<B> {
             let s = &self
                 .served
                 .iter()
+                .chain(&self.served_txs)
                 .find(|(h, _)| *h == hash)
                 .expect("cached")
                 .1;
@@ -1487,6 +1576,10 @@ impl<B: Backend> Node<B> {
     }
 
     fn on_chunk(&mut self, session: u32, hash: Hash, index: u32, data: &[u8]) {
+        if self.tx_fetches.contains_key(&hash) {
+            self.on_tx_chunk(session, hash, index, data);
+            return;
+        }
         let Some(d) = &mut self.download else {
             return;
         };
@@ -1801,6 +1894,160 @@ impl<B: Backend> Node<B> {
         }
     }
 
+    // Transactions.
+
+    /// Tells every peer (but `except`) about transactions `ids`.
+    fn announce_txs(&mut self, ids: &[Hash], except: Option<u32>) {
+        let sessions: Vec<u32> = self
+            .peers
+            .keys()
+            .copied()
+            .filter(|&s| Some(s) != except)
+            .collect();
+        for batch in ids.chunks(MAX_TX_IDS) {
+            for &s in &sessions {
+                self.send_peer(
+                    s,
+                    &Message::TxInv {
+                        ids: batch.to_vec(),
+                    },
+                );
+            }
+        }
+    }
+
+    fn on_tx_inv(&mut self, session: u32, ids: &[Hash]) {
+        for id in ids {
+            if let Some(f) = self.tx_fetches.get_mut(id) {
+                if f.session != session && !f.others.contains(&session) {
+                    f.others.push(session);
+                }
+                continue;
+            }
+            if self.tx_fetches.len() >= MAX_TX_FETCHES || self.backend.knows_tx(id) {
+                continue;
+            }
+            self.tx_fetches.insert(
+                *id,
+                TxFetch {
+                    session,
+                    others: Vec::new(),
+                    asm: None,
+                    asked: Instant::now(),
+                    tries: 1,
+                },
+            );
+            self.send_peer(session, &Message::GetTx { id: *id });
+        }
+    }
+
+    fn on_tx_info(&mut self, session: u32, id: Hash, size: u32, root: Hash) {
+        let Some(f) = self.tx_fetches.get_mut(&id) else {
+            return;
+        };
+        if f.session != session || f.asm.is_some() {
+            return;
+        }
+        let size = size as usize;
+        if size > crate::transaction::MAX_TX_BYTES
+            || chunk::object_hash(domain::TX_ID, size, &root) != id
+        {
+            self.drop_peer(session, "transaction info doesn't match its id");
+            return;
+        }
+        f.asm = Some(Assembly::new(size, root));
+        f.asked = Instant::now();
+        self.request_tx_chunks(id);
+    }
+
+    /// Asks for every chunk of transaction `id` still missing.
+    fn request_tx_chunks(&mut self, id: Hash) {
+        let Some(f) = self.tx_fetches.get(&id) else {
+            return;
+        };
+        let Some(asm) = &f.asm else {
+            return;
+        };
+        let mut ranges: Vec<(u32, u16)> = Vec::new();
+        for i in asm.wanted(MAX_SERVE) {
+            match ranges.last_mut() {
+                Some((first, count)) if *first as usize + *count as usize == i => *count += 1,
+                _ => ranges.push((i as u32, 1)),
+            }
+        }
+        let session = f.session;
+        for batch in ranges.chunks(MAX_RANGES) {
+            self.send_peer(
+                session,
+                &Message::GetBlockChunks {
+                    hash: id,
+                    ranges: batch.to_vec(),
+                },
+            );
+        }
+    }
+
+    fn on_tx_chunk(&mut self, session: u32, id: Hash, index: u32, data: &[u8]) {
+        let Some(f) = self.tx_fetches.get_mut(&id) else {
+            return;
+        };
+        let Some(asm) = &mut f.asm else {
+            return;
+        };
+        if f.session != session {
+            return;
+        }
+        match asm.add(index as usize, data) {
+            Ok(_) if asm.is_complete() => {
+                let f = self.tx_fetches.remove(&id).expect("fetching");
+                let bytes = f.asm.and_then(Assembly::finish).expect("complete");
+                match self.backend.add_tx(&bytes) {
+                    Ok(true) => {
+                        let from = self
+                            .peers
+                            .get(&session)
+                            .map_or("?".into(), |p| p.addr.to_string());
+                        (self.log)(format!(
+                            "transaction {} ({} bytes) from {from} added to the mempool",
+                            short(&id),
+                            bytes.len()
+                        ));
+                        self.announce_txs(&[id], Some(session));
+                    }
+                    Ok(false) => {}
+                    Err(Rejected::Invalid(e)) => {
+                        self.drop_peer(session, &format!("invalid transaction {}: {e}", short(&id)))
+                    }
+                    Err(Rejected::Failed(e)) => {
+                        (self.log)(format!("transaction {} not added: {e}", short(&id)))
+                    }
+                }
+            }
+            Ok(_) | Err(ChunkError::Shape) => {}
+            Err(e) => self.drop_peer(session, &format!("bad transaction chunk ({e:?})")),
+        }
+    }
+
+    /// Asks the next peer that announced transaction `id`, or gives up on it.
+    fn next_tx_source(&mut self, id: Hash) {
+        let Some(f) = self.tx_fetches.get_mut(&id) else {
+            return;
+        };
+        match f.others.pop() {
+            Some(s) if self.peers.contains_key(&s) => {
+                f.session = s;
+                f.asm = None;
+                f.asked = Instant::now();
+                f.tries = 1;
+                self.send_peer(s, &Message::GetTx { id });
+            }
+            Some(_) => self.next_tx_source(id),
+            None => {
+                self.tx_fetches.remove(&id);
+            }
+        }
+    }
+
     // Timers.
 
     fn tick(&mut self) {
@@ -1915,6 +2162,28 @@ impl<B: Backend> Node<B> {
                 self.request_chunks();
             }
         }
+        // Transactions: ask again, or try another peer.
+        let late: Vec<Hash> = self
+            .tx_fetches
+            .iter()
+            .filter(|(_, f)| now - f.asked > REQUEST_TIMEOUT)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in late {
+            let f = self.tx_fetches.get_mut(&id).expect("fetching");
+            if f.tries >= TX_TRIES {
+                self.next_tx_source(id);
+                continue;
+            }
+            f.tries += 1;
+            f.asked = now;
+            if f.asm.is_some() {
+                self.request_tx_chunks(id);
+            } else {
+                let s = f.session;
+                self.send_peer(s, &Message::GetTx { id });
+            }
+        }
         self.maybe_download();
         self.maybe_sync();
         self.check_synced(now);
@@ -1979,6 +2248,9 @@ mod tests {
         /// State nodes served.
         served: u64,
         sync: Option<MockSync>,
+        /// The mempool: any bytes are a transaction, unless they start with
+        /// 0xff (invalid).
+        txs: HashMap<Hash, Vec<u8>>,
     }
 
     /// A state download: the base, the nodes still wanted (with their
@@ -2033,7 +2305,13 @@ mod tests {
                 corrupt: false,
                 served: 0,
                 sync: None,
+                txs: HashMap::new(),
             })))
+        }
+
+        fn has_tx(&self, bytes: &[u8]) -> bool {
+            let id = crate::transaction::Transaction::id_of(bytes);
+            self.0.lock().unwrap().txs.contains_key(&id)
         }
 
         fn base(&self) -> u64 {
@@ -2307,6 +2585,32 @@ mod tests {
             c.main = hashes;
             c.base = base.height;
             Ok(())
+        }
+
+        fn tx(&self, id: &Hash) -> Option<Vec<u8>> {
+            self.0.lock().unwrap().txs.get(id).cloned()
+        }
+
+        fn knows_tx(&self, id: &Hash) -> bool {
+            self.0.lock().unwrap().txs.contains_key(id)
+        }
+
+        fn add_tx(&self, bytes: &[u8]) -> Result<bool, Rejected> {
+            if bytes.first() == Some(&0xff) {
+                return Err(Rejected::Invalid("bad tx".into()));
+            }
+            let id = crate::transaction::Transaction::id_of(bytes);
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .txs
+                .insert(id, bytes.to_vec())
+                .is_none())
+        }
+
+        fn tx_ids(&self) -> Vec<Hash> {
+            self.0.lock().unwrap().txs.keys().copied().collect()
         }
     }
 
@@ -2623,6 +2927,55 @@ mod tests {
         wait_for("H to sync", 20, || h.tip() == a.tip());
         assert_eq!(h.base(), 0);
         assert!(has_line(&lines, "has no state at height 50"));
+    }
+
+    #[test]
+    fn transactions_spread_and_bad_ones_get_their_sender_dropped() {
+        // A has one transaction when B connects; C hears of B's through B.
+        let tx = |n: u8, len: usize| -> Vec<u8> { (0..len).map(|i| n ^ i as u8).collect() };
+        let (a, b, c) = (Mock::new(), Mock::new(), Mock::new());
+        let first = tx(1, 2500);
+        a.add_tx(&first).unwrap();
+        let na = start(a.clone(), true, vec![], 0);
+        let nb = start(b.clone(), true, vec![na.addr], 0);
+        let c_lines = Arc::new(Mutex::new(vec![]));
+        let _nc = start_with(
+            c.clone(),
+            Config {
+                peers: vec![nb.addr],
+                max_peers: 1,
+                ..Config::new(*b"test")
+            },
+            c_lines.clone(),
+        );
+        wait_for("the first transaction to reach C", 10, || c.has_tx(&first));
+        // A new one from B reaches A and C.
+        let second = tx(2, 40);
+        b.add_tx(&second).unwrap();
+        nb.events
+            .send(Event::NewTx(crate::transaction::Transaction::id_of(
+                &second,
+            )))
+            .unwrap();
+        wait_for("the second transaction to spread", 10, || {
+            a.has_tx(&second) && c.has_tx(&second)
+        });
+        // An invalid one from B gets B dropped by C.
+        let bad = [vec![0xff], tx(3, 100)].concat();
+        b.0.lock()
+            .unwrap()
+            .txs
+            .insert(crate::transaction::Transaction::id_of(&bad), bad.clone());
+        nb.events
+            .send(Event::NewTx(crate::transaction::Transaction::id_of(&bad)))
+            .unwrap();
+        wait_for("C to drop B", 10, || {
+            has_line(
+                &c_lines,
+                &format!("dropping peer {}: invalid transaction", nb.addr),
+            )
+        });
+        assert!(!c.has_tx(&bad));
     }
 
     #[test]

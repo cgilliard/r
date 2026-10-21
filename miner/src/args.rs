@@ -8,10 +8,12 @@ use std::path::PathBuf;
 pub const USAGE: &str = "\
 Usage: r [OPTIONS]
 
-Mines the chain in <PATH>/chain (creating it if needed) until stopped,
-logging each step, and shares it with peers: it finds them (from --peer, the
-peer list saved in <PATH>/peers, and what peers pass on), syncs the chain
-before mining, verifies and follows peers' blocks, and serves its own.
+Runs a node on the chain in <PATH>/chain (creating it if needed): it finds
+peers (from --peer, the peer list saved in <PATH>/peers, and what peers pass
+on), syncs the chain, verifies and follows peers' blocks, relays
+transactions, and mines (unless --no-mine) once caught up. Its log goes to
+<PATH>/node.log; the terminal takes wallet commands (type help): payments go
+through files, with send, receive and finalize.
 
 Options:
       --data-dir <PATH>      Directory for the database [default: target/data]
@@ -28,8 +30,14 @@ Options:
                              state at any of them [default: 1000]
       --max-peers <NUM>      Most peers connected at once, inbound and
                              outbound [default: 64]
-      --no-mine              Don't mine (saves CPU): only sync the chain
-                             from peers, verifying every block, and serve it
+      --no-mine              Don't mine (saves CPU): only follow and serve
+                             the chain, verifying every block, and run the
+                             wallet
+      --coin-maturity <BLOCKS>
+                             Confirmations before this node's mining rewards
+                             can be spent [default: 6]
+      --restore              Restore the wallet from its 24 recovery words
+                             (asked for at the start; needs a new --data-dir)
       --status               Print the stored chain's status and exit
   -h, --help                 Print help
   -V, --version              Print version";
@@ -37,6 +45,7 @@ Options:
 pub const DEFAULT_DATA_DIR: &str = "target/data";
 pub const DEFAULT_SYNC_DEPTH: u64 = 100;
 pub const DEFAULT_MAX_PEERS: usize = 64;
+pub const DEFAULT_COIN_MATURITY: u64 = crate::cli::DEFAULT_MATURITY;
 pub const DEFAULT_SNAP_SYNC_LIMIT: u64 = crate::ledger::DEFAULT_SNAP_SYNC_LIMIT;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +65,10 @@ pub struct Args {
     pub max_peers: usize,
     /// Blocks of state history kept for fast-syncing peers.
     pub snap_sync_limit: u64,
+    /// Confirmations before our mining rewards can be spent.
+    pub coin_maturity: u64,
+    /// Restore the wallet from recovery words.
+    pub restore: bool,
 }
 
 /// What the command line asked for.
@@ -117,6 +130,8 @@ impl Args {
         let mut sync_depth: Option<u64> = None;
         let mut max_peers: Option<usize> = None;
         let mut snap_sync_limit: Option<u64> = None;
+        let mut coin_maturity: Option<u64> = None;
+        let mut restore = false;
         let mut args = args.into_iter().map(Into::into);
 
         while let Some(arg) = args.next() {
@@ -143,11 +158,11 @@ impl Args {
                     }
                     data_dir = Some(value.into());
                 }
-                "--no-mine" | "--status" => {
-                    let (opt, set) = if name == "--no-mine" {
-                        ("--no-mine", &mut no_mine)
-                    } else {
-                        ("--status", &mut status)
+                "--no-mine" | "--status" | "--restore" => {
+                    let (opt, set) = match name {
+                        "--no-mine" => ("--no-mine", &mut no_mine),
+                        "--status" => ("--status", &mut status),
+                        _ => ("--restore", &mut restore),
                     };
                     if inline.is_some() {
                         return Err(ArgsError::UnexpectedValue(opt));
@@ -157,11 +172,11 @@ impl Args {
                     }
                     *set = true;
                 }
-                "--sync-depth" | "--snap-sync-limit" => {
-                    let (opt, slot) = if name == "--sync-depth" {
-                        ("--sync-depth", &mut sync_depth)
-                    } else {
-                        ("--snap-sync-limit", &mut snap_sync_limit)
+                "--sync-depth" | "--snap-sync-limit" | "--coin-maturity" => {
+                    let (opt, slot) = match name {
+                        "--sync-depth" => ("--sync-depth", &mut sync_depth),
+                        "--snap-sync-limit" => ("--snap-sync-limit", &mut snap_sync_limit),
+                        _ => ("--coin-maturity", &mut coin_maturity),
                     };
                     if slot.is_some() {
                         return Err(ArgsError::Duplicate(opt));
@@ -227,6 +242,8 @@ impl Args {
             sync_depth: sync_depth.unwrap_or(DEFAULT_SYNC_DEPTH),
             max_peers: max_peers.unwrap_or(DEFAULT_MAX_PEERS),
             snap_sync_limit: snap_sync_limit.unwrap_or(DEFAULT_SNAP_SYNC_LIMIT),
+            coin_maturity: coin_maturity.unwrap_or(DEFAULT_COIN_MATURITY),
+            restore,
         }))
     }
 }
@@ -257,6 +274,8 @@ mod tests {
             sync_depth: DEFAULT_SYNC_DEPTH,
             max_peers: DEFAULT_MAX_PEERS,
             snap_sync_limit: DEFAULT_SNAP_SYNC_LIMIT,
+            coin_maturity: DEFAULT_COIN_MATURITY,
+            restore: false,
         }))
     }
 
@@ -287,6 +306,8 @@ mod tests {
                 sync_depth: DEFAULT_SYNC_DEPTH,
                 max_peers: DEFAULT_MAX_PEERS,
                 snap_sync_limit: DEFAULT_SNAP_SYNC_LIMIT,
+                coin_maturity: DEFAULT_COIN_MATURITY,
+                restore: false,
             }))
         };
         assert_eq!(parse(&["--no-mine"]), want(true, false));
@@ -345,6 +366,28 @@ mod tests {
     }
 
     #[test]
+    fn wallet_options() {
+        let get = |args: &[&str]| match parse(args) {
+            Ok(Command::Run(a)) => Ok((a.coin_maturity, a.restore)),
+            Ok(c) => panic!("{c:?}"),
+            Err(e) => Err(e),
+        };
+        assert_eq!(get(&[]), Ok((6, false)));
+        assert_eq!(get(&["--coin-maturity", "10", "--restore"]), Ok((10, true)));
+        assert_eq!(get(&["--coin-maturity=0"]), Ok((0, false)));
+        use ArgsError::*;
+        assert_eq!(
+            get(&["--coin-maturity", "x"]),
+            Err(InvalidValue("--coin-maturity"))
+        );
+        assert_eq!(
+            get(&["--restore", "--restore"]),
+            Err(Duplicate("--restore"))
+        );
+        assert_eq!(get(&["--restore=1"]), Err(UnexpectedValue("--restore")));
+    }
+
+    #[test]
     fn max_peers() {
         let max = |args: &[&str]| match parse(args) {
             Ok(Command::Run(a)) => Ok(a.max_peers),
@@ -377,6 +420,8 @@ mod tests {
             sync_depth: DEFAULT_SYNC_DEPTH,
             max_peers: DEFAULT_MAX_PEERS,
             snap_sync_limit: DEFAULT_SNAP_SYNC_LIMIT,
+            coin_maturity: DEFAULT_COIN_MATURITY,
+            restore: false,
         }));
         assert_eq!(
             parse(&[
@@ -450,6 +495,8 @@ mod tests {
                 sync_depth: DEFAULT_SYNC_DEPTH,
                 max_peers: DEFAULT_MAX_PEERS,
                 snap_sync_limit: DEFAULT_SNAP_SYNC_LIMIT,
+                coin_maturity: DEFAULT_COIN_MATURITY,
+                restore: false,
             }))
         );
     }

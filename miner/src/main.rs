@@ -38,8 +38,10 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         max_peers: args.max_peers,
         snap_sync_limit: args.snap_sync_limit,
     };
-    if args.no_mine {
-        return r::daemon::follow(&args.data_dir, &net);
-    }
-    r::daemon::run(&args.data_dir, &net)
+    let opts = r::daemon::Options {
+        mine: !args.no_mine,
+        coin_maturity: args.coin_maturity,
+        restore: args.restore,
+    };
+    r::daemon::run(&args.data_dir, &net, &opts)
 }

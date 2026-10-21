@@ -10,14 +10,32 @@
 //! a block reward (outputs, no inputs) validates too. The caller must check
 //! that each input is unspent, and the block must bound how much its
 //! transactions mint.
+//!
+//! Transactions travel between nodes (and stay out of blocks, which publish
+//! only their lists) in the [`Transaction::to_bytes`] encoding; a
+//! transaction's id ([`Transaction::id_of`]) is the chunk hash of that
+//! encoding, so its chunks can be checked as they arrive.
 
 use std::fmt;
 
-use crate::babybear::BabyBear;
-use crate::hash::{self, DOMAIN_SLOT, HASH_LEN, Hash, domain};
-use crate::output::{self, Amount, Commitment, Nonce, Output, OutputHash};
+use crate::babybear::{BabyBear, P};
+use crate::chunk;
+use crate::hash::{self, DOMAIN_SLOT, HASH_BYTES, HASH_LEN, Hash, domain};
+use crate::output::{
+    self, Amount, COMMITMENT_LEN, Commitment, NONCE_LEN, Nonce, OUTPUT_HASH_LEN, Output, OutputHash,
+};
 use crate::poseidon2::{self, WIDTH};
-use crate::wots::{self, PublicKey, SecretKey, Signature};
+use crate::wots::{self, NUM_CHAINS, PARAM_LEN, PublicKey, RAND_LEN, SecretKey, Signature};
+
+/// Bytes in an encoded input: commitment, position, public key (parameter,
+/// root), amount, nonce.
+pub const INPUT_BYTES: usize = COMMITMENT_LEN + 8 + PARAM_LEN * 4 + HASH_BYTES + 8 + NONCE_LEN;
+/// Bytes in an encoded output: hash, amount, nonce.
+pub const OUTPUT_BYTES: usize = OUTPUT_HASH_LEN + 8 + NONCE_LEN;
+/// Bytes in an encoded signature: randomizer, chains.
+pub const SIGNATURE_BYTES: usize = RAND_LEN * 4 + NUM_CHAINS * HASH_BYTES;
+/// The largest transaction nodes relay.
+pub const MAX_TX_BYTES: usize = 100_000;
 
 /// The pubkey hash an output pays to: `H(pubkey)` as bytes.
 pub fn pubkey_hash(pubkey: &PublicKey) -> OutputHash {
@@ -183,6 +201,94 @@ impl fmt::Display for TxError {
 impl std::error::Error for TxError {}
 
 impl Transaction {
+    /// The encoding: input and output counts (`u16`s), the inputs, the
+    /// outputs, then one signature per input. Integers are little-endian,
+    /// field elements `u32`s.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let TxBody { inputs, outputs } = &self.body;
+        let mut out = Vec::with_capacity(
+            4 + inputs.len() * (INPUT_BYTES + SIGNATURE_BYTES) + outputs.len() * OUTPUT_BYTES,
+        );
+        out.extend((inputs.len() as u16).to_le_bytes());
+        out.extend((outputs.len() as u16).to_le_bytes());
+        for i in inputs {
+            out.extend(i.commitment.0);
+            out.extend(i.position.to_le_bytes());
+            put_elems(&mut out, &i.pubkey.param);
+            put_elems(&mut out, &i.pubkey.root);
+            out.extend(i.amount.to_le_bytes());
+            out.extend(i.nonce);
+        }
+        for o in outputs {
+            out.extend(o.hash);
+            out.extend(o.amount.to_le_bytes());
+            out.extend(o.nonce);
+        }
+        for sig in &self.signatures {
+            put_elems(&mut out, &sig.rand);
+            for c in &sig.chains {
+                put_elems(&mut out, c);
+            }
+        }
+        out
+    }
+
+    /// Decodes [`Transaction::to_bytes`] output: `None` unless the length is
+    /// exact and every field element canonical (the rest is checked by
+    /// [`Transaction::validate`]).
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut r = bytes;
+        let mut take = |n: usize| -> Option<&[u8]> {
+            let (a, b) = r.split_at_checked(n)?;
+            r = b;
+            Some(a)
+        };
+        let n_in = u16::from_le_bytes(take(2)?.try_into().ok()?) as usize;
+        let n_out = u16::from_le_bytes(take(2)?.try_into().ok()?) as usize;
+        if bytes.len() != 4 + n_in * (INPUT_BYTES + SIGNATURE_BYTES) + n_out * OUTPUT_BYTES {
+            return None;
+        }
+        let mut inputs = Vec::with_capacity(n_in);
+        for _ in 0..n_in {
+            inputs.push(Input {
+                commitment: Commitment(take(COMMITMENT_LEN)?.try_into().ok()?),
+                position: u64::from_le_bytes(take(8)?.try_into().ok()?),
+                pubkey: PublicKey {
+                    param: get_elems(take(PARAM_LEN * 4)?)?,
+                    root: get_elems(take(HASH_BYTES)?)?,
+                },
+                amount: u64::from_le_bytes(take(8)?.try_into().ok()?),
+                nonce: take(NONCE_LEN)?.try_into().ok()?,
+            });
+        }
+        let mut outputs = Vec::with_capacity(n_out);
+        for _ in 0..n_out {
+            outputs.push(Output {
+                hash: take(OUTPUT_HASH_LEN)?.try_into().ok()?,
+                amount: u64::from_le_bytes(take(8)?.try_into().ok()?),
+                nonce: take(NONCE_LEN)?.try_into().ok()?,
+            });
+        }
+        let mut signatures = Vec::with_capacity(n_in);
+        for _ in 0..n_in {
+            let rand = get_elems(take(RAND_LEN * 4)?)?;
+            let mut chains = [[BabyBear::ZERO; HASH_LEN]; NUM_CHAINS];
+            for c in &mut chains {
+                *c = get_elems(take(HASH_BYTES)?)?;
+            }
+            signatures.push(Signature { rand, chains });
+        }
+        Some(Self {
+            body: TxBody { inputs, outputs },
+            signatures,
+        })
+    }
+
+    /// The id of the transaction encoded as `bytes`.
+    pub fn id_of(bytes: &[u8]) -> Hash {
+        chunk::hash_of(domain::TX_ID, bytes)
+    }
+
     /// Signs `body` with one key per input, in input order.
     ///
     /// # Panics
@@ -228,6 +334,25 @@ impl Transaction {
         }
         Ok(totals)
     }
+}
+
+fn put_elems(out: &mut Vec<u8>, elems: &[BabyBear]) {
+    for x in elems {
+        out.extend(x.as_u32().to_le_bytes());
+    }
+}
+
+/// `N` canonical field elements from `4 * N` bytes.
+fn get_elems<const N: usize>(bytes: &[u8]) -> Option<[BabyBear; N]> {
+    let mut out = [BabyBear::ZERO; N];
+    for (x, chunk) in out.iter_mut().zip(bytes.chunks_exact(4)) {
+        let v = u32::from_le_bytes(chunk.try_into().ok()?);
+        if v >= P {
+            return None;
+        }
+        *x = BabyBear::new(v);
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -290,6 +415,27 @@ mod tests {
 
     fn totals(inputs: Amount, outputs: Amount) -> Result<Totals, TxError> {
         Ok(Totals { inputs, outputs })
+    }
+
+    #[test]
+    fn transactions_round_trip_through_bytes() {
+        let t = tx();
+        let bytes = t.to_bytes();
+        assert_eq!(
+            bytes.len(),
+            4 + 2 * (INPUT_BYTES + SIGNATURE_BYTES) + 2 * OUTPUT_BYTES
+        );
+        assert_eq!(Transaction::from_bytes(&bytes), Some(t));
+        assert_eq!(Transaction::from_bytes(&bytes[..bytes.len() - 1]), None);
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert_eq!(Transaction::from_bytes(&longer), None);
+        // A non-canonical field element.
+        let mut bad = bytes.clone();
+        let at = 4 + COMMITMENT_LEN + 8;
+        bad[at..at + 4].copy_from_slice(&P.to_le_bytes());
+        assert_eq!(Transaction::from_bytes(&bad), None);
+        assert_ne!(Transaction::id_of(&bytes), Transaction::id_of(&longer));
     }
 
     #[test]

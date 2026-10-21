@@ -528,7 +528,7 @@ impl Ledger {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::babybear::BabyBear;
     use crate::db::test::TempEnv;
@@ -540,7 +540,7 @@ mod tests {
     use crate::state::State;
 
     /// Checks only the body hash: the chain proof is out of scope here.
-    struct BodyOnly;
+    pub(crate) struct BodyOnly;
 
     impl Verifier for BodyOnly {
         fn verify_block(&self, header: &Header, block: &Block, _: u128) -> Result<(), BlockError> {
@@ -553,7 +553,7 @@ mod tests {
     }
 
     /// The smallest well-formed proof encoding.
-    fn tiny_proof() -> StarkProof {
+    pub(crate) fn tiny_proof() -> StarkProof {
         let mut e = vec![BabyBear::new(3)];
         e.extend([BabyBear::ONE; HASH_LEN]);
         e.push(BabyBear::ZERO);
@@ -629,7 +629,7 @@ mod tests {
         }
     }
 
-    fn ledger(env: &TempEnv, genesis: &Header) -> Ledger {
+    pub(crate) fn ledger(env: &TempEnv, genesis: &Header) -> Ledger {
         ledger_keeping(env, genesis, DEFAULT_SNAP_SYNC_LIMIT)
     }
 
@@ -808,7 +808,7 @@ mod tests {
 
     /// Downloads the state at `base` from `from` into `to`, as a
     /// fast-syncing node would.
-    fn download_state(from: &Ledger, to: &Ledger, base: &Header) {
+    pub(crate) fn download_state(from: &Ledger, to: &Ledger, base: &Header) {
         to.begin_state(base).unwrap();
         loop {
             let wanted = to.state_wanted(5, &HashSet::new()).unwrap();

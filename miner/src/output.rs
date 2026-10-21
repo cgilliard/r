@@ -34,6 +34,41 @@ pub const LIMB_BITS: u32 = 16;
 pub const AMOUNT_LIMBS: usize = (Amount::BITS / LIMB_BITS) as usize;
 pub const NONCE_LIMBS: usize = NONCE_LEN / 2;
 
+/// `units` as a decimal number of coins ("1.5", "1000").
+pub fn format_coins(units: u128) -> String {
+    let (whole, frac) = (units / COIN as u128, units % COIN as u128);
+    if frac == 0 {
+        format!("{whole}")
+    } else {
+        format!("{whole}.{}", format!("{frac:08}").trim_end_matches('0'))
+    }
+}
+
+/// Parses a decimal number of coins (at most 8 decimals) into units.
+pub fn parse_coins(s: &str) -> Option<Amount> {
+    let (whole, frac) = s.split_once('.').unwrap_or((s, ""));
+    if (whole.is_empty() && frac.is_empty())
+        || frac.len() > 8
+        || !whole
+            .bytes()
+            .chain(frac.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let whole: Amount = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().ok()?
+    };
+    let frac: Amount = if frac.is_empty() {
+        0
+    } else {
+        format!("{frac:0<8}").parse().ok()?
+    };
+    whole.checked_mul(COIN)?.checked_add(frac)
+}
+
 /// `H(hash || amount || nonce)`, as stored on chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Commitment(pub [u8; COMMITMENT_LEN]);
@@ -141,6 +176,34 @@ mod tests {
     use crate::babybear::P;
 
     const NONCE: Nonce = *b"0123456789abcdef";
+
+    #[test]
+    fn coins_format_and_parse() {
+        for (text, units) in [
+            ("0", 0),
+            ("1", COIN),
+            ("1.5", COIN + COIN / 2),
+            ("0.00000001", 1),
+            ("1000", 1000 * COIN),
+        ] {
+            assert_eq!(parse_coins(text), Some(units), "{text}");
+            assert_eq!(format_coins(units as u128), text);
+        }
+        assert_eq!(parse_coins(".5"), Some(COIN / 2));
+        assert_eq!(parse_coins("2."), Some(2 * COIN));
+        for bad in [
+            "",
+            ".",
+            "1.000000001",
+            "-1",
+            "1e3",
+            "x",
+            "1.2.3",
+            "999999999999",
+        ] {
+            assert_eq!(parse_coins(bad), None, "{bad}");
+        }
+    }
 
     /// A canonical hash.
     fn hash(n: u32) -> OutputHash {
