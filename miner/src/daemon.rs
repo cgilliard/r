@@ -41,13 +41,13 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::block::{self, Block, BlockProver};
-use crate::chain::{Chain, ChainProof};
+use crate::chain::{self, Chain, ChainProof, ChainVerifier};
 use crate::cli::Cli;
 use crate::db;
 use crate::fri::FriParams;
 use crate::hash::{self, Hash};
 use crate::header::{self, Consensus, FRAC_BITS, Header};
-use crate::ledger::{Added, Ledger};
+use crate::ledger::{Added, Ledger, Verifier};
 use crate::mempool::Mempool;
 use crate::net::LedgerBackend;
 use crate::net::node::{self, Config, Event, Node};
@@ -164,12 +164,13 @@ struct Opened {
     genesis: Header,
     consensus: Consensus,
     ledger: Arc<Ledger>,
-    chain: Arc<Chain>,
+    /// The provers, if mining.
+    chain: Option<Arc<Chain>>,
 }
 
 /// Opens (creating if needed) the chain in `data_dir/chain`, with the
-/// PoW dataset (if mining) and verifying keys cached in `data_dir/cache`,
-/// and sets up the provers and verifier.
+/// PoW dataset and proving setup (if mining) cached in `data_dir/cache`,
+/// and sets up the provers (if mining) and the verifier.
 fn open(
     log: &Log,
     data_dir: &Path,
@@ -188,9 +189,9 @@ fn open(
         } else {
             "PoW dataset (64 MiB) built and cached"
         });
-        (Some(data), DatasetTree::Full(tree))
+        (Some(data), Some(DatasetTree::Full(tree)))
     } else {
-        (None, DatasetTree::Blank)
+        (None, None)
     };
     let env = db::open_env(&dir)?;
     let tree = StateTree::open(&env)?;
@@ -216,28 +217,44 @@ fn open(
         }
     }
     let consensus = Consensus::DEFAULT;
-    log.line(
-        "setting up the provers and verifier (item chunks of 682/2730, signature chunks of \
-         7/31/124, 16-op segments, nodes at 2^15)",
-    );
-    let keys = KeyCache::open(cache.join("keys"));
-    let chain = provers(consensus, genesis, pow_tree, &keys);
-    if let Err(e) = keys.save() {
-        log.line(format!("couldn't save the key cache: {e}"));
-    }
-    let ([first_rows, chain_rows, wrap_rows], log_height) = chain.used_rows();
-    log.line(format!(
-        "ready (proving keys are built on first use); chain circuits use {first_rows} (first), \
-         {chain_rows} (chain) rows of 2^{log_height}, wrap {wrap_rows} of 2^{}",
-        crate::chain::WRAP_LOG_HEIGHT
-    ));
-    let chain = Arc::new(chain);
+    // Only a miner needs the provers; others check chain proofs with the
+    // pinned keys.
+    let (chain, verifier): (Option<Arc<Chain>>, Arc<dyn Verifier>) = match pow_tree {
+        Some(pow_tree) => {
+            log.line(
+                "setting up the provers and verifier (item chunks of 682/2730, signature chunks \
+                 of 7/31/124, 16-op segments, nodes at 2^15)",
+            );
+            let keys = KeyCache::open(cache.join("keys"));
+            let chain = provers(consensus, genesis, pow_tree, &keys);
+            if let Err(e) = keys.save() {
+                log.line(format!("couldn't save the key cache: {e}"));
+            }
+            if chain.verifier().keys() != chain::KEYS {
+                return Err("the circuits' keys aren't the pinned ones (chain::KEYS): this build \
+                            can't make proofs other nodes accept"
+                    .into());
+            }
+            let ([first_rows, chain_rows, wrap_rows], log_height) = chain.used_rows();
+            log.line(format!(
+                "ready (proving keys are built on first use); chain circuits use {first_rows} \
+                 (first), {chain_rows} (chain) rows of 2^{log_height}, wrap {wrap_rows} of 2^{}",
+                chain::WRAP_LOG_HEIGHT
+            ));
+            let chain = Arc::new(chain);
+            (Some(chain.clone()), chain)
+        }
+        None => {
+            log.line("ready: checking chain proofs with the pinned keys (no provers: not mining)");
+            (None, Arc::new(ChainVerifier::new(chain::KEYS)))
+        }
+    };
     let ledger = Arc::new(Ledger {
         env: env.clone(),
         store,
         tree,
         consensus,
-        verifier: chain.clone(),
+        verifier,
         snap_sync_limit,
     });
     ledger.start_history()?;
@@ -538,7 +555,7 @@ impl Miner<'_> {
         let (env, store, tree, consensus) = (&o.env, o.store, o.tree, o.consensus);
         let data = o.data.expect("a miner has the dataset");
         let ledger = &o.ledger;
-        let chain = &o.chain;
+        let chain = o.chain.as_ref().expect("a miner has the provers");
         log.line("catching up with peers before mining");
         while !synced.load(Ordering::Relaxed) {
             if stop.load(Ordering::Relaxed) {

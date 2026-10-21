@@ -57,7 +57,9 @@ use crate::pow::DatasetTree;
 use crate::output;
 use crate::pow_circuit::{self, HeaderCells};
 use crate::recursion_air::RecursionAir;
-use crate::stark::{self, KeyCache, StarkError, StarkProof};
+use crate::stark::{
+    self, KeyCache, PreprocessedCommitment, StarkError, StarkProof, VerifyingKey,
+};
 use crate::state::{self, StateTree, Undo};
 use crate::symbolic::{Program, compile};
 use crate::verifier_circuit::{self, Inner, ProofCells};
@@ -121,6 +123,7 @@ pub struct Chain {
     /// wrap proofs.
     chain_program: Program,
     wrap_program: Program,
+    verifier: ChainVerifier,
 }
 
 fn consts(c: &mut Circuit, values: &[BabyBear]) -> Vec<Cell> {
@@ -448,6 +451,10 @@ impl Chain {
             &w,
         );
         let chain = Node::new(&params, &c, &public, log_height, keys);
+        let verifier = ChainVerifier::new(ChainKeys {
+            chain: chain.root(),
+            wrap: wrap.root(),
+        });
         Self {
             consensus,
             genesis,
@@ -460,6 +467,7 @@ impl Chain {
             wrap,
             chain_program,
             wrap_program,
+            verifier,
         }
     }
 
@@ -566,11 +574,101 @@ impl Chain {
         self.wrap(statement, proof, false)
     }
 
+    /// What checks this chain's proofs, without its circuits.
+    pub fn verifier(&self) -> &ChainVerifier {
+        &self.verifier
+    }
+
+    /// [`ChainVerifier::statement`].
+    pub fn statement(&self, header: &Header, work_before: u128) -> Vec<BabyBear> {
+        self.verifier.statement(header, work_before)
+    }
+
+    /// [`ChainVerifier::verify_proof`].
+    pub fn verify_proof(
+        &self,
+        header: &Header,
+        work_before: u128,
+        proof: &StarkProof,
+    ) -> Result<(), StarkError> {
+        self.verifier.verify_proof(header, work_before, proof)
+    }
+
+    /// [`ChainVerifier::verify_block`].
+    pub fn verify_block(
+        &self,
+        header: &Header,
+        block: &Block,
+        work_before: u128,
+    ) -> Result<(), BlockError> {
+        self.verifier.verify_block(header, block, work_before)
+    }
+
+    /// [`ChainVerifier::check_and_apply`].
+    pub fn check_and_apply(
+        &self,
+        tree: &StateTree,
+        txn: &mut heed::RwTxn,
+        parent: &Header,
+        header: &Header,
+        block: &Block,
+        work_before: u128,
+    ) -> Result<Undo, BlockError> {
+        self.verifier
+            .check_and_apply(tree, txn, parent, header, block, work_before)
+    }
+}
+
+/// What chain proofs are checked against: the chain circuit's key, which
+/// every statement names, and the wrap circuit's (published proofs are
+/// wrap proofs, of `2^WRAP_LOG_HEIGHT` rows).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainKeys {
+    pub chain: Hash,
+    pub wrap: Hash,
+}
+
+/// The real chain's keys (the default consensus and the genesis in
+/// [`crate::genesis`]), pinned so that a node that doesn't mine needn't
+/// build the circuits ([`ChainVerifier`]). A miner, which builds them,
+/// checks they match at startup; any circuit change means updating these
+/// (`cargo test --release pinned_keys -- --ignored --nocapture` prints them).
+pub const KEYS: ChainKeys = ChainKeys {
+    chain: BabyBear::new_array([
+        780211085, 867189719, 1490953196, 617223248, 485687576, 909532308, 895215005, 647430773,
+    ]),
+    wrap: BabyBear::new_array([
+        342833832, 1304694754, 961309630, 1987511813, 777483746, 1662147403, 1020515416,
+        1107749614,
+    ]),
+};
+
+/// Checks chain proofs and blocks with only the [`ChainKeys`]: the
+/// recursion circuits' constraints are the same for every circuit (its
+/// layout is in the preprocessed columns the keys commit to), so no circuit
+/// needs building. [`Chain`] has one for the keys it makes.
+pub struct ChainVerifier {
+    keys: ChainKeys,
+    wrap_air: RecursionAir,
+}
+
+impl ChainVerifier {
+    pub fn new(keys: ChainKeys) -> Self {
+        Self {
+            keys,
+            wrap_air: RecursionAir::for_verifying(WRAP_LOG_HEIGHT),
+        }
+    }
+
+    pub fn keys(&self) -> ChainKeys {
+        self.keys
+    }
+
     /// The statement block `header`'s chain proof must prove, given the
     /// total work of headers `1 ..= header.height - 1`.
     pub fn statement(&self, header: &Header, work_before: u128) -> Vec<BabyBear> {
         let (lo, hi) = state::split(header.state.size);
-        let mut s = self.key().to_vec();
+        let mut s = self.keys.chain.to_vec();
         s.extend(header.prev);
         s.extend(header.state.root);
         s.extend([lo, hi]);
@@ -590,13 +688,13 @@ impl Chain {
             return Err(StarkError::Shape);
         }
         let statement = self.statement(header, work_before);
-        stark::verify(
-            &wrap_params(),
-            &self.wrap.vk,
-            &self.wrap.air,
-            &statement,
-            proof,
-        )
+        let vk = VerifyingKey {
+            preprocessed: Some(PreprocessedCommitment {
+                root: self.keys.wrap,
+                log_n: WRAP_LOG_HEIGHT,
+            }),
+        };
+        stark::verify(&wrap_params(), &vk, &self.wrap_air, &statement, proof)
     }
 
     /// Checks `block` as the body of `header`: it fits [`MAX_BLOCK_SIZE`],
@@ -636,7 +734,7 @@ impl Chain {
             .map_err(BlockError::Chain)
     }
 
-    /// A full node's check of a received block: [`Chain::verify_block`],
+    /// A full node's check of a received block: [`ChainVerifier::verify_block`],
     /// then [`block::apply`] to `tree` (at `parent`'s state in `txn`).
     pub fn check_and_apply(
         &self,
@@ -671,6 +769,25 @@ mod tests {
     fn spend(wallet: &Wallet, coins: &[Coin], outputs: Vec<Output>) -> Transaction {
         let (keys, inputs) = coins.iter().map(|c| wallet.input(c, 0)).unzip();
         Transaction::sign(TxBody { inputs, outputs }, keys).unwrap()
+    }
+
+    /// The real chain's keys are the pinned ones (a node that doesn't mine
+    /// uses those). Builds the circuits without the dataset, as such a node
+    /// would have to otherwise.
+    #[test]
+    #[ignore = "slow: builds the real circuits"]
+    fn pinned_keys() {
+        let chain = Chain::new(
+            Consensus::DEFAULT,
+            crate::genesis::header(),
+            BlockProver::standard(FriParams::default(), &KeyCache::none()),
+            DatasetTree::Blank,
+            &KeyCache::none(),
+        );
+        let keys = chain.verifier().keys();
+        eprintln!("chain {:?}", keys.chain.map(|x| x.as_u32()));
+        eprintln!("wrap  {:?}", keys.wrap.map(|x| x.as_u32()));
+        assert_eq!(keys, KEYS);
     }
 
     /// Three blocks with real spends, each with its chain proof, mined at an

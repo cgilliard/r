@@ -209,6 +209,19 @@ impl RecursionAir {
         Self::with_min_height(circuit, public, 64)
     }
 
+    /// An AIR of `2^log_height` rows with no circuit: enough to verify
+    /// proofs, since the constraints are the same for every circuit (its
+    /// layout is in the preprocessed columns, which the verifying key
+    /// commits to), but not to prove or to make keys.
+    pub fn for_verifying(log_height: u32) -> Self {
+        Self {
+            rows: vec![],
+            reads: vec![],
+            public: vec![],
+            height: 1 << log_height,
+        }
+    }
+
     /// [`new`](Self::new) with exactly `2^log_height` rows.
     ///
     /// # Panics

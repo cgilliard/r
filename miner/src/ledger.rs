@@ -38,7 +38,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use heed::{Env, RwTxn};
 
 use crate::block::{self, Block, BlockError};
-use crate::chain::Chain;
+use crate::chain::{Chain, ChainVerifier};
 use crate::hash::{self, Hash};
 use crate::header::{self, Consensus, Header, HeaderError};
 use crate::state::{self, StateTree, SyncPut};
@@ -148,6 +148,17 @@ impl Verifier for Chain {
         work_before: u128,
     ) -> Result<(), BlockError> {
         Chain::verify_block(self, header, block, work_before)
+    }
+}
+
+impl Verifier for ChainVerifier {
+    fn verify_block(
+        &self,
+        header: &Header,
+        block: &Block,
+        work_before: u128,
+    ) -> Result<(), BlockError> {
+        ChainVerifier::verify_block(self, header, block, work_before)
     }
 }
 
