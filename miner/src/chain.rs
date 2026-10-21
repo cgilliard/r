@@ -53,7 +53,7 @@ use crate::fri::FriParams;
 use crate::hash::{HASH_LEN, Hash, domain};
 use crate::header::{self, Consensus, Header, WORK_LIMBS};
 use crate::item_chunk_air::Boundary;
-use crate::merkle::MerkleTree;
+use crate::pow::DatasetTree;
 use crate::output;
 use crate::pow_circuit::{self, HeaderCells};
 use crate::recursion_air::RecursionAir;
@@ -111,8 +111,9 @@ pub struct Chain {
     params: FriParams,
     log_height: u32,
     blocks: BlockProver,
-    /// The PoW dataset's tree, for opening items in header checks.
-    tree: MerkleTree,
+    /// The PoW dataset's tree, for opening items in header checks (blank
+    /// on a node that only verifies).
+    tree: DatasetTree,
     first: Node,
     chain: Node,
     wrap: Node,
@@ -321,7 +322,7 @@ fn wrap_circuit(
 #[allow(clippy::too_many_arguments)]
 fn chain_circuit(
     consensus: &Consensus,
-    tree: &MerkleTree,
+    tree: &DatasetTree,
     agg: &Aggregator,
     wrap: &Inner<'_, RecursionAir>,
     vk: &Hash,
@@ -366,7 +367,8 @@ fn chain_circuit(
 impl Chain {
     /// Sets up chain proofs for the chain starting at `genesis` under
     /// `consensus`, proving transitions with `blocks` and header checks
-    /// with the dataset's `tree` ([`crate::pow::Dataset::tree`]).
+    /// with the dataset's `tree` ([`crate::pow::Dataset::tree`]; a
+    /// [`DatasetTree::Blank`] chain verifies but can't prove).
     ///
     /// # Panics
     /// If a circuit doesn't fit the aggregation height.
@@ -374,7 +376,7 @@ impl Chain {
         consensus: Consensus,
         genesis: Header,
         blocks: BlockProver,
-        tree: MerkleTree,
+        tree: DatasetTree,
         keys: &KeyCache,
     ) -> Self {
         let agg = blocks.aggregator();
@@ -698,7 +700,22 @@ mod tests {
         };
         let t = std::time::Instant::now();
         let blocks = BlockProver::standard(FriParams::default(), &KeyCache::none());
-        let chain = Chain::new(consensus, genesis, blocks, data.tree(), &KeyCache::none());
+        let chain = Chain::new(
+            consensus,
+            genesis,
+            blocks,
+            DatasetTree::Full(data.tree()),
+            &KeyCache::none(),
+        );
+        // A node that doesn't mine sets up without the dataset, and gets the
+        // same keys.
+        let verifier = Chain::new(
+            consensus,
+            genesis,
+            BlockProver::standard(FriParams::default(), &KeyCache::none()),
+            DatasetTree::Blank,
+            &KeyCache::none(),
+        );
         eprintln!(
             "setup {:.1} s, rows {:?}",
             t.elapsed().as_secs_f64(),
@@ -773,12 +790,13 @@ mod tests {
             // A full node.
             let work_before = *work.last().unwrap();
             assert_eq!(statement_work(&proof.statement), Some(work_before));
-            assert_eq!(header::check(&consensus, data, &parent, &header), Ok(()));
+            assert_eq!(header::check(&consensus, &parent, &header), Ok(()));
             let mut txn = env.env().write_txn().unwrap();
             chain
                 .check_and_apply(&tree, &mut txn, &parent, &header, &block, work_before)
                 .unwrap();
             txn.commit().unwrap();
+            verifier.verify_block(&header, &block, work_before).unwrap();
 
             work.push(work_before + header::work(consensus.log_target(&parent)));
             headers.push(header);
@@ -878,7 +896,7 @@ mod tests {
         };
         assert!(past.mine(data, consensus.target(&headers[3])));
         assert_eq!(
-            header::check(&consensus, data, &headers[3], &past),
+            header::check(&consensus, &headers[3], &past),
             Err(header::HeaderError::PastEnd)
         );
     }

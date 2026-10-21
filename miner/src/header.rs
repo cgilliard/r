@@ -265,8 +265,10 @@ impl Header {
         })
     }
 
-    pub fn pow(&self, data: &Dataset) -> Hash {
-        data.hash(&self.seed(), self.nonce)
+    /// The PoW hash, derived from the cache ([`pow::light_hash`]: no
+    /// dataset needed, a few tens of milliseconds).
+    pub fn pow(&self) -> Hash {
+        pow::light_hash(&self.seed(), self.nonce)
     }
 
     /// Searches nonces from the current one until one meets `target`.
@@ -317,7 +319,6 @@ impl std::error::Error for HeaderError {}
 /// also enforce (height, link, increasing time, PoW).
 pub fn check(
     c: &Consensus,
-    data: &Dataset,
     parent: &Header,
     header: &Header,
 ) -> Result<(), HeaderError> {
@@ -333,7 +334,7 @@ pub fn check(
     if header.timestamp <= parent.timestamp {
         return Err(HeaderError::TooOld);
     }
-    if pow::value(&header.pow(data)) >= c.target(parent) {
+    if pow::value(&header.pow()) >= c.target(parent) {
         return Err(HeaderError::Work);
     }
     Ok(())
@@ -343,7 +344,6 @@ pub fn check(
 /// `max_future` past `now`.
 pub fn check_new(
     c: &Consensus,
-    data: &Dataset,
     parent: &Header,
     header: &Header,
     now: u64,
@@ -351,7 +351,7 @@ pub fn check_new(
     if header.timestamp > now.saturating_add(c.max_future) {
         return Err(HeaderError::TooNew);
     }
-    check(c, data, parent, header)
+    check(c, parent, header)
 }
 
 #[cfg(test)]
@@ -528,7 +528,7 @@ mod tests {
                 ..*parent
             };
             assert!(h.mine(data, c.target(parent)));
-            assert_eq!(check(&c, data, parent, &h), Ok(()));
+            assert_eq!(check(&c, parent, &h), Ok(()));
             chain.push(h);
         }
 
@@ -536,7 +536,7 @@ mod tests {
         let reject = |f: &dyn Fn(&mut Header)| {
             let mut bad = h;
             f(&mut bad);
-            check(&c, data, parent, &bad)
+            check(&c, parent, &bad)
         };
         assert_eq!(reject(&|b| b.height += 1), Err(HeaderError::Height));
         assert_eq!(
@@ -554,11 +554,11 @@ mod tests {
             .unwrap();
         assert_eq!(reject(&|b| b.nonce = bad_nonce), Err(HeaderError::Work));
         assert_eq!(
-            check_new(&c, data, parent, &h, h.timestamp - c.max_future - 1),
+            check_new(&c, parent, &h, h.timestamp - c.max_future - 1),
             Err(HeaderError::TooNew)
         );
         assert_eq!(
-            check_new(&c, data, parent, &h, h.timestamp - c.max_future),
+            check_new(&c, parent, &h, h.timestamp - c.max_future),
             Ok(())
         );
     }

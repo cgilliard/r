@@ -49,12 +49,11 @@ use crate::hash::{self, Hash};
 use crate::header::{self, Consensus, FRAC_BITS, Header};
 use crate::ledger::{Added, Ledger};
 use crate::mempool::Mempool;
-use crate::merkle::MerkleTree;
 use crate::net::LedgerBackend;
 use crate::net::node::{self, Config, Event, Node};
 use crate::net::wire::cap;
 use crate::output::{Amount, format_coins};
-use crate::pow::{self, Dataset};
+use crate::pow::{self, Dataset, DatasetTree};
 use crate::stark::KeyCache;
 use crate::state::StateTree;
 use crate::store::ChainStore;
@@ -91,7 +90,7 @@ fn supply(c: &Consensus, height: u64) -> u128 {
     first * c.first_subsidy as u128 + second * c.second_subsidy as u128
 }
 
-fn provers(consensus: Consensus, genesis: Header, tree: MerkleTree, keys: &KeyCache) -> Chain {
+fn provers(consensus: Consensus, genesis: Header, tree: DatasetTree, keys: &KeyCache) -> Chain {
     let blocks = BlockProver::standard(FriParams::default(), keys);
     Chain::new(consensus, genesis, blocks, tree, keys)
 }
@@ -160,7 +159,8 @@ struct Opened {
     env: heed::Env,
     store: ChainStore,
     tree: StateTree,
-    data: &'static Dataset,
+    /// The PoW dataset, if mining.
+    data: Option<&'static Dataset>,
     genesis: Header,
     consensus: Consensus,
     ledger: Arc<Ledger>,
@@ -168,17 +168,30 @@ struct Opened {
 }
 
 /// Opens (creating if needed) the chain in `data_dir/chain`, with the
-/// PoW dataset and verifying keys cached in `data_dir/cache`, and sets up
-/// the provers and verifier.
-fn open(log: &Log, data_dir: &Path, snap_sync_limit: u64) -> Result<Opened, Box<dyn Error>> {
+/// PoW dataset (if mining) and verifying keys cached in `data_dir/cache`,
+/// and sets up the provers and verifier.
+fn open(
+    log: &Log,
+    data_dir: &Path,
+    snap_sync_limit: u64,
+    mine: bool,
+) -> Result<Opened, Box<dyn Error>> {
     let dir = data_dir.join("chain");
     let cache = data_dir.join("cache");
-    let (data, pow_tree, loaded) = Dataset::load(&cache.join("pow-dataset"));
-    log.line(if loaded {
-        "PoW dataset (64 MiB) loaded and checked against its root"
+    std::fs::create_dir_all(&cache)?;
+    // Only a miner needs the dataset: others check headers' PoW from the
+    // cache in the binary.
+    let (data, pow_tree) = if mine {
+        let (data, tree, loaded) = Dataset::load(&cache.join("pow-dataset"));
+        log.line(if loaded {
+            "PoW dataset (64 MiB) loaded and checked against its root"
+        } else {
+            "PoW dataset (64 MiB) built and cached"
+        });
+        (Some(data), DatasetTree::Full(tree))
     } else {
-        "PoW dataset (64 MiB) built and cached"
-    });
+        (None, DatasetTree::Blank)
+    };
     let env = db::open_env(&dir)?;
     let tree = StateTree::open(&env)?;
     let store = ChainStore::open(&env)?;
@@ -224,7 +237,6 @@ fn open(log: &Log, data_dir: &Path, snap_sync_limit: u64) -> Result<Opened, Box<
         store,
         tree,
         consensus,
-        data,
         verifier: chain.clone(),
         snap_sync_limit,
     });
@@ -338,7 +350,14 @@ pub fn run(data_dir: &Path, net: &Net, opts: &Options) -> Result<(), Box<dyn Err
         data_dir.join("chain").display(),
         log_path.display(),
     );
-    println!("starting up (the PoW dataset and provers take a moment)...");
+    println!(
+        "starting up ({} take a moment)...",
+        if mine {
+            "the PoW dataset and provers"
+        } else {
+            "the provers"
+        }
+    );
     log.line(format!(
         "starting: {} the chain in {}{}",
         if mine {
@@ -353,7 +372,7 @@ pub fn run(data_dir: &Path, net: &Net, opts: &Options) -> Result<(), Box<dyn Err
             String::new()
         },
     ));
-    let o = Arc::new(open(&log, data_dir, net.snap_sync_limit)?);
+    let o = Arc::new(open(&log, data_dir, net.snap_sync_limit, mine)?);
     let mempool = Arc::new(Mempool::new());
     let wallet_store = WalletStore::open(&o.env)?;
     let wallet = open_wallet(&o.env, &wallet_store, opts.restore, &log)?;
@@ -516,7 +535,8 @@ impl Miner<'_> {
             wallet,
             events,
         } = self;
-        let (env, store, tree, data, consensus) = (&o.env, o.store, o.tree, o.data, o.consensus);
+        let (env, store, tree, consensus) = (&o.env, o.store, o.tree, o.consensus);
+        let data = o.data.expect("a miner has the dataset");
         let ledger = &o.ledger;
         let chain = &o.chain;
         log.line("catching up with peers before mining");
@@ -854,7 +874,7 @@ impl Miner<'_> {
                 .proof;
             let t = Instant::now();
             if tip.height >= 2 {
-                header::check(&consensus, data, &tip_parent, &tip)?;
+                header::check(&consensus, &tip_parent, &tip)?;
             }
             chain
                 .verify_proof(&tip, claimed, &proof)

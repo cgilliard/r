@@ -41,7 +41,6 @@ use crate::block::{self, Block, BlockError};
 use crate::chain::Chain;
 use crate::hash::{self, Hash};
 use crate::header::{self, Consensus, Header, HeaderError};
-use crate::pow::Dataset;
 use crate::state::{self, StateTree, SyncPut};
 use crate::store::{self, ChainStore};
 
@@ -167,7 +166,6 @@ pub struct Ledger {
     pub store: ChainStore,
     pub tree: StateTree,
     pub consensus: Consensus,
-    pub data: &'static Dataset,
     pub verifier: Arc<dyn Verifier>,
     /// Blocks below the tip whose state is kept to serve fast-syncing
     /// nodes.
@@ -216,7 +214,7 @@ impl Ledger {
             .header_by_hash(&txn, &header.prev)?
             .ok_or(LedgerError::UnknownParent)?;
         self.check_fork(&txn, &parent)?;
-        header::check_new(&self.consensus, self.data, &parent, header, now())
+        header::check_new(&self.consensus, &parent, header, now())
             .map_err(LedgerError::Header)?;
         Ok(parent)
     }
@@ -442,7 +440,7 @@ impl Ledger {
         if parent.height == 0 {
             return Err(LedgerError::Header(HeaderError::Height));
         }
-        header::check(&self.consensus, self.data, parent, base).map_err(LedgerError::Header)?;
+        header::check(&self.consensus, parent, base).map_err(LedgerError::Header)?;
         self.verifier
             .verify_block(base, block, parent_work)
             .map_err(LedgerError::Block)
@@ -707,7 +705,6 @@ pub(crate) mod tests {
                 genesis_log_target: MAX_LOG_TARGET,
                 ..Consensus::DEFAULT
             },
-            data: Dataset::get(),
             verifier: Arc::new(BodyOnly),
             snap_sync_limit,
         };

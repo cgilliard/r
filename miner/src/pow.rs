@@ -1,14 +1,20 @@
 //! Proof of work: Poseidon2 over a 64 MiB dataset expanded from the
-//! compressed Bible text.
+//! compressed Bible text, in the manner of Ethash.
 //!
-//! The dataset has [`ITEMS`] items of 8 field elements (32 bytes each). The
-//! first ones are the 32-byte chunks of `resources/akjv.txt.gz`, as is (each
-//! little-endian `u32` reduced mod `p`). The rest are built in doubling
-//! levels: an item in level `[b, 2b)` starts from its index, then absorbs
-//! [`PARENTS`] items from `[0, b)`, each chosen by its own state, with one
-//! permutation per parent. A miner that skips storing part of the dataset
-//! pays `PARENTS` permutations and lookups for every missing item it touches,
-//! and more when those parents are missing too.
+//! The cache is the text, `resources/akjv.txt.gz`, as items of 8 field
+//! elements: one per 32-byte chunk (each little-endian `u32` reduced mod
+//! `p`). The dataset has [`ITEMS`] items, each derived from the cache
+//! alone: it starts from its index, then absorbs [`PARENTS`] cache items,
+//! each chosen by its own state, with one permutation per parent.
+//!
+//! Miners build the whole dataset once (`ITEMS * PARENTS` permutations,
+//! cached in a file) and read one item per round. Verifiers keep only the
+//! cache, which is in the binary, and derive the items a hash reads
+//! ([`light_hash`]: about `ROUNDS * PARENTS` permutations, milliseconds).
+//! A miner that skips storing the dataset pays the same `PARENTS`
+//! permutations for every item it reads instead of one memory read; with
+//! 256 parents that is meant to cost well over a random DRAM read even in
+//! custom hardware, whatever on-chip memory it has for the cache.
 //!
 //! A header's PoW hash starts from its seed (a hash of every header field but
 //! the nonce) and the nonce, then runs [`ROUNDS`] of: look up the item the
@@ -27,15 +33,15 @@ use std::thread;
 use crate::babybear::BabyBear;
 use crate::hash::{DOMAIN_SLOT, HASH_LEN, Hash, domain};
 use crate::matrix::RowMajorMatrix;
-use crate::merkle::MerkleTree;
+use crate::merkle::{MerklePath, MerkleTree};
 use crate::par;
 use crate::poseidon2::{self, WIDTH};
 use crate::poseidon2_x8::{LANES, permute_x8};
 
 pub const LOG_ITEMS: u32 = 21;
 pub const ITEMS: usize = 1 << LOG_ITEMS;
-/// Parents absorbed by each derived item.
-pub const PARENTS: usize = 64;
+/// Cache items absorbed by each dataset item.
+pub const PARENTS: usize = 256;
 /// Dataset lookups per PoW hash.
 pub const ROUNDS: usize = 64;
 /// Bytes of text per seed item.
@@ -45,7 +51,7 @@ pub type Item = [BabyBear; HASH_LEN];
 
 /// The dataset's Merkle root (leaves are items hashed as rows).
 pub const ROOT: [u32; HASH_LEN] = [
-    423062192, 440601328, 97459279, 1428391130, 679320822, 1171734707, 1025165310, 1798928519,
+    1796128910, 1758294722, 640279288, 1524090617, 1744323623, 1199373394, 1519935544, 936409918,
 ];
 
 /// Bits taken from each of the first four hash elements for its value.
@@ -57,9 +63,53 @@ pub const MAX_TARGET: u128 = 1 << VALUE_BITS;
 
 static TEXT: &[u8] = include_bytes!("../../resources/akjv.txt.gz");
 
-/// Seed items: one per (zero-padded) 32-byte chunk of the text.
-pub fn seed_items() -> usize {
-    TEXT.len().div_ceil(CHUNK)
+/// The cache: one item per (zero-padded) 32-byte chunk of the text.
+pub fn cache() -> &'static [Item] {
+    static CACHE: OnceLock<Vec<Item>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        TEXT.chunks(CHUNK)
+            .map(|chunk| {
+                let mut bytes = [0u8; CHUNK];
+                bytes[..chunk.len()].copy_from_slice(chunk);
+                core::array::from_fn(|k| {
+                    BabyBear::new(u32::from_le_bytes(
+                        bytes[4 * k..4 * k + 4].try_into().expect("4 bytes"),
+                    ))
+                })
+            })
+            .collect()
+    })
+}
+
+/// Dataset item `i`, derived from the cache.
+pub fn item(i: usize) -> Item {
+    let cache = cache();
+    let mut s = item_start(i);
+    poseidon2::permute(&mut s);
+    for _ in 0..PARENTS {
+        let j = parent(&s, cache.len());
+        add(&mut s, &cache[j]);
+        poseidon2::permute(&mut s);
+    }
+    core::array::from_fn(|k| s[k])
+}
+
+/// The PoW hash for `seed` and `nonce`, deriving the items it reads from
+/// the cache: what a node that doesn't mine checks headers with.
+pub fn light_hash(seed: &Hash, nonce: u64) -> Hash {
+    hash_with(seed, nonce, item)
+}
+
+/// The PoW hash for `seed` and `nonce`, reading items with `item`.
+fn hash_with(seed: &Hash, nonce: u64, item: impl Fn(usize) -> Item) -> Hash {
+    let mut s = start(seed, nonce);
+    poseidon2::permute(&mut s);
+    for _ in 0..ROUNDS {
+        let j = lookup(&s);
+        add(&mut s, &item(j));
+        poseidon2::permute(&mut s);
+    }
+    core::array::from_fn(|i| s[i])
 }
 
 pub struct Dataset {
@@ -134,32 +184,16 @@ impl Dataset {
         std::fs::rename(tmp, path)
     }
 
-    /// Builds the dataset (about 2^27 permutations, spread across threads).
+    /// Builds the dataset (`ITEMS * PARENTS` = 2^29 permutations, spread
+    /// across threads).
     pub fn build() -> Self {
         let mut items = vec![[BabyBear::ZERO; HASH_LEN]; ITEMS];
-        let seeds = seed_items();
-        for (item, chunk) in items.iter_mut().zip(TEXT.chunks(CHUNK)) {
-            let mut bytes = [0u8; CHUNK];
-            bytes[..chunk.len()].copy_from_slice(chunk);
-            *item = core::array::from_fn(|k| {
-                BabyBear::new(u32::from_le_bytes(
-                    bytes[4 * k..4 * k + 4].try_into().unwrap(),
-                ))
-            });
-        }
-        let mut b = seeds;
-        while b < ITEMS {
-            let e = (2 * b).min(ITEMS);
-            let (lower, upper) = items.split_at_mut(b);
-            let lower = &*lower;
-            par::par_chunks_mut(&mut upper[..e - b], 1024, |c, out| {
-                let first = b + c * 1024;
-                for (g, group) in out.chunks_mut(LANES).enumerate() {
-                    derive_x8(lower, first + g * LANES, group);
-                }
-            });
-            b = e;
-        }
+        let cache = cache();
+        par::par_chunks_mut(&mut items, 1024, |c, out| {
+            for (g, group) in out.chunks_mut(LANES).enumerate() {
+                derive_x8(cache, c * 1024 + g * LANES, group);
+            }
+        });
         Self { items }
     }
 
@@ -173,16 +207,9 @@ impl Dataset {
         MerkleTree::new(RowMajorMatrix::new(values, HASH_LEN))
     }
 
-    /// The PoW hash for `seed` and `nonce`.
+    /// The PoW hash for `seed` and `nonce` (the same as [`light_hash`]).
     pub fn hash(&self, seed: &Hash, nonce: u64) -> Hash {
-        let mut s = start(seed, nonce);
-        poseidon2::permute(&mut s);
-        for _ in 0..ROUNDS {
-            let j = lookup(&s);
-            add(&mut s, &self.items[j]);
-            poseidon2::permute(&mut s);
-        }
-        core::array::from_fn(|i| s[i])
+        hash_with(seed, nonce, |j| self.items[j])
     }
 
     /// [`Dataset::hash`] of eight nonces at once.
@@ -236,6 +263,28 @@ impl Dataset {
     }
 }
 
+/// What a chain proof opens dataset items with: the dataset's Merkle tree
+/// (a miner's, to prove), or a blank stand-in for a node that only
+/// verifies, which lays the circuits out the same (so they have the same
+/// keys) but can't prove.
+pub enum DatasetTree {
+    Full(MerkleTree),
+    Blank,
+}
+
+impl DatasetTree {
+    /// Item `index` and its path (zeros when blank).
+    pub fn open(&self, index: usize) -> (Vec<BabyBear>, MerklePath) {
+        match self {
+            Self::Full(tree) => tree.open(index),
+            Self::Blank => (
+                vec![BabyBear::ZERO; HASH_LEN],
+                vec![[BabyBear::ZERO; HASH_LEN]; LOG_ITEMS as usize],
+            ),
+        }
+    }
+}
+
 /// The value compared against the target: the low 27 bits of each of the
 /// first four elements, most significant first. Below [`MAX_TARGET`].
 /// (Each element is uniform mod `p = 15 * 2^27 + 1`, so its low 27 bits
@@ -271,26 +320,28 @@ fn add(s: &mut [BabyBear; WIDTH], item: &Item) {
     }
 }
 
-/// The parent among the first `b` items that a derived item reads next.
+/// The cache item (of `b`) that a dataset item reads next.
 fn parent(s: &[BabyBear; WIDTH], b: usize) -> usize {
     let x = (s[HASH_LEN].as_u32() as u64) << 31 | s[HASH_LEN + 1].as_u32() as u64;
     (x % b as u64) as usize
 }
 
+fn item_start(i: usize) -> [BabyBear; WIDTH] {
+    let mut s = [BabyBear::ZERO; WIDTH];
+    s[0] = BabyBear::new(i as u32);
+    s[DOMAIN_SLOT] = BabyBear::new(domain::POW_DATASET);
+    s
+}
+
 /// Derives the items from index `first` into `out` (at most 8), reading
-/// parents from `lower`.
-fn derive_x8(lower: &[Item], first: usize, out: &mut [Item]) {
-    let b = lower.len();
-    let mut s: [[BabyBear; WIDTH]; LANES] = core::array::from_fn(|l| {
-        let mut s = [BabyBear::ZERO; WIDTH];
-        s[0] = BabyBear::new((first + l) as u32);
-        s[DOMAIN_SLOT] = BabyBear::new(domain::POW_DATASET);
-        s
-    });
+/// parents from `cache`.
+fn derive_x8(cache: &[Item], first: usize, out: &mut [Item]) {
+    let b = cache.len();
+    let mut s: [[BabyBear; WIDTH]; LANES] = core::array::from_fn(|l| item_start(first + l));
     permute_x8(&mut s);
     for _ in 0..PARENTS {
         for s in &mut s {
-            add(s, &lower[parent(s, b)]);
+            add(s, &cache[parent(s, b)]);
         }
         permute_x8(&mut s);
     }
@@ -304,30 +355,21 @@ mod tests {
     use super::*;
     use crate::babybear::P;
 
-    /// One derived item, scalar.
-    fn derive(lower: &[Item], i: usize) -> Item {
-        let mut s = [BabyBear::ZERO; WIDTH];
-        s[0] = BabyBear::new(i as u32);
-        s[DOMAIN_SLOT] = BabyBear::new(domain::POW_DATASET);
-        poseidon2::permute(&mut s);
-        for _ in 0..PARENTS {
-            let j = parent(&s, lower.len());
-            add(&mut s, &lower[j]);
-            poseidon2::permute(&mut s);
+    #[test]
+    fn derive_x8_matches_scalar() {
+        let mut out = [[BabyBear::ZERO; HASH_LEN]; 5];
+        derive_x8(cache(), 1000, &mut out);
+        for (l, x) in out.iter().enumerate() {
+            assert_eq!(*x, item(1000 + l));
         }
-        core::array::from_fn(|k| s[k])
     }
 
     #[test]
-    fn derive_x8_matches_scalar() {
-        let lower: Vec<Item> = (0..100u32)
-            .map(|i| core::array::from_fn(|k| BabyBear::new(i * 8 + k as u32)))
-            .collect();
-        let mut out = [[BabyBear::ZERO; HASH_LEN]; 5];
-        derive_x8(&lower, 1000, &mut out);
-        for (l, item) in out.iter().enumerate() {
-            assert_eq!(*item, derive(&lower, 1000 + l));
-        }
+    fn the_cache_is_the_text() {
+        let c = cache();
+        assert_eq!(c.len(), TEXT.len().div_ceil(CHUNK));
+        let first = u32::from_le_bytes(TEXT[..4].try_into().unwrap());
+        assert_eq!(c[0][0], BabyBear::new(first));
     }
 
     #[test]
@@ -362,10 +404,8 @@ mod tests {
         let data = Dataset::build();
         eprintln!("build {:.2?}", t.elapsed());
         let items = data.items();
-        let b = seed_items();
-        for i in [b, b + 1, 2 * b - 1, 2 * b, ITEMS - 1] {
-            let level = 1 << (i / b).ilog2();
-            assert_eq!(items[i], derive(&items[..b * level], i), "item {i}");
+        for i in [0, 1, 40_000, ITEMS / 2 + 3, ITEMS - 1] {
+            assert_eq!(items[i], item(i), "item {i}");
         }
 
         let t = std::time::Instant::now();
@@ -390,6 +430,10 @@ mod tests {
         for (n, h) in nonces.iter().zip(&x8) {
             assert_eq!(*h, data.hash(&seed, *n));
         }
+        // Verifiers get the same hash without the dataset.
+        let t = std::time::Instant::now();
+        assert_eq!(light_hash(&seed, 7), x8[7]);
+        eprintln!("light hash {:.2?}", t.elapsed());
 
         let count = 1 << 16;
         let t = std::time::Instant::now();

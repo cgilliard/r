@@ -20,9 +20,8 @@ use crate::hash::{DOMAIN_SLOT, HASH_LEN, domain};
 use crate::header::{
     Consensus, FRAC_BITS, Header, MAX_LOG_TARGET, MIN_LOG_TARGET, WORK_LIMB_BITS, WORK_LIMBS,
 };
-use crate::merkle::MerkleTree;
 use crate::poseidon2::WIDTH;
-use crate::pow::{self, LOG_ITEMS, ROUNDS, VALUE_BITS, VALUE_LIMB_BITS, u64_limbs};
+use crate::pow::{self, DatasetTree, LOG_ITEMS, ROUNDS, VALUE_BITS, VALUE_LIMB_BITS, u64_limbs};
 use crate::verifier_circuit::{HashCells, canonical_bits, sponge, verify_path};
 
 /// Limbs of a `u64`.
@@ -114,11 +113,13 @@ pub struct HeaderCheck {
 pub fn check_header(
     c: &mut Circuit,
     consensus: &Consensus,
-    tree: &MerkleTree,
+    tree: &DatasetTree,
     parent: &HeaderCells,
     header: &HeaderCells,
 ) -> HeaderCheck {
-    assert_eq!(tree.log_height(), LOG_ITEMS, "not the dataset's tree");
+    if let DatasetTree::Full(t) = tree {
+        assert_eq!(t.log_height(), LOG_ITEMS, "not the dataset's tree");
+    }
     // Height: parent + 1.
     let one = c.one();
     let mut lhs = parent.height;
@@ -266,7 +267,7 @@ pub fn add_work(c: &mut Circuit, a: &[Cell], b: &[Cell]) -> [Cell; WORK_LIMBS] {
 /// against [`pow::ROOT`].
 fn pow_hash(
     c: &mut Circuit,
-    tree: &MerkleTree,
+    tree: &DatasetTree,
     seed: &HashCells,
     nonce: &[Cell; LIMBS],
 ) -> HashCells {
@@ -623,7 +624,7 @@ mod tests {
     fn checks_a_mined_header() {
         let data = pow::Dataset::get();
         let t = std::time::Instant::now();
-        let tree = data.tree();
+        let tree = DatasetTree::Full(data.tree());
         eprintln!("tree {:.2?}", t.elapsed());
         let consensus = Consensus {
             genesis_time: 1_000_000,
@@ -643,7 +644,7 @@ mod tests {
             ..parent
         };
         assert!(h.mine(data, consensus.target(&parent)));
-        assert_eq!(crate::header::check(&consensus, data, &parent, &h), Ok(()));
+        assert_eq!(crate::header::check(&consensus, &parent, &h), Ok(()));
 
         let build = |h: &Header| {
             let mut c = Circuit::new();

@@ -83,7 +83,7 @@ impl Backend for LedgerBackend {
         {
             l.check_fork(&txn, parent).map_err(|e| e.to_string())?;
         }
-        header::check_new(&l.consensus, l.data, parent, header, now()).map_err(|e| e.to_string())
+        header::check_new(&l.consensus, parent, header, now()).map_err(|e| e.to_string())
     }
 
     fn accept(&self, header: &Header, body: &[u8]) -> Result<Added, Rejected> {
