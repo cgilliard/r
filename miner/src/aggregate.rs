@@ -1,43 +1,41 @@
-//! Aggregation: folds validity sub-block proofs and state-segment proofs
+//! Aggregation: folds item chunk, signature chunk and state segment proofs
 //! into one proof of a combined [`Statement`].
 //!
 //! Every node of the aggregation tree is a [`RecursionAir`] proof of the
 //! same height whose public values are a statement:
 //!
-//! - a sub-block leaf verifies one [`SubBlockAir`] proof and states its
-//!   fingerprints, net value and transaction hash, with no state change;
+//! - an item chunk leaf verifies one [`ItemChunkAir`] proof and states its
+//!   fingerprint ratios (as products), net value, transaction hash and the
+//!   item stream's boundary hashes where it starts and stops;
+//! - a signature chunk leaf verifies one [`SigChunkAir`] proof and states
+//!   the inverse of its signature fingerprint and its pair hash;
 //! - a segment leaf verifies one [`StateSegmentAir`] proof and states the
-//!   inverses of its fingerprints and its state change, with a net value of
-//!   zero and a zero transaction hash;
+//!   inverses of its fingerprints and its state change (as hashes);
 //! - a merge verifies two node proofs and states their combination:
 //!   fingerprint ratios multiply, net values add (offset 16-bit limbs,
 //!   renormalized), transaction hashes merge (`hash::merge(a, b)`), state
-//!   changes chain (the first child's end must be the second child's
-//!   start), and `lambda`, `r` must agree.
+//!   changes and item streams chain (the first child's end must be the
+//!   second child's start), and `lambda`, `r` must agree.
 //!
-//! Fingerprints are carried as ratios, transaction side over tree side,
-//! separately for spent (`Q_IN`) and created (`Q_OUT`) commitments: both
-//! are 1 exactly when the transactions spend and create the commitments
-//! the tree updates do (with overwhelming probability over `lambda, r`).
-//!
-//! The final transaction hash commits to every sub-block's commitments, and
-//! the final state change to every key the segments touched, so the block's
-//! challenges `lambda, r` are derived from both ([`crate::block`]).
+//! The ratios are transaction side over the other side, separately for
+//! spent commitments (`Q_IN`, inputs over segment removals), created
+//! commitments (`Q_OUT`, outputs over segment inserts) and signatures
+//! (`Q_SIG`, inputs' `(pkh, digest)` over signature chunks' pairs): all are
+//! 1 exactly when the multisets match (with overwhelming probability over
+//! `lambda, r`). The final transaction hash commits to every chunk's
+//! contents and the final state to every key the segments touched, so the
+//! block's challenges are derived from both ([`crate::block`]).
 //!
 //! All nodes share one constraint program, so a node's verifying key is its
-//! preprocessed commitment alone, and a merge can verify either kind of
-//! leaf or another merge with the key as data. The merge's own key can't be
-//! a constant of its own circuit, so it is part of the statement: a merge
+//! preprocessed commitment alone, and a merge can verify any kind of leaf
+//! or another merge with the key as data. The merge's own key can't be a
+//! constant of its own circuit, so it is part of the statement: a merge
 //! accepts a child whose key is a leaf key or the statement's key, and
-//! requires the children's statements to name the same key. Whoever checks
-//! the final proof checks that the key is the real merge key.
+//! requires the children's statements to name the same key.
 //!
 //! Grouping stays hidden: only the final proof is published, it is zero
-//! knowledge, and its statement holds only totals: the net value, which a
-//! valid block's must equal the subsidy, so it reveals nothing. The
-//! block-level checks (products against the published lists, the state
-//! chain against the headers, the net value against the subsidy) are made
-//! natively on the final statement.
+//! knowledge, and its statement holds only totals and hashes. The chain
+//! proof ([`crate::chain`]) checks the final statement.
 
 use std::fmt;
 
@@ -45,15 +43,16 @@ use crate::babybear::BabyBear;
 use crate::babybear4::BabyBear4;
 use crate::circuit::{Cell, Circuit, ExtCell};
 use crate::fri::FriParams;
-use crate::hash::{HASH_LEN, Hash};
+use crate::hash::{self, HASH_LEN, Hash, domain};
+use crate::item_chunk_air::{self, Boundary, ItemChunkAir};
 use crate::output::{self, NET_LIMBS, NET_OFFSET};
 use crate::recursion_air::RecursionAir;
-use crate::stark::{self, ProvingKey, StarkError, StarkProof, VerifyingKey};
-use crate::state::State;
+use crate::sig_chunk_air::{self, SigChunkAir};
+use crate::stark::{self, KeyCache, LazyKey, StarkError, StarkProof, VerifyingKey};
+use crate::state::{self, State};
 use crate::state_air::{self, StateSegmentAir};
-use crate::subblock_air::{self, SubBlockAir};
 use crate::symbolic::{Program, compile};
-use crate::verifier_circuit::{self, Inner, ProofCells};
+use crate::verifier_circuit::{self, HashCells, Inner, ProofCells};
 
 /// Offsets of a statement's elements.
 pub mod statement {
@@ -63,43 +62,47 @@ pub mod statement {
     pub const VK: usize = 0;
     pub const LAMBDA: usize = VK + HASH_LEN;
     pub const R: usize = LAMBDA + 4;
-    /// Spent commitments' fingerprint ratio: the sub-blocks' inputs over
-    /// the segments' spends.
+    /// Fingerprint ratios: spent commitments, created commitments,
+    /// signatures.
     pub const Q_IN: usize = R + 4;
-    /// Created commitments' fingerprint ratio: the sub-blocks' outputs over
-    /// the segments' inserts.
     pub const Q_OUT: usize = Q_IN + 4;
+    pub const Q_SIG: usize = Q_OUT + 4;
     /// `sum(outputs) - sum(inputs)` as [`crate::output::net_limbs`].
-    pub const NET: usize = Q_OUT + 4;
-    /// The sub-blocks' transaction hashes, merged in tree order.
+    pub const NET: usize = Q_SIG + 4;
+    /// The leaves' transaction and pair hashes, merged in tree order.
     pub const TX_HASH: usize = NET + crate::output::NET_LIMBS;
-    /// 1 if any segment is included; the state fields are zero otherwise.
+    /// 1 if any segment is included; the state hashes are zero otherwise.
     pub const HAS_STATE: usize = TX_HASH + HASH_LEN;
-    /// `root | size lo, hi` before and after, as a segment's public values.
-    pub const OLD_ROOT: usize = HAS_STATE + 1;
-    pub const OLD_SIZE: usize = OLD_ROOT + HASH_LEN;
-    pub const NEW_ROOT: usize = OLD_SIZE + 2;
-    pub const NEW_SIZE: usize = NEW_ROOT + HASH_LEN;
-    /// The last inserted and spent keys before and after.
-    pub const PREV_INS_IN: usize = NEW_SIZE + 2;
-    pub const PREV_INS_OUT: usize = PREV_INS_IN + HASH_LEN;
-    pub const PREV_SP_IN: usize = PREV_INS_OUT + HASH_LEN;
-    pub const PREV_SP_OUT: usize = PREV_SP_IN + HASH_LEN;
-    pub const LEN: usize = PREV_SP_OUT + HASH_LEN;
-
-    /// The state fields: `OLD_ROOT .. LEN`.
-    pub const STATE: usize = OLD_ROOT;
-    /// Before (`OLD_*`, `PREV_*_IN`) and after (`NEW_*`, `PREV_*_OUT`) in
-    /// chain order: `(old, new)` offset pairs and their lengths.
-    pub const LINKS: [(usize, usize, usize); 4] = [
-        (OLD_ROOT, NEW_ROOT, HASH_LEN),
-        (OLD_SIZE, NEW_SIZE, 2),
-        (PREV_INS_IN, PREV_INS_OUT, HASH_LEN),
-        (PREV_SP_IN, PREV_SP_OUT, HASH_LEN),
-    ];
+    /// [`super::state_hash`] before and after.
+    pub const STATE_IN: usize = HAS_STATE + 1;
+    pub const STATE_OUT: usize = STATE_IN + HASH_LEN;
+    /// 1 if any item chunk is included; the stream hashes are zero
+    /// otherwise.
+    pub const HAS_STREAM: usize = STATE_OUT + HASH_LEN;
+    /// [`super::stream_hash`] of the item stream's boundary before and
+    /// after.
+    pub const STREAM_IN: usize = HAS_STREAM + 1;
+    pub const STREAM_OUT: usize = STREAM_IN + HASH_LEN;
+    pub const LEN: usize = STREAM_OUT + HASH_LEN;
 }
 
 use statement as st;
+
+/// The hash a statement holds for a tree state and the last keys the
+/// segments inserted and spent.
+pub fn state_hash(state: &State, prev_insert: &Hash, prev_spend: &Hash) -> Hash {
+    let (lo, hi) = state::split(state.size);
+    hash::sponge(
+        domain::AGG_STATE,
+        &[],
+        &[&state.root, &[lo, hi], prev_insert, prev_spend],
+    )
+}
+
+/// The hash a statement holds for an item stream boundary.
+pub fn stream_hash(b: &Boundary) -> Hash {
+    hash::sponge(domain::AGG_STREAM, &[], &[&b.elements()])
+}
 
 /// A node's public values.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,17 +115,6 @@ impl Statement {
 
     fn hash(&self, at: usize) -> Hash {
         core::array::from_fn(|j| self.0[at + j])
-    }
-
-    fn state(&self, root: usize, size: usize) -> State {
-        let (lo, hi) = (
-            self.0[size].as_u32() as u64,
-            self.0[size + 1].as_u32() as u64,
-        );
-        State {
-            root: self.hash(root),
-            size: lo | hi << 30,
-        }
     }
 
     pub fn vk(&self) -> Hash {
@@ -145,6 +137,10 @@ impl Statement {
         self.ext(st::Q_OUT)
     }
 
+    pub fn q_sig(&self) -> BabyBear4 {
+        self.ext(st::Q_SIG)
+    }
+
     /// `sum(outputs) - sum(inputs)`.
     pub fn net(&self) -> i128 {
         output::net_value(&self.0[st::NET..st::NET + NET_LIMBS])
@@ -158,35 +154,34 @@ impl Statement {
         self.0[st::HAS_STATE] == BabyBear::ONE
     }
 
-    pub fn old_state(&self) -> State {
-        self.state(st::OLD_ROOT, st::OLD_SIZE)
+    pub fn state_in(&self) -> Hash {
+        self.hash(st::STATE_IN)
     }
 
-    pub fn new_state(&self) -> State {
-        self.state(st::NEW_ROOT, st::NEW_SIZE)
+    pub fn state_out(&self) -> Hash {
+        self.hash(st::STATE_OUT)
     }
 
-    pub fn prev_insert_in(&self) -> Hash {
-        self.hash(st::PREV_INS_IN)
+    pub fn has_stream(&self) -> bool {
+        self.0[st::HAS_STREAM] == BabyBear::ONE
     }
 
-    pub fn prev_insert_out(&self) -> Hash {
-        self.hash(st::PREV_INS_OUT)
+    pub fn stream_in(&self) -> Hash {
+        self.hash(st::STREAM_IN)
     }
 
-    pub fn prev_spend_in(&self) -> Hash {
-        self.hash(st::PREV_SP_IN)
-    }
-
-    pub fn prev_spend_out(&self) -> Hash {
-        self.hash(st::PREV_SP_OUT)
+    pub fn stream_out(&self) -> Hash {
+        self.hash(st::STREAM_OUT)
     }
 }
 
 /// What a node proof proves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    SubBlock,
+    /// An item chunk leaf of the given shape (index into the aggregator's).
+    Items(usize),
+    /// A signature chunk leaf of the given shape.
+    Sigs(usize),
     Segment,
     Merge,
 }
@@ -221,10 +216,11 @@ impl fmt::Display for AggError {
 
 impl std::error::Error for AggError {}
 
-/// One node circuit's layout and keys.
+/// One node circuit's layout and keys (the proving key built on first
+/// use).
 pub(crate) struct Node {
     pub(crate) air: RecursionAir,
-    pub(crate) pk: ProvingKey,
+    key: LazyKey,
     pub(crate) vk: VerifyingKey,
 }
 
@@ -234,10 +230,12 @@ impl Node {
         circuit: &Circuit,
         public: &[Cell],
         log_height: u32,
+        keys: &KeyCache,
     ) -> Self {
         let air = RecursionAir::with_height(circuit, public, log_height);
-        let (pk, vk) = stark::setup(params, &air);
-        Self { air, pk, vk }
+        let key = LazyKey::new(keys, params, &air);
+        let vk = *key.verifying_key();
+        Self { air, key, vk }
     }
 
     /// The node's key: its preprocessed commitment.
@@ -265,7 +263,8 @@ impl Node {
             "circuit shape changed"
         );
         let pv = self.air.public_values(c);
-        let proof = stark::prove(params, &self.pk, &self.air, self.air.trace(c), &pv);
+        let pk = self.key.proving_key(params, &self.air);
+        let proof = stark::prove(params, pk, &self.air, self.air.trace(c), &pv);
         Some((pv, proof))
     }
 }
@@ -301,19 +300,22 @@ impl<A: crate::air::Air> Leaf<A> {
     }
 }
 
-/// Keys and layouts for aggregating one sub-block shape and one segment
-/// shape.
+/// Keys and layouts for aggregating item and signature chunks of lists of
+/// shapes and one segment shape.
 pub struct Aggregator {
     params: FriParams,
     log_height: u32,
-    sub: Leaf<SubBlockAir>,
+    items: Vec<Leaf<ItemChunkAir>>,
+    sigs: Vec<Leaf<SigChunkAir>>,
     seg: Leaf<StateSegmentAir>,
     /// The constraints shared by every node.
     node_program: Program,
-    leaf_sub: Node,
+    /// One leaf circuit per item and signature chunk shape.
+    leaf_items: Vec<Node>,
+    leaf_sigs: Vec<Node>,
     leaf_seg: Node,
     merge: Node,
-    /// Bytes in a final proof (every node proof has the same shape).
+    /// Bytes in a node proof (every node proof has the same shape).
     proof_size: usize,
 }
 
@@ -336,6 +338,19 @@ pub(crate) fn publish(c: &mut Circuit, cells: &[Cell]) -> Vec<Cell> {
 
 pub(crate) fn ext_at(cells: &[Cell], at: usize) -> ExtCell {
     ExtCell(core::array::from_fn(|b| cells[at + b]))
+}
+
+/// [`state_hash`] in a circuit, of `root | size lo, hi | prev insert |
+/// prev spend` cells.
+pub(crate) fn state_hash_cells(c: &mut Circuit, fields: &[Cell]) -> HashCells {
+    assert_eq!(fields.len(), 2 * HASH_LEN + 2 + HASH_LEN);
+    verifier_circuit::sponge(c, domain::AGG_STATE, fields, None)
+}
+
+/// [`stream_hash`] in a circuit, of a boundary's cells.
+pub(crate) fn stream_hash_cells(c: &mut Circuit, boundary: &[Cell]) -> HashCells {
+    assert_eq!(boundary.len(), item_chunk_air::BOUNDARY_LEN);
+    verifier_circuit::sponge(c, domain::AGG_STREAM, boundary, None)
 }
 
 /// The sum of two net values in offset limbs ([`output::net_limbs`]):
@@ -374,34 +389,58 @@ fn select(c: &mut Circuit, bit: Cell, a: Cell, b: Cell) -> Cell {
     c.add(a, m)
 }
 
+/// A statement span (state or stream) that's absent: flag and both hashes
+/// zero.
+fn absent(c: &mut Circuit) -> Vec<Cell> {
+    vec![c.zero(); 1 + 2 * HASH_LEN]
+}
+
 impl Aggregator {
-    /// Sets up aggregation of `sub` proofs (verifying key `sub_vk`) and
-    /// `seg` proofs, every node at height `2^log_height`.
+    /// Sets up aggregation of item chunks and signature chunks of the
+    /// shapes in `items` and `sigs` (with their verifying keys) and `seg`
+    /// segments, every node at height `2^log_height`.
     ///
     /// # Panics
-    /// If a node circuit doesn't fit the height.
+    /// If a shape list is empty or a node circuit doesn't fit the height.
     pub fn new(
         params: FriParams,
-        sub: SubBlockAir,
-        sub_vk: VerifyingKey,
+        items: Vec<(ItemChunkAir, VerifyingKey)>,
+        sigs: Vec<(SigChunkAir, VerifyingKey)>,
         seg: StateSegmentAir,
         seg_vk: VerifyingKey,
         log_height: u32,
+        keys: &KeyCache,
     ) -> Self {
-        let sub = Leaf::new(sub, sub_vk, subblock_air::PUBLIC_LEN);
+        assert!(!items.is_empty() && !sigs.is_empty(), "no chunk shapes");
+        let items: Vec<Leaf<ItemChunkAir>> = items
+            .into_iter()
+            .map(|(air, vk)| Leaf::new(air, vk, item_chunk_air::public::LEN))
+            .collect();
+        let sigs: Vec<Leaf<SigChunkAir>> = sigs
+            .into_iter()
+            .map(|(air, vk)| Leaf::new(air, vk, sig_chunk_air::public::LEN))
+            .collect();
         let seg = Leaf::new(seg, seg_vk, state_air::public::LEN);
         let zero_vk = [BabyBear::ZERO; HASH_LEN];
 
-        let p = StarkProof::placeholder(&params, &sub.air, sub.log_n);
-        let (c, public) = Self::leaf_sub_circuit(
-            &params,
-            &sub,
-            zero_vk,
-            &[BabyBear::ZERO; subblock_air::PUBLIC_LEN],
-            &p,
-        );
-        let leaf_sub = Node::new(&params, &c, &public, log_height);
-
+        let leaf_items: Vec<Node> = items
+            .iter()
+            .map(|leaf| {
+                let p = StarkProof::placeholder(&params, &leaf.air, leaf.log_n);
+                let public = [BabyBear::ZERO; item_chunk_air::public::LEN];
+                let (c, out) = Self::leaf_items_circuit(&params, leaf, zero_vk, &public, &p);
+                Node::new(&params, &c, &out, log_height, keys)
+            })
+            .collect();
+        let leaf_sigs: Vec<Node> = sigs
+            .iter()
+            .map(|leaf| {
+                let p = StarkProof::placeholder(&params, &leaf.air, leaf.log_n);
+                let public = [BabyBear::ZERO; sig_chunk_air::public::LEN];
+                let (c, out) = Self::leaf_sigs_circuit(&params, leaf, zero_vk, &public, &p);
+                Node::new(&params, &c, &out, log_height, keys)
+            })
+            .collect();
         let p = StarkProof::placeholder(&params, &seg.air, seg.log_n);
         let (c, public) = Self::leaf_seg_circuit(
             &params,
@@ -410,32 +449,36 @@ impl Aggregator {
             &[BabyBear::ZERO; state_air::public::LEN],
             &p,
         );
-        let leaf_seg = Node::new(&params, &c, &public, log_height);
+        let leaf_seg = Node::new(&params, &c, &public, log_height, keys);
 
-        let node_program = compile(&leaf_sub.air, st::LEN);
-        let p = StarkProof::placeholder(&params, &leaf_sub.air, log_height);
+        let first = &leaf_items[0];
+        let node_program = compile(&first.air, st::LEN);
+        let p = StarkProof::placeholder(&params, &first.air, log_height);
         let child = NodeProof {
             kind: Kind::Merge,
             statement: Statement(vec![BabyBear::ZERO; st::LEN]),
             proof: p,
         };
+        let merge = Node {
+            air: first.air.clone(),
+            key: LazyKey::verifying_only(first.vk),
+            vk: first.vk,
+        };
         let mut agg = Self {
             params,
             log_height,
-            sub,
+            items,
+            sigs,
             seg,
             node_program,
-            merge: Node {
-                air: leaf_sub.air.clone(),
-                pk: leaf_sub.pk.clone(),
-                vk: leaf_sub.vk,
-            },
-            leaf_sub,
+            leaf_items,
+            leaf_sigs,
             leaf_seg,
+            merge,
             proof_size: child.proof.size(),
         };
         let (c, public) = agg.merge_circuit(&child, &child);
-        agg.merge = Node::new(&agg.params, &c, &public, log_height);
+        agg.merge = Node::new(&agg.params, &c, &public, log_height, keys);
         agg
     }
 
@@ -468,33 +511,78 @@ impl Aggregator {
         self.log_height
     }
 
+    /// The item chunk shapes, as [`Aggregator::prove_items`] indexes them.
+    pub fn item_shapes(&self) -> Vec<ItemChunkAir> {
+        self.items.iter().map(|l| l.air).collect()
+    }
+
+    /// The signature chunk shapes, as [`Aggregator::prove_sigs`] indexes
+    /// them.
+    pub fn sig_shapes(&self) -> Vec<SigChunkAir> {
+        self.sigs.iter().map(|l| l.air).collect()
+    }
+
     fn node(&self, kind: Kind) -> &Node {
         match kind {
-            Kind::SubBlock => &self.leaf_sub,
+            Kind::Items(i) => &self.leaf_items[i],
+            Kind::Sigs(i) => &self.leaf_sigs[i],
             Kind::Segment => &self.leaf_seg,
             Kind::Merge => &self.merge,
         }
     }
 
-    fn leaf_sub_circuit(
+    fn leaf_items_circuit(
         params: &FriParams,
-        sub: &Leaf<SubBlockAir>,
+        leaf: &Leaf<ItemChunkAir>,
         vk: Hash,
         public: &[BabyBear],
         proof: &StarkProof,
     ) -> (Circuit, Vec<Cell>) {
+        use item_chunk_air::public as ip;
         let mut c = Circuit::new();
         let vk = inputs(&mut c, &vk);
         let pv = inputs(&mut c, public);
         let cells = ProofCells::load(&mut c, proof);
-        verifier_circuit::verify(&mut c, &sub.inner(params), &pv, &cells);
-        let zero = c.zero();
+        verifier_circuit::verify(&mut c, &leaf.inner(params), &pv, &cells);
+        let one = c.one();
         let mut s = vk;
-        s.extend_from_slice(&pv[..16]); // lambda, r, Q_in = P_in, Q_out = P_out
-        s.extend_from_slice(&pv[subblock_air::NET..subblock_air::NET + NET_LIMBS]);
-        s.extend_from_slice(&pv[subblock_air::TX_HASH..subblock_air::TX_HASH + HASH_LEN]);
-        s.push(zero); // has_state
-        s.resize(st::LEN, zero);
+        // lambda, r, Q_in = P_in, Q_out = P_out, Q_sig = P_sig, net, tx hash.
+        s.extend_from_slice(&pv[ip::LAMBDA..ip::ENTRY]);
+        s.extend(absent(&mut c));
+        s.push(one); // has_stream
+        let entry = stream_hash_cells(&mut c, &pv[ip::ENTRY..ip::EXIT]);
+        let exit = stream_hash_cells(&mut c, &pv[ip::EXIT..ip::LEN]);
+        s.extend(entry);
+        s.extend(exit);
+        let public = publish(&mut c, &s);
+        (c, public)
+    }
+
+    fn leaf_sigs_circuit(
+        params: &FriParams,
+        leaf: &Leaf<SigChunkAir>,
+        vk: Hash,
+        public: &[BabyBear],
+        proof: &StarkProof,
+    ) -> (Circuit, Vec<Cell>) {
+        use sig_chunk_air::public as gp;
+        let mut c = Circuit::new();
+        let vk = inputs(&mut c, &vk);
+        let pv = inputs(&mut c, public);
+        let cells = ProofCells::load(&mut c, proof);
+        verifier_circuit::verify(&mut c, &leaf.inner(params), &pv, &cells);
+        let (one, zero) = (c.one(), c.zero());
+        let mut s = vk;
+        s.extend_from_slice(&pv[gp::LAMBDA..gp::P_SIG]);
+        s.extend([one, zero, zero, zero, one, zero, zero, zero]); // Q_in, Q_out
+        let q_sig = c.ext_inverse(ext_at(&pv, gp::P_SIG));
+        s.extend(q_sig.0);
+        for limb in output::net_limbs(0) {
+            s.push(c.constant(limb)); // net
+        }
+        s.extend_from_slice(&pv[gp::HASH..gp::LEN]); // tx hash: the pair hash
+        s.extend(absent(&mut c));
+        s.extend(absent(&mut c));
         let public = publish(&mut c, &s);
         (c, public)
     }
@@ -519,13 +607,24 @@ impl Aggregator {
         let q_out = c.ext_inverse(ext_at(&pv, sp::P_INS));
         s.extend(q_in.0);
         s.extend(q_out.0);
+        s.extend([one, zero, zero, zero]); // Q_sig
         for limb in output::net_limbs(0) {
             s.push(c.constant(limb)); // net
         }
         s.extend([zero; HASH_LEN]); // tx hash
         s.push(one); // has_state
-        s.extend_from_slice(&pv[sp::OLD_ROOT..sp::LAMBDA]);
-        s.extend_from_slice(&pv[sp::PREV_INS_IN..sp::LEN]);
+        let field = |at: usize, len: usize| pv[at..at + len].to_vec();
+        let mut before = field(sp::OLD_ROOT, HASH_LEN + 2);
+        before.extend(field(sp::PREV_INS_IN, HASH_LEN));
+        before.extend(field(sp::PREV_SP_IN, HASH_LEN));
+        let mut after = field(sp::NEW_ROOT, HASH_LEN + 2);
+        after.extend(field(sp::PREV_INS_OUT, HASH_LEN));
+        after.extend(field(sp::PREV_SP_OUT, HASH_LEN));
+        let state_in = state_hash_cells(&mut c, &before);
+        let state_out = state_hash_cells(&mut c, &after);
+        s.extend(state_in);
+        s.extend(state_out);
+        s.extend(absent(&mut c));
         let public = publish(&mut c, &s);
         (c, public)
     }
@@ -534,7 +633,12 @@ impl Aggregator {
     /// leaf key, or `merge_vk` (the statement's own key).
     fn verify_child(&self, c: &mut Circuit, child: &NodeProof, merge_vk: &[Cell]) -> Vec<Cell> {
         let s = inputs(c, &child.statement.0);
-        let sel: Vec<Cell> = [Kind::SubBlock, Kind::Segment, Kind::Merge]
+        let kinds: Vec<Kind> = (0..self.leaf_items.len())
+            .map(Kind::Items)
+            .chain((0..self.leaf_sigs.len()).map(Kind::Sigs))
+            .chain([Kind::Segment, Kind::Merge])
+            .collect();
+        let sel: Vec<Cell> = kinds
             .iter()
             .map(|&k| c.hint(BabyBear::from(child.kind == k)))
             .collect();
@@ -546,13 +650,23 @@ impl Aggregator {
         }
         let one = c.one();
         c.assert_eq(sum, one);
-        let (l_sub, l_seg) = (self.leaf_sub.root(), self.leaf_seg.root());
+        // The child's key: a leaf key picked by the selectors, or the
+        // statement's own (merge) key.
+        let leaf_keys: Vec<Hash> = self
+            .leaf_items
+            .iter()
+            .chain(&self.leaf_sigs)
+            .chain([&self.leaf_seg])
+            .map(Node::root)
+            .collect();
+        let merge_sel = *sel.last().expect("merge selector");
         let root: [Cell; HASH_LEN] = core::array::from_fn(|j| {
-            let a = c.mul_const(sel[0], l_sub[j]);
-            let b = c.mul_const(sel[1], l_seg[j]);
-            let m = c.mul(sel[2], merge_vk[j]);
-            let ab = c.add(a, b);
-            c.add(ab, m)
+            let mut acc = c.mul(merge_sel, merge_vk[j]);
+            for (&b, key) in sel.iter().zip(&leaf_keys) {
+                let t = c.mul_const(b, key[j]);
+                acc = c.add(acc, t);
+            }
+            acc
         });
         let cells = ProofCells::load(c, &child.proof);
         let inner = Inner {
@@ -564,6 +678,37 @@ impl Aggregator {
         };
         verifier_circuit::verify_keyed(c, &inner, Some(root), &s, &cells);
         s
+    }
+
+    /// Chains an optional span (state or stream) of two children: with
+    /// both, `a`'s end must be `b`'s start; the combination starts where
+    /// the first present one starts and ends where the last ends. Returns
+    /// `has | start | end`.
+    fn chain(
+        c: &mut Circuit,
+        sa: &[Cell],
+        sb: &[Cell],
+        has: usize,
+        start: usize,
+        end: usize,
+    ) -> Vec<Cell> {
+        let (ha, hb) = (sa[has], sb[has]);
+        let both = c.mul(ha, hb);
+        let either = c.add(ha, hb);
+        let h = c.sub(either, both);
+        let mut out = vec![h];
+        for j in 0..HASH_LEN {
+            let d = c.sub(sa[end + j], sb[start + j]);
+            let gated = c.mul(both, d);
+            c.assert_zero(gated);
+        }
+        for j in 0..HASH_LEN {
+            out.push(select(c, ha, sb[start + j], sa[start + j]));
+        }
+        for j in 0..HASH_LEN {
+            out.push(select(c, hb, sa[end + j], sb[end + j]));
+        }
+        out
     }
 
     fn merge_circuit(&self, a: &NodeProof, b: &NodeProof) -> (Circuit, Vec<Cell>) {
@@ -581,7 +726,7 @@ impl Aggregator {
         }
         let mut s = vk.clone();
         s.extend_from_slice(&sa[st::LAMBDA..st::Q_IN]);
-        for at in [st::Q_IN, st::Q_OUT] {
+        for at in [st::Q_IN, st::Q_OUT, st::Q_SIG] {
             let p = c.ext_mul(ext_at(&sa, at), ext_at(&sb, at));
             s.extend(p.0);
         }
@@ -595,24 +740,22 @@ impl Aggregator {
         let b_tx: [Cell; HASH_LEN] = core::array::from_fn(|j| sb[st::TX_HASH + j]);
         let left = c.zero();
         s.extend(c.merkle_step(a_tx, b_tx, left));
-        // State: chain when both have one, else whichever has one.
-        let (ha, hb) = (sa[st::HAS_STATE], sb[st::HAS_STATE]);
-        let both = c.mul(ha, hb);
-        let either = c.add(ha, hb);
-        let h = c.sub(either, both);
-        s.push(h);
-        let mut fields = vec![c.zero(); st::LEN - st::STATE];
-        for (old, new, len) in st::LINKS {
-            for j in 0..len {
-                let d = c.sub(sa[new + j], sb[old + j]);
-                let gated = c.mul(both, d);
-                c.assert_zero(gated);
-                // Start: a's if it has a state; end: b's if it has one.
-                fields[old - st::STATE + j] = select(c, ha, sb[old + j], sa[old + j]);
-                fields[new - st::STATE + j] = select(c, hb, sa[new + j], sb[new + j]);
-            }
-        }
-        s.extend(fields);
+        s.extend(Self::chain(
+            c,
+            &sa,
+            &sb,
+            st::HAS_STATE,
+            st::STATE_IN,
+            st::STATE_OUT,
+        ));
+        s.extend(Self::chain(
+            c,
+            &sa,
+            &sb,
+            st::HAS_STREAM,
+            st::STREAM_IN,
+            st::STREAM_OUT,
+        ));
         let public = publish(c, &s);
         (circuit, public)
     }
@@ -630,15 +773,40 @@ impl Aggregator {
         })
     }
 
-    /// Wraps a sub-block proof with public values `public`.
-    pub fn prove_sub_block(
+    /// Wraps a proof of item chunk shape `shape` with public values
+    /// `public`.
+    pub fn prove_items(
         &self,
+        shape: usize,
         public: &[BabyBear],
         proof: &StarkProof,
     ) -> Result<NodeProof, AggError> {
-        let (c, cells) =
-            Self::leaf_sub_circuit(&self.params, &self.sub, self.merge_key(), public, proof);
-        self.prove_node(Kind::SubBlock, &c, &cells)
+        let (c, cells) = Self::leaf_items_circuit(
+            &self.params,
+            &self.items[shape],
+            self.merge_key(),
+            public,
+            proof,
+        );
+        self.prove_node(Kind::Items(shape), &c, &cells)
+    }
+
+    /// Wraps a proof of signature chunk shape `shape` with public values
+    /// `public`.
+    pub fn prove_sigs(
+        &self,
+        shape: usize,
+        public: &[BabyBear],
+        proof: &StarkProof,
+    ) -> Result<NodeProof, AggError> {
+        let (c, cells) = Self::leaf_sigs_circuit(
+            &self.params,
+            &self.sigs[shape],
+            self.merge_key(),
+            public,
+            proof,
+        );
+        self.prove_node(Kind::Sigs(shape), &c, &cells)
     }
 
     /// Wraps a state-segment proof with public values `public`.
@@ -652,7 +820,8 @@ impl Aggregator {
         self.prove_node(Kind::Segment, &c, &cells)
     }
 
-    /// Merges two nodes; `a`'s state change (if any) comes first.
+    /// Merges two nodes; `a`'s state change and item stream (if any) come
+    /// first.
     pub fn merge(&self, a: &NodeProof, b: &NodeProof) -> Result<NodeProof, AggError> {
         let (c, cells) = self.merge_circuit(a, b);
         self.prove_node(Kind::Merge, &c, &cells)
@@ -681,9 +850,15 @@ impl Aggregator {
             .map_err(AggError::Stark)
     }
 
-    /// Rows each node circuit uses, out of `2^log_height`.
-    pub fn used_rows(&self) -> [usize; 3] {
-        [&self.leaf_sub, &self.leaf_seg, &self.merge].map(|n| n.air.used_rows())
+    /// Rows each node circuit uses: the item chunk leaves (by shape), the
+    /// signature chunk leaves, the segment leaf, the merge.
+    pub fn used_rows(&self) -> Vec<usize> {
+        self.leaf_items
+            .iter()
+            .chain(&self.leaf_sigs)
+            .chain([&self.leaf_seg, &self.merge])
+            .map(|n| n.air.used_rows())
+            .collect()
     }
 }
 
@@ -691,12 +866,12 @@ impl Aggregator {
 mod tests {
     use super::*;
     use crate::db::test::TempEnv;
-    use crate::hash;
+    use crate::item_chunk_air::{Item, output_element, product, stream};
     use crate::output::{Amount, NONCE_LEN, Output, OutputRecord};
     use crate::rng::Rng;
+    use crate::stark::ProvingKey;
     use crate::state::StateTree;
     use crate::state_air::{InsertOp, SegmentStart};
-    use crate::subblock_air::{output_element, product};
     use crate::transaction::{Transaction, TxBody};
 
     const LAMBDA: BabyBear4 = BabyBear4::new([3, 5, 7, 11]);
@@ -751,10 +926,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn hashes_match_in_and_out_of_circuit() {
+        let state = State {
+            root: [BabyBear::new(4); HASH_LEN],
+            size: (1 << 33) + 5,
+        };
+        let (ins, sp) = ([BabyBear::new(7); HASH_LEN], [BabyBear::new(9); HASH_LEN]);
+        let mut c = Circuit::new();
+        let (lo, hi) = state::split(state.size);
+        let mut fields = state.root.to_vec();
+        fields.extend([lo, hi]);
+        fields.extend(ins);
+        fields.extend(sp);
+        let cells = inputs(&mut c, &fields);
+        let h = state_hash_cells(&mut c, &cells);
+        assert_eq!(h.map(|x| c.value(x)), state_hash(&state, &ins, &sp));
+        let b = Boundary {
+            cnt_out: 3,
+            ..Boundary::IDLE
+        };
+        let cells = inputs(&mut c, &b.elements());
+        let h = stream_hash_cells(&mut c, &cells);
+        assert_eq!(h.map(|x| c.value(x)), stream_hash(&b));
+    }
+
     struct Setup {
         params: FriParams,
-        sub: SubBlockAir,
-        sub_pk: ProvingKey,
+        items: ItemChunkAir,
+        items_pk: ProvingKey,
+        sigs: SigChunkAir,
+        sigs_pk: ProvingKey,
         seg: StateSegmentAir,
         seg_pk: ProvingKey,
         agg: Aggregator,
@@ -763,18 +965,25 @@ mod tests {
     impl Setup {
         fn new() -> Self {
             let params = FriParams::default();
-            let sub = SubBlockAir {
-                inputs: 1,
-                outputs: 2,
-            };
+            let items = crate::block::ITEM_SHAPES[0];
+            let sigs = SigChunkAir { slots: 1 };
             let seg = StateSegmentAir {
                 inserts: 3,
                 spends: 1,
             };
-            let (sub_pk, sub_vk) = stark::setup(&params, &sub);
+            let (items_pk, items_vk) = stark::setup(&params, &items);
+            let (sigs_pk, sigs_vk) = stark::setup(&params, &sigs);
             let (seg_pk, seg_vk) = stark::setup(&params, &seg);
             let t = std::time::Instant::now();
-            let agg = Aggregator::new(params, sub, sub_vk, seg, seg_vk, 15);
+            let agg = Aggregator::new(
+                params,
+                vec![(items, items_vk)],
+                vec![(sigs, sigs_vk)],
+                seg,
+                seg_vk,
+                15,
+                &KeyCache::none(),
+            );
             eprintln!(
                 "setup {:.1} s, rows used {:?}",
                 t.elapsed().as_secs_f64(),
@@ -782,22 +991,33 @@ mod tests {
             );
             Self {
                 params,
-                sub,
-                sub_pk,
+                items,
+                items_pk,
+                sigs,
+                sigs_pk,
                 seg,
                 seg_pk,
                 agg,
             }
         }
 
-        fn sub_block(&self, tx: &Transaction, lambda: BabyBear4) -> NodeProof {
+        fn items(&self, items: &[Item], entry: &Boundary) -> NodeProof {
             let blinding = [BabyBear::new(77); HASH_LEN];
-            let (t, public) = self.sub.trace(tx, &blinding, lambda, R, &mut Rng::from_seed(1));
-            let proof = stark::prove(&self.params, &self.sub_pk, &self.sub, t, &public);
+            let (t, public) = self.items.trace(items, entry, &blinding, LAMBDA, R);
+            let proof = stark::prove(&self.params, &self.items_pk, &self.items, t, &public);
             let time = std::time::Instant::now();
-            let node = self.agg.prove_sub_block(&public, &proof).unwrap();
-            eprintln!("sub-block leaf {:.1} s", time.elapsed().as_secs_f64());
+            let node = self.agg.prove_items(0, &public, &proof).unwrap();
+            eprintln!("item leaf {:.1} s", time.elapsed().as_secs_f64());
             node
+        }
+
+        fn no_sigs(&self) -> NodeProof {
+            let blinding = [BabyBear::new(78); HASH_LEN];
+            let (t, public) = self
+                .sigs
+                .trace(&[], &blinding, LAMBDA, R, &mut Rng::from_seed(2));
+            let proof = stark::prove(&self.params, &self.sigs_pk, &self.sigs, t, &public);
+            self.agg.prove_sigs(0, &public, &proof).unwrap()
         }
 
         /// Inserts `records` (sorted) into `tree` as one segment.
@@ -806,7 +1026,7 @@ mod tests {
             env: &TempEnv,
             tree: &StateTree,
             records: &[OutputRecord],
-        ) -> (NodeProof, State, State) {
+        ) -> (NodeProof, State, State, Hash) {
             let mut txn = env.env().write_txn().unwrap();
             let before = tree.state(&txn).unwrap();
             let mut records = records.to_vec();
@@ -815,6 +1035,7 @@ mod tests {
                     .unwrap()
                     .map(|x| x.as_u32())
             });
+            let last = crate::state::key_of(&records.last().unwrap().commitment).unwrap();
             let ops: Vec<InsertOp> = records
                 .into_iter()
                 .map(|record| InsertOp {
@@ -831,10 +1052,8 @@ mod tests {
             };
             let (t, public) = self.seg.trace(&start, &ops, &[], LAMBDA, R);
             let proof = stark::prove(&self.params, &self.seg_pk, &self.seg, t, &public);
-            let time = std::time::Instant::now();
             let node = self.agg.prove_segment(&public, &proof).unwrap();
-            eprintln!("segment leaf {:.1} s", time.elapsed().as_secs_f64());
-            (node, before, after)
+            (node, before, after, last)
         }
 
         fn merge(&self, a: &NodeProof, b: &NodeProof) -> NodeProof {
@@ -845,55 +1064,59 @@ mod tests {
         }
     }
 
-    /// The full pipeline: two reward sub-blocks and the segment inserting
-    /// their outputs, merged into one proof, and a merge of a merge.
+    /// Two rewards streamed across two item chunks, a segment inserting
+    /// their outputs and an empty signature chunk, merged into one proof.
     #[test]
     #[ignore = "slow: run in release"]
-    fn aggregates_sub_blocks_and_a_segment() {
+    fn aggregates_chunks_and_a_segment() {
         let s = Setup::new();
         let tx1 = reward(vec![out(1, 50), out(2, 0x1_0000_ffff)]);
         let tx2 = reward(vec![out(3, 0xffff)]);
-        let records: Vec<OutputRecord> = [&tx1, &tx2]
+        let txs = [tx1, tx2];
+        let records: Vec<OutputRecord> = txs
             .iter()
             .flat_map(|t| t.body.outputs.iter().map(|o| o.record().unwrap()))
             .collect();
+        let items = stream(&txs);
+        assert_eq!(items.len(), 7);
 
         let env = TempEnv::new();
         let tree = StateTree::open(env.env()).unwrap();
-        let (seg, before, after) = s.segment(&env, &tree, &records);
-        let sub1 = s.sub_block(&tx1, LAMBDA);
-        let sub2 = s.sub_block(&tx2, LAMBDA);
-        for leaf in [&seg, &sub1, &sub2] {
+        let (seg, before, after, last) = s.segment(&env, &tree, &records);
+        // Cut inside the first transaction, after its first output.
+        let mid = items[..2].iter().fold(Boundary::IDLE, |b, i| b.after(i));
+        let chunk1 = s.items(&items[..2], &Boundary::IDLE);
+        let chunk2 = s.items(&items[2..], &mid);
+        let sigs = s.no_sigs();
+        for leaf in [&seg, &chunk1, &chunk2, &sigs] {
             assert_eq!(s.agg.verify_node(leaf), Ok(()));
         }
 
-        let m1 = s.merge(&sub1, &seg);
-        let top = s.merge(&m1, &sub2);
-        assert_eq!(s.agg.verify(&m1.statement, &m1.proof), Ok(()));
+        let m1 = s.merge(&seg, &chunk1);
+        let m2 = s.merge(&chunk2, &sigs);
+        let top = s.merge(&m1, &m2);
         assert_eq!(s.agg.verify(&top.statement, &top.proof), Ok(()));
 
         let st = &top.statement;
         assert_eq!(st.vk(), s.agg.merge_key());
         assert_eq!((st.lambda(), st.r()), (LAMBDA, R));
         // The transactions create exactly what the segment inserts.
-        assert_eq!((st.q_in(), st.q_out()), (BabyBear4::ONE, BabyBear4::ONE));
+        assert_eq!(
+            (st.q_in(), st.q_out(), st.q_sig()),
+            (BabyBear4::ONE, BabyBear4::ONE, BabyBear4::ONE)
+        );
+        assert_eq!(st.net(), 50 + 0x1_0000_ffff + 0xffff);
+        let zero = [BabyBear::ZERO; HASH_LEN];
+        assert!(st.has_state() && st.has_stream());
+        assert_eq!(st.state_in(), state_hash(&before, &zero, &zero));
+        assert_eq!(st.state_out(), state_hash(&after, &last, &zero));
+        assert_eq!(st.stream_in(), stream_hash(&Boundary::IDLE));
+        assert_eq!(st.stream_out(), stream_hash(&Boundary::IDLE));
         let p_out = product(
             R,
             records.iter().map(|r| output_element(LAMBDA, r).unwrap()),
         );
-        assert_eq!(m1.statement.q_out(), sub1.statement.q_out() * p_out.inverse().unwrap());
-        assert_eq!(st.net(), 50 + 0x1_0000_ffff + 0xffff);
-        // Transaction hashes merge in tree order; the segment's is zero.
-        let zero = [BabyBear::ZERO; HASH_LEN];
-        let m1_tx = crate::hash::merge(&sub1.statement.tx_hash(), &zero);
-        assert_eq!(m1.statement.tx_hash(), m1_tx);
-        assert_eq!(
-            st.tx_hash(),
-            crate::hash::merge(&m1_tx, &sub2.statement.tx_hash())
-        );
-        assert!(st.has_state());
-        assert_eq!((st.old_state(), st.new_state()), (before, after));
-        assert_eq!(st.prev_spend_out(), [BabyBear::ZERO; HASH_LEN]);
+        assert_eq!(chunk1.statement.q_out() * chunk2.statement.q_out(), p_out);
 
         // Tampered statements and keys are rejected.
         let mut bad = st.clone();
@@ -906,13 +1129,13 @@ mod tests {
         bad.0[st::VK] += BabyBear::ONE;
         assert_eq!(s.agg.verify(&bad, &top.proof), Err(AggError::WrongKey));
         // A leaf isn't a final proof.
-        assert!(s.agg.verify(&sub1.statement, &sub1.proof).is_err());
-
-        // Children must agree on the challenges.
-        let other = s.sub_block(&tx2, LAMBDA + BabyBear4::ONE);
-        assert_eq!(s.agg.merge(&m1, &other).err(), Some(AggError::Invalid));
+        assert!(s.agg.verify(&chunk1.statement, &chunk1.proof).is_err());
+        // Chunks must chain: the first chunk stops mid-transaction, where
+        // it doesn't start, so it can't follow itself.
+        assert_ne!(chunk1.statement.stream_out(), stream_hash(&Boundary::IDLE));
+        assert_eq!(s.agg.merge(&chunk1, &chunk1).err(), Some(AggError::Invalid));
         // A child claimed under the wrong key doesn't verify.
-        let mut wrong = sub2.clone();
+        let mut wrong = chunk2.clone();
         wrong.kind = Kind::Segment;
         assert_eq!(s.agg.merge(&m1, &wrong).err(), Some(AggError::Invalid));
         // Two segments must chain.

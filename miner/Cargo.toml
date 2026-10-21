@@ -3,6 +3,10 @@ name = "r"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "genesis"
+path = "tools/genesis.rs"
+
 [dependencies]
 heed = { version = "0.20", default-features = false }
 

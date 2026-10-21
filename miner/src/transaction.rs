@@ -15,8 +15,8 @@ use std::fmt;
 
 use crate::babybear::BabyBear;
 use crate::hash::{self, DOMAIN_SLOT, HASH_LEN, Hash, domain};
-use crate::poseidon2::{self, WIDTH};
 use crate::output::{self, Amount, Commitment, Nonce, Output, OutputHash};
+use crate::poseidon2::{self, WIDTH};
 use crate::wots::{self, PublicKey, SecretKey, Signature};
 
 /// The pubkey hash an output pays to: `H(pubkey)` as bytes.
@@ -84,7 +84,8 @@ pub(crate) fn digest_of(inputs: &[(Hash, u64)], outputs: &[Hash]) -> Hash {
         state[HASH_LEN] = BabyBear::new(nin);
         state[HASH_LEN + 1] = BabyBear::new(nout);
         state[DOMAIN_SLOT] = BabyBear::new(domain::TX_BODY);
-        state[DOMAIN_SLOT + 1] = BabyBear::new((HASH_LEN as u32 + 2) * nin + HASH_LEN as u32 * nout);
+        state[DOMAIN_SLOT + 1] =
+            BabyBear::new((HASH_LEN as u32 + 2) * nin + HASH_LEN as u32 * nout);
         let mut absorb = |block: &[BabyBear]| {
             for (x, &v) in state.iter_mut().zip(block) {
                 *x += v;

@@ -41,7 +41,7 @@ use crate::challenger::Challenger;
 use crate::fri::{self, FriError, FriParams, FriProof};
 use crate::hash::Hash;
 use crate::matrix::RowMajorMatrix;
-use crate::merkle::{self, MerklePath, MerkleTree};
+use crate::merkle::{self, MerkleLayers, MerklePath, MerkleTree};
 use crate::ntt;
 use crate::par::par_map;
 use crate::rng::Rng;
@@ -101,11 +101,28 @@ pub struct ProvingKey {
     preprocessed: Option<Preprocessed>,
 }
 
+/// The committed preprocessed columns: their coefficients and the tree's
+/// hash layers. The extension itself (the tree's leaves) isn't kept: each
+/// proof recomputes it from the coefficients (a fraction of a second) and
+/// drops it, which saves about half a gigabyte per recursion-node key.
 #[derive(Clone, Debug)]
 struct Preprocessed {
     log_n: u32,
     coeffs: RowMajorMatrix,
-    tree: MerkleTree,
+    layers: MerkleLayers,
+}
+
+impl Preprocessed {
+    /// The low-degree extension the layers commit to.
+    fn extension(&self, params: &FriParams) -> RowMajorMatrix {
+        preprocessed_extension(params, &self.coeffs)
+    }
+}
+
+/// The preprocessed columns' extension, from their coefficients: the same
+/// LDE domain as the masked trace (`N * blowup = n * 2 * blowup`).
+fn preprocessed_extension(params: &FriParams, coeffs: &RowMajorMatrix) -> RowMajorMatrix {
+    ntt::coset_extend(coeffs.clone(), params.log_blowup + 1, SHIFT)
 }
 
 /// What a verifier needs to know about an AIR beyond its constraints.
@@ -186,7 +203,14 @@ impl StarkProof {
             fn ext(&mut self) -> Option<Vec<BabyBear4>> {
                 let n = self.len()?;
                 (0..n)
-                    .map(|_| Some(BabyBear4([self.one()?, self.one()?, self.one()?, self.one()?])))
+                    .map(|_| {
+                        Some(BabyBear4([
+                            self.one()?,
+                            self.one()?,
+                            self.one()?,
+                            self.one()?,
+                        ]))
+                    })
                     .collect()
             }
             fn path(&mut self) -> Option<MerklePath> {
@@ -394,7 +418,7 @@ impl ProvingKey {
     pub fn verifying_key(&self) -> VerifyingKey {
         VerifyingKey {
             preprocessed: self.preprocessed.as_ref().map(|p| PreprocessedCommitment {
-                root: p.tree.root(),
+                root: p.layers.root(),
                 log_n: p.log_n,
             }),
         }
@@ -404,41 +428,226 @@ impl ProvingKey {
 /// Commits to `air`'s preprocessed columns, if any.
 ///
 /// # Panics
-/// If the preprocessed columns' width is not `air.preprocessed_width()` or
-/// their height is not a power of two of at least 2.
+/// If the preprocessed trace's shape is wrong.
 pub fn setup<A: Air>(params: &FriParams, air: &A) -> (ProvingKey, VerifyingKey) {
-    let preprocessed = air.preprocessed_trace().map(|m| {
-        assert_eq!(
-            m.width,
-            air.preprocessed_width(),
-            "preprocessed width mismatch"
-        );
-        let n = m.height();
-        assert!(
-            n >= 2 && n.is_power_of_two(),
-            "preprocessed height must be a power of two >= 2"
-        );
-        let mut coeffs = m;
-        ntt::intt(&mut coeffs);
-        // Same LDE domain as the masked trace: N * blowup = n * 2 * blowup.
-        let tree = MerkleTree::new(ntt::coset_extend(
-            coeffs.clone(),
-            params.log_blowup + 1,
-            SHIFT,
-        ));
-        Preprocessed {
-            log_n: n.trailing_zeros(),
-            coeffs,
-            tree,
-        }
-    });
-    assert!(
-        preprocessed.is_some() || air.preprocessed_width() == 0,
-        "AIR declares preprocessed columns but provides none"
-    );
-    let pk = ProvingKey { preprocessed };
+    let pk = ProvingKey {
+        preprocessed: preprocessed_trace(air).map(|m| commit_preprocessed(params, m)),
+    };
     let vk = pk.verifying_key();
     (pk, vk)
+}
+
+fn preprocessed_trace<A: Air>(air: &A) -> Option<RowMajorMatrix> {
+    let m = air.preprocessed_trace();
+    assert!(
+        m.is_some() || air.preprocessed_width() == 0,
+        "AIR declares preprocessed columns but provides none"
+    );
+    let m = m?;
+    assert_eq!(
+        m.width,
+        air.preprocessed_width(),
+        "preprocessed width mismatch"
+    );
+    let n = m.height();
+    assert!(
+        n >= 2 && n.is_power_of_two(),
+        "preprocessed height must be a power of two >= 2"
+    );
+    Some(m)
+}
+
+fn commit_preprocessed(params: &FriParams, m: RowMajorMatrix) -> Preprocessed {
+    let log_n = m.height().trailing_zeros();
+    let mut coeffs = m;
+    ntt::intt(&mut coeffs);
+    let layers = MerkleTree::new(preprocessed_extension(params, &coeffs)).into_layers();
+    Preprocessed {
+        log_n,
+        coeffs,
+        layers,
+    }
+}
+
+/// Verifying keys remembered across runs.
+///
+/// A key's preprocessed commitment costs a low-degree extension and a
+/// Merkle tree of the preprocessed columns (about a second for a recursion
+/// node), and keeping the proving key holds that extension in memory. The
+/// cache maps a cheap fingerprint of the columns (a hash of their rows and
+/// the blowup) to the commitment's root, so a verifier never builds the
+/// extension and a prover builds it only for the keys it uses
+/// ([`LazyKey`]). Entries carry a checksum; bad lines are ignored. A wrong
+/// root that passes the checksum is caught when the proving key is built.
+pub struct KeyCache {
+    path: Option<std::path::PathBuf>,
+    roots: std::sync::Mutex<std::collections::HashMap<Hash, Hash>>,
+    changed: std::sync::atomic::AtomicBool,
+}
+
+impl KeyCache {
+    /// No cache: every key is computed.
+    pub fn none() -> Self {
+        Self {
+            path: None,
+            roots: Default::default(),
+            changed: Default::default(),
+        }
+    }
+
+    /// The cache in file `path` (empty if it doesn't exist or can't be
+    /// read).
+    pub fn open(path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
+        let mut roots = std::collections::HashMap::new();
+        for line in std::fs::read_to_string(&path).unwrap_or_default().lines() {
+            if let Some((fp, root)) = Self::parse(line) {
+                roots.insert(fp, root);
+            }
+        }
+        Self {
+            path: Some(path),
+            roots: std::sync::Mutex::new(roots),
+            changed: Default::default(),
+        }
+    }
+
+    fn check(fp: &Hash, root: &Hash) -> BabyBear {
+        crate::hash::sponge(crate::hash::domain::KEY_CACHE, &[], &[fp, root])[0]
+    }
+
+    fn parse(line: &str) -> Option<(Hash, Hash)> {
+        let v: Vec<u32> = line
+            .split_whitespace()
+            .map(|w| w.parse().ok())
+            .collect::<Option<_>>()?;
+        if v.len() != 2 * crate::hash::HASH_LEN + 1 || v.iter().any(|&x| x >= crate::babybear::P) {
+            return None;
+        }
+        let fp: Hash = core::array::from_fn(|j| BabyBear::new(v[j]));
+        let root: Hash = core::array::from_fn(|j| BabyBear::new(v[8 + j]));
+        (Self::check(&fp, &root).as_u32() == v[16]).then_some((fp, root))
+    }
+
+    /// `air`'s fingerprint under `params`.
+    fn fingerprint(params: &FriParams, m: &RowMajorMatrix) -> Hash {
+        let rows = MerkleTree::new(m.clone()).root();
+        let shape = [
+            BabyBear::new(m.height().trailing_zeros()),
+            BabyBear::new(m.width as u32),
+            BabyBear::new(params.log_blowup),
+        ];
+        crate::hash::sponge(crate::hash::domain::KEY_CACHE, &[], &[&rows, &shape])
+    }
+
+    /// Writes the cache back if it changed.
+    pub fn save(&self) -> std::io::Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        if !self
+            .changed
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(());
+        }
+        let roots = self.roots.lock().expect("key cache lock");
+        let mut text = String::new();
+        for (fp, root) in roots.iter() {
+            for x in fp.iter().chain(root) {
+                text.push_str(&x.as_u32().to_string());
+                text.push(' ');
+            }
+            text.push_str(&Self::check(fp, root).as_u32().to_string());
+            text.push('\n');
+        }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(tmp, path)
+    }
+}
+
+/// A key whose verifying half is known and whose proving half is built on
+/// first use.
+pub struct LazyKey {
+    vk: VerifyingKey,
+    pk: std::sync::OnceLock<ProvingKey>,
+}
+
+impl LazyKey {
+    /// `air`'s key under `params`: the verifying key from `cache` if it's
+    /// there (the proving key then waits for [`LazyKey::proving_key`]),
+    /// else both, computed now.
+    pub fn new<A: Air>(cache: &KeyCache, params: &FriParams, air: &A) -> Self {
+        let Some(m) = preprocessed_trace(air) else {
+            let pk = ProvingKey { preprocessed: None };
+            return Self {
+                vk: pk.verifying_key(),
+                pk: pk.into(),
+            };
+        };
+        let fp = KeyCache::fingerprint(params, &m);
+        let log_n = m.height().trailing_zeros();
+        let hit = cache
+            .roots
+            .lock()
+            .expect("key cache lock")
+            .get(&fp)
+            .copied();
+        if let Some(root) = hit {
+            return Self {
+                vk: VerifyingKey {
+                    preprocessed: Some(PreprocessedCommitment { root, log_n }),
+                },
+                pk: std::sync::OnceLock::new(),
+            };
+        }
+        let pk = ProvingKey {
+            preprocessed: Some(commit_preprocessed(params, m)),
+        };
+        let vk = pk.verifying_key();
+        let root = vk.preprocessed.expect("preprocessed columns").root;
+        cache.roots.lock().expect("key cache lock").insert(fp, root);
+        cache
+            .changed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Self { vk, pk: pk.into() }
+    }
+
+    /// A key with only its verifying half, for laying out circuits that
+    /// verify proofs under it. Its proving key is never built.
+    pub fn verifying_only(vk: VerifyingKey) -> Self {
+        Self {
+            vk,
+            pk: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub fn verifying_key(&self) -> &VerifyingKey {
+        &self.vk
+    }
+
+    /// The proving key for `air` (the AIR this key was made for), built on
+    /// the first call.
+    ///
+    /// # Panics
+    /// If the built key doesn't match the verifying key: the key cache
+    /// holds a wrong root.
+    pub fn proving_key<A: Air>(&self, params: &FriParams, air: &A) -> &ProvingKey {
+        self.pk.get_or_init(|| {
+            let (pk, vk) = setup(params, air);
+            assert_eq!(
+                vk, self.vk,
+                "a cached verifying key is wrong: delete the key cache"
+            );
+            pk
+        })
+    }
+
+    /// Whether the proving key has been built.
+    pub fn is_built(&self) -> bool {
+        self.pk.get().is_some()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -585,7 +794,8 @@ pub fn prove_with_rng<A: Air>(
     );
     let log_blowup = params.log_blowup;
     let pre = pk.preprocessed.as_ref();
-    let pre_row = |i: usize| pre.map_or(&[][..], |p| p.tree.matrix().row(i));
+    let pre_lde = pre.map(|p| p.extension(params));
+    let pre_row = |i: usize| pre_lde.as_ref().map_or(&[][..], |m| m.row(i));
 
     let mut ch = Challenger::new();
     observe_instance(&mut ch, air, &pk.verifying_key(), layout.log_n, public);
@@ -720,8 +930,9 @@ pub fn prove_with_rng<A: Air>(
         .iter()
         .map(|&i| {
             let (trace_row, trace_path) = trace_tree.open(i);
-            let (preprocessed_row, preprocessed_path) =
-                pre.map_or_else(Default::default, |p| p.tree.open(i));
+            let (preprocessed_row, preprocessed_path) = pre.map_or_else(Default::default, |p| {
+                (pre_row(i).to_vec(), p.layers.path(i))
+            });
             let (aux_row, aux_path) = aux_tree
                 .as_ref()
                 .map_or_else(Default::default, |t| t.open(i));
@@ -765,7 +976,7 @@ pub fn prove_with_rng<A: Air>(
     }
 }
 
-/// Prints phase times when `STARK_PROFILE` is set.
+/// Prints phase times (and resident memory) when `STARK_PROFILE` is set.
 struct Timer(Option<std::time::Instant>);
 
 impl Timer {
@@ -775,7 +986,15 @@ impl Timer {
 
     fn lap(&mut self, phase: &str) {
         if let Some(t) = &mut self.0 {
-            eprintln!("  {phase}: {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+            // Resident memory, where the system reports it.
+            let rss = std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|st| {
+                    let line = st.lines().find(|l| l.starts_with("VmRSS"))?;
+                    line.split_whitespace().nth(1)?.parse::<u64>().ok()
+                })
+                .map_or(String::new(), |kb| format!(", {} MB resident", kb / 1024));
+            eprintln!("  {phase}: {:.0} ms{rss}", t.elapsed().as_secs_f64() * 1e3);
             *t = std::time::Instant::now();
         }
     }
@@ -1229,6 +1448,58 @@ mod tests {
             grinding_bits: 4,
             ..FriParams::default()
         }
+    }
+
+    #[test]
+    fn key_cache_round_trips_and_checks_lines() {
+        use crate::item_chunk_air::ItemChunkAir;
+        let dir = crate::db::test::TempEnv::new();
+        let path = dir.path.join("keys");
+        let p = params();
+        let air = ItemChunkAir { items: 8 };
+        let (_, vk) = setup(&p, &air);
+
+        // A miss computes both halves and records the root.
+        let cache = KeyCache::open(&path);
+        let key = LazyKey::new(&cache, &p, &air);
+        assert!(key.is_built());
+        assert_eq!(*key.verifying_key(), vk);
+        cache.save().unwrap();
+
+        // Reloaded: the verifying key comes from the file, the proving key
+        // waits until it's asked for.
+        let cache = KeyCache::open(&path);
+        let key = LazyKey::new(&cache, &p, &air);
+        assert!(!key.is_built());
+        assert_eq!(*key.verifying_key(), vk);
+        key.proving_key(&p, &air);
+        assert!(key.is_built());
+        // Another blowup is another key.
+        let other = FriParams { log_blowup: 4, ..p };
+        assert!(LazyKey::new(&cache, &other, &air).is_built());
+
+        // A damaged line is ignored.
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("1{text}")).unwrap();
+        assert!(LazyKey::new(&KeyCache::open(&path), &p, &air).is_built());
+    }
+
+    #[test]
+    #[should_panic(expected = "cached verifying key is wrong")]
+    fn a_wrong_cached_root_is_caught() {
+        use crate::item_chunk_air::ItemChunkAir;
+        let p = params();
+        let air = ItemChunkAir { items: 8 };
+        let fp = KeyCache::fingerprint(&p, &preprocessed_trace(&air).unwrap());
+        let cache = KeyCache::none();
+        cache
+            .roots
+            .lock()
+            .unwrap()
+            .insert(fp, [BabyBear::ONE; crate::hash::HASH_LEN]);
+        let key = LazyKey::new(&cache, &p, &air);
+        assert!(!key.is_built());
+        key.proving_key(&p, &air);
     }
 
     /// Runs `setup` first; seeded masks.

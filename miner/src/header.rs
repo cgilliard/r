@@ -57,9 +57,9 @@ pub struct Consensus {
 
 impl Consensus {
     pub const DEFAULT: Self = Self {
-        genesis_time: 0,
+        genesis_time: crate::genesis::TIMESTAMP,
         // 2^84.72: about 2^23.3 expected hashes, under half a minute on one
-        // dev machine. Low for development.
+        // desktop. To be raised before launch.
         genesis_log_target: (84 << FRAC_BITS) + 42406,
         spacing: 600,
         // About 36 hours.
@@ -128,15 +128,16 @@ pub const WORK_LIMB_BITS: u32 = 12;
 /// Limbs of a work value: 144 bits.
 pub const WORK_LIMBS: usize = 12;
 
-/// The work a block mined at `log_target` adds to its chain:
-/// `(2^17 - frac) * 2^(108 - int)` for the log-target's parts, in units of
-/// `2^-17` expected hashes. At octave boundaries this is exactly
-/// `2^17 * MAX_TARGET / target`; between them it's linear (within 12.5%),
-/// which keeps it cheap to prove and still decreasing in the target.
+/// The work a block mined at `log_target` adds to its chain: its expected
+/// hashes, `MAX_TARGET / target`, in units of `2^-17` hashes. With the
+/// target `(2^16 + frac) * 2^(int - 16)` ([`target_of`]) that is
+/// `floor(2^33 / (2^16 + frac)) * 2^(108 - int)`: exact at octave
+/// boundaries, and below the exact value by less than `2^-16` in between
+/// (the quotient's rounding). Never increasing in the target.
 pub fn work(log_target: i64) -> u128 {
     let l = log_target.clamp(MIN_LOG_TARGET, MAX_LOG_TARGET);
     let (int, frac) = ((l >> FRAC_BITS) as u32, (l & 0xffff) as u128);
-    ((1 << (FRAC_BITS + 1)) - frac) << (VALUE_BITS - int)
+    ((1u128 << (2 * FRAC_BITS + 1)) / ((1 << FRAC_BITS) + frac)) << (VALUE_BITS - int)
 }
 
 /// `w` as [`WORK_LIMBS`] limbs of [`WORK_LIMB_BITS`] bits.
@@ -144,7 +145,11 @@ pub fn work_limbs(w: u128) -> [crate::babybear::BabyBear; WORK_LIMBS] {
     let mask = (1 << WORK_LIMB_BITS) - 1;
     core::array::from_fn(|k| {
         let shift = WORK_LIMB_BITS as usize * k;
-        crate::babybear::BabyBear::new(if shift < 128 { (w >> shift) as u32 & mask } else { 0 })
+        crate::babybear::BabyBear::new(if shift < 128 {
+            (w >> shift) as u32 & mask
+        } else {
+            0
+        })
     })
 }
 
@@ -352,9 +357,9 @@ pub fn check_new(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pow::MAX_TARGET;
     use crate::babybear::BabyBear;
     use crate::hash::HASH_LEN;
+    use crate::pow::MAX_TARGET;
 
     fn header(height: u64, timestamp: u64) -> Header {
         Header {
@@ -462,11 +467,18 @@ mod tests {
             let l = int << FRAC_BITS;
             assert_eq!(work(l), (MAX_TARGET / target_of(l)) << 17, "{int}");
         }
-        // Decreasing in the log-target.
+        // Within 2^-16 below the exact expected hashes, everywhere, and
+        // never increasing in the target.
         let mut last = u128::MAX;
         for l in (40 << FRAC_BITS)..(42 << FRAC_BITS) {
-            assert!(work(l) < last);
-            last = work(l);
+            let w = work(l);
+            let exact = (MAX_TARGET << 17) as f64 / target_of(l) as f64;
+            assert!(
+                w as f64 <= exact && w as f64 >= exact * (1.0 - 1.0 / 65536.0),
+                "{l}"
+            );
+            assert!(w <= last);
+            last = w;
         }
         for w in [0, 1, 4095, 4096, work(MIN_LOG_TARGET), u128::MAX] {
             assert_eq!(work_value(&work_limbs(w)), Some(w));
@@ -527,8 +539,14 @@ mod tests {
             check(&c, data, parent, &bad)
         };
         assert_eq!(reject(&|b| b.height += 1), Err(HeaderError::Height));
-        assert_eq!(reject(&|b| b.prev = chain[3].hash()), Err(HeaderError::Prev));
-        assert_eq!(reject(&|b| b.timestamp = parent.timestamp), Err(HeaderError::TooOld));
+        assert_eq!(
+            reject(&|b| b.prev = chain[3].hash()),
+            Err(HeaderError::Prev)
+        );
+        assert_eq!(
+            reject(&|b| b.timestamp = parent.timestamp),
+            Err(HeaderError::TooOld)
+        );
         // Another nonce almost surely misses an easy-but-not-trivial target.
         let target = c.target(parent);
         let bad_nonce = (h.nonce + 1..)
@@ -539,6 +557,9 @@ mod tests {
             check_new(&c, data, parent, &h, h.timestamp - c.max_future - 1),
             Err(HeaderError::TooNew)
         );
-        assert_eq!(check_new(&c, data, parent, &h, h.timestamp - c.max_future), Ok(()));
+        assert_eq!(
+            check_new(&c, data, parent, &h, h.timestamp - c.max_future),
+            Ok(())
+        );
     }
 }

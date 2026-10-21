@@ -19,6 +19,7 @@
 //! opening per round.
 
 use std::ops::Range;
+use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
@@ -65,11 +66,72 @@ pub struct Dataset {
     items: Vec<Item>,
 }
 
+static DATASET: OnceLock<Dataset> = OnceLock::new();
+
+/// Bytes of a dataset file: every item's elements, little-endian `u32`s.
+const FILE_BYTES: usize = ITEMS * HASH_LEN * 4;
+
 impl Dataset {
     /// The shared dataset, built on first use.
     pub fn get() -> &'static Dataset {
-        static DATASET: OnceLock<Dataset> = OnceLock::new();
         DATASET.get_or_init(Dataset::build)
+    }
+
+    /// The shared dataset and its tree, loaded from the file `path` if it
+    /// holds the dataset (its tree's root must be [`ROOT`], which checks
+    /// every item), else built and written there. Also says whether it was
+    /// loaded.
+    pub fn load(path: &Path) -> (&'static Dataset, MerkleTree, bool) {
+        if let Some(d) = DATASET.get() {
+            return (d, d.tree(), false);
+        }
+        if let Some(d) = Self::read(path) {
+            let tree = d.tree();
+            if tree.root() == BabyBear::new_array(ROOT) {
+                let d = DATASET.get_or_init(|| d);
+                return (d, tree, true);
+            }
+        }
+        let d = Self::get();
+        // Best effort: a missing cache only costs time.
+        let _ = d.write(path);
+        (d, d.tree(), false)
+    }
+
+    fn read(path: &Path) -> Option<Dataset> {
+        let bytes = std::fs::read(path).ok()?;
+        if bytes.len() != FILE_BYTES {
+            return None;
+        }
+        let mut values = bytes
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")));
+        let mut items = Vec::with_capacity(ITEMS);
+        for _ in 0..ITEMS {
+            let mut item = [BabyBear::ZERO; HASH_LEN];
+            for x in &mut item {
+                let v = values.next()?;
+                if v >= crate::babybear::P {
+                    return None;
+                }
+                *x = BabyBear::new(v);
+            }
+            items.push(item);
+        }
+        Some(Self { items })
+    }
+
+    fn write(&self, path: &Path) -> std::io::Result<()> {
+        let mut bytes = Vec::with_capacity(FILE_BYTES);
+        for x in self.items.iter().flatten() {
+            bytes.extend_from_slice(&x.as_u32().to_le_bytes());
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(tmp, path)
     }
 
     /// Builds the dataset (about 2^27 permutations, spread across threads).
@@ -80,7 +142,9 @@ impl Dataset {
             let mut bytes = [0u8; CHUNK];
             bytes[..chunk.len()].copy_from_slice(chunk);
             *item = core::array::from_fn(|k| {
-                BabyBear::new(u32::from_le_bytes(bytes[4 * k..4 * k + 4].try_into().unwrap()))
+                BabyBear::new(u32::from_le_bytes(
+                    bytes[4 * k..4 * k + 4].try_into().unwrap(),
+                ))
             });
         }
         let mut b = seeds;
@@ -178,9 +242,9 @@ impl Dataset {
 /// are uniform but for a negligible excess at 0.)
 pub fn value(h: &Hash) -> u128 {
     let mask = (1 << VALUE_LIMB_BITS) - 1;
-    h[..4].iter().fold(0, |v, x| {
-        v << VALUE_LIMB_BITS | (x.as_u32() & mask) as u128
-    })
+    h[..4]
+        .iter()
+        .fold(0, |v, x| v << VALUE_LIMB_BITS | (x.as_u32() & mask) as u128)
 }
 
 /// `x` as 16-bit limbs, least significant first.
@@ -280,6 +344,15 @@ mod tests {
         assert_eq!(value(&h), 0);
     }
 
+    #[test]
+    fn dataset_files_must_be_whole() {
+        let dir = crate::db::test::TempEnv::new();
+        let path = dir.path.join("pow-dataset");
+        assert!(Dataset::read(&path).is_none());
+        std::fs::write(&path, [0u8; 64]).unwrap();
+        assert!(Dataset::read(&path).is_none());
+    }
+
     /// Builds the real dataset and checks it against the pinned root, the
     /// x8 hash and the miner. Slow in debug builds.
     #[test]
@@ -300,6 +373,16 @@ mod tests {
         eprintln!("tree {:.2?}", t.elapsed());
         eprintln!("root {:?}", root.map(|x| x.as_u32()));
         assert_eq!(root, BabyBear::new_array(ROOT));
+
+        // The file cache round-trips, and the root catches a damaged copy.
+        let dir = crate::db::test::TempEnv::new();
+        let path = dir.path.join("pow-dataset");
+        data.write(&path).unwrap();
+        assert!(Dataset::read(&path).unwrap().items == data.items);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[100] ^= 1;
+        std::fs::write(&path, &bytes).unwrap();
+        assert_ne!(Dataset::read(&path).unwrap().tree().root(), root);
 
         let seed = BabyBear::new_array([1, 2, 3, 4, 5, 6, 7, 8]);
         let nonces = [0, 1, 2, 3, u64::MAX, 5, 6, 7];

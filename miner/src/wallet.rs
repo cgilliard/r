@@ -225,7 +225,9 @@ mod tests {
     use super::*;
 
     fn wallet(n: u32) -> Wallet {
-        Wallet::from_seed(BabyBear::new_array(core::array::from_fn(|i| n * 100 + i as u32)))
+        Wallet::from_seed(BabyBear::new_array(core::array::from_fn(|i| {
+            n * 100 + i as u32
+        })))
     }
 
     fn record(o: &Output) -> OutputRecord {
@@ -254,8 +256,7 @@ mod tests {
         let a = wallet(1).address(7);
         assert_eq!(Address::from_bytes(&a.to_bytes()), Some(a));
         let mut bad = a.to_bytes();
-        bad[output::OUTPUT_HASH_LEN..output::OUTPUT_HASH_LEN + 4]
-            .copy_from_slice(&P.to_le_bytes());
+        bad[output::OUTPUT_HASH_LEN..output::OUTPUT_HASH_LEN + 4].copy_from_slice(&P.to_le_bytes());
         assert_eq!(Address::from_bytes(&bad), None);
         assert_eq!(Address::from_bytes(&bad[1..]), None);
     }
@@ -275,8 +276,10 @@ mod tests {
         .map(|(i, o)| (i as u64 + 1, record(o)))
         .collect();
         let coins = alice.scan(&outputs, 0..10);
-        let found: Vec<(u32, u64, Amount)> =
-            coins.iter().map(|c| (c.index, c.position, c.amount)).collect();
+        let found: Vec<(u32, u64, Amount)> = coins
+            .iter()
+            .map(|c| (c.index, c.position, c.amount))
+            .collect();
         assert_eq!(found, [(0, 1, 10), (5, 3, 30)]);
         // A wider range finds the far address too.
         assert_eq!(alice.scan(&outputs, 0..100).len(), 3);

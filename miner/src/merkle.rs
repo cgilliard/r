@@ -66,6 +66,37 @@ impl MerkleTree {
     }
 }
 
+impl MerkleTree {
+    /// The tree without its matrix: its root and paths, for rows the owner
+    /// can recompute.
+    pub fn into_layers(self) -> MerkleLayers {
+        MerkleLayers {
+            layers: self.layers,
+        }
+    }
+}
+
+/// A Merkle tree's hash layers, without the committed matrix.
+#[derive(Clone, Debug)]
+pub struct MerkleLayers {
+    layers: Vec<Vec<Hash>>,
+}
+
+impl MerkleLayers {
+    pub fn root(&self) -> Hash {
+        self.layers.last().expect("a root")[0]
+    }
+
+    /// The authentication path of row `index`.
+    pub fn path(&self, index: usize) -> MerklePath {
+        self.layers[..self.layers.len() - 1]
+            .iter()
+            .enumerate()
+            .map(|(d, layer)| layer[(index >> d) ^ 1])
+            .collect()
+    }
+}
+
 /// Checks that `row` is row `index` of a matrix of height `2^log_height`
 /// committed to by `root`.
 pub fn verify(root: &Hash, log_height: u32, index: usize, row: &[BabyBear], path: &[Hash]) -> bool {

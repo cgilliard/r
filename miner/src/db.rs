@@ -8,7 +8,7 @@ use heed::{Env, EnvOpenOptions};
 /// file grows as data is written.
 pub const MAP_SIZE: usize = 1 << 40;
 /// Named databases the environment can hold.
-pub const MAX_DBS: u32 = 16;
+pub const MAX_DBS: u32 = 32;
 
 /// Opens (creating if needed) the environment in `path`.
 pub fn open_env(path: &Path) -> heed::Result<Env> {

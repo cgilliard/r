@@ -86,15 +86,32 @@ impl Challenger {
     /// state. Each extra bit doubles the prover's work and adds a bit of
     /// soundness.
     pub fn grind(&mut self, bits: u32) -> BabyBear {
-        for w in 0..P {
-            let w = BabyBear::new(w);
-            let mut fork = self.clone();
-            if fork.check_witness(bits, w) {
-                *self = fork;
-                return w;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        // Threads try interleaved candidates and stop once any succeeds;
+        // the smallest success found wins (any valid witness would do).
+        let threads = crate::par::threads() as u32;
+        let found = AtomicU32::new(P);
+        std::thread::scope(|s| {
+            for t in 0..threads {
+                let (found, this) = (&found, &*self);
+                s.spawn(move || {
+                    let mut w = t;
+                    while w < found.load(Ordering::Relaxed) {
+                        if this.clone().check_witness(bits, BabyBear::new(w)) {
+                            found.fetch_min(w, Ordering::Relaxed);
+                            return;
+                        }
+                        w += threads;
+                    }
+                });
             }
-        }
-        unreachable!("some witness below p succeeds for bits <= 27");
+        });
+        let w = BabyBear::new(found.into_inner());
+        assert!(
+            self.check_witness(bits, w),
+            "some witness below p succeeds for bits <= 27"
+        );
+        w
     }
 
     /// Observes `w` and checks it is a valid [`grind`](Self::grind) witness.

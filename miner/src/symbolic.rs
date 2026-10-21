@@ -387,9 +387,10 @@ pub fn compile<A: Air>(air: &A, public_len: usize) -> Program {
 mod tests {
     use super::*;
     use crate::babybear::P;
+    use crate::item_chunk_air::{self, ItemChunkAir};
     use crate::poseidon2_air::Poseidon2Air;
+    use crate::sig_chunk_air::{self, SigChunkAir};
     use crate::state_air::{self, StateSegmentAir};
-    use crate::subblock_air::{self, SubBlockAir};
     use crate::wots_air::WotsAir;
 
     fn rng(seed: u64) -> impl FnMut() -> BabyBear4 {
@@ -489,14 +490,12 @@ mod tests {
             ("poseidon2", check(&Poseidon2Air, 0)),
             ("wots", check(&WotsAir, 21)),
             (
-                "sub-block",
-                check(
-                    &SubBlockAir {
-                        inputs: 1,
-                        outputs: 2,
-                    },
-                    subblock_air::PUBLIC_LEN,
-                ),
+                "item chunk",
+                check(&ItemChunkAir { items: 4 }, item_chunk_air::public::LEN),
+            ),
+            (
+                "sig chunk",
+                check(&SigChunkAir { slots: 1 }, sig_chunk_air::public::LEN),
             ),
             (
                 "state segment",

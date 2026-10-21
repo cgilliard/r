@@ -14,20 +14,24 @@
 //! net value, so nothing about fees is published.
 //!
 //! [`BlockProver`] proves a block's transition as one aggregated proof
-//! ([`crate::aggregate`]). Its two private halves, the transactions
-//! (sub-blocks) and the tree updates (segments), are tied together by
-//! multiset fingerprints over commitments, under challenges `lambda, r`
-//! that must be fixed only after both halves are ([`challenges`]): they
-//! hash the previous and new state, whose roots commit to every key
-//! inserted and spent, and the transaction hash, which commits (blinded) to
-//! every commitment the transactions spend and create. The chain proof
-//! checks that derivation, the fingerprint ratios, the net value and the
-//! state link in-circuit.
+//! ([`crate::aggregate`]). The transactions become one stream of items
+//! (each transaction's start, inputs, outputs and end), cut into item
+//! chunks of a few fixed sizes ([`ITEM_SHAPES`]) wherever the stream
+//! happens to cross a chunk boundary, so a transaction of any size fits and
+//! only the last chunk has padding. Each input's signature is checked in a
+//! signature chunk ([`SIG_SHAPES`]), and the tree updates in segments. The
+//! three are tied together by multiset fingerprints, under challenges
+//! `lambda, r` that must be fixed only after everything is
+//! ([`challenges`]): they hash the previous and new state, whose roots
+//! commit to every key inserted and spent, and the transaction hash, which
+//! commits (blinded) to every chunk's contents. The chain proof checks
+//! that derivation, the fingerprint ratios, the net value, that the item
+//! stream starts and ends between transactions, and the state link,
+//! in-circuit.
 //!
 //! The published lists are bound through the state: applying them to the
 //! previous tree must give the header's new state ([`apply`]). Output
-//! nonces are published for wallets but aren't fingerprinted; only the body
-//! hash commits to them.
+//! nonces are in the tree's leaves, so the state binds them too.
 //!
 //! On the wire a block is its header and body ([`encode`]), at most
 //! [`MAX_BLOCK_SIZE`] bytes. A [`Header`] commits to the block through
@@ -38,15 +42,18 @@ use std::fmt;
 use crate::aggregate::{AggError, Aggregator, NodeProof};
 use crate::babybear::BabyBear;
 use crate::babybear4::BabyBear4;
+use crate::chunk;
 use crate::fri::FriParams;
 use crate::hash::{self, HASH_LEN, Hash, domain};
 use crate::header::Header;
-use crate::output::{self, Amount, COMMITMENT_LEN, Commitment, NONCE_LEN, OutputRecord};
+use crate::item_chunk_air::{self, Boundary, Item, ItemChunkAir};
+use crate::output::{Amount, COMMITMENT_LEN, Commitment, NONCE_LEN, OutputRecord};
+use crate::par;
 use crate::rng::Rng;
-use crate::stark::{self, ProvingKey, StarkProof};
-use crate::state::{self, State, StateTree, key_of};
+use crate::sig_chunk_air::{self, SigChunkAir, SigItem};
+use crate::stark::{self, KeyCache, LazyKey, StarkProof};
+use crate::state::{self, State, StateTree, Undo, key_of};
 use crate::state_air::{InsertOp, SegmentStart, SpendOp, StateSegmentAir};
-use crate::subblock_air::{self, SubBlockAir};
 use crate::transaction::{Transaction, TxError};
 
 /// What a block publishes.
@@ -64,8 +71,6 @@ pub struct Block {
 pub enum BlockError {
     /// A transaction is invalid.
     Tx(usize, TxError),
-    /// A transaction doesn't fit the sub-block shape.
-    TooLarge(usize),
     /// A transaction's input names a position other than the spent
     /// output's slot.
     Position(usize),
@@ -96,7 +101,6 @@ impl fmt::Display for BlockError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Tx(i, e) => write!(f, "transaction {i}: {e:?}"),
-            Self::TooLarge(i) => write!(f, "transaction {i} exceeds the sub-block shape"),
             Self::Position(i) => write!(f, "transaction {i} names the wrong position for an input"),
             Self::NotCanonical => write!(f, "lists not in canonical order"),
             Self::State(e) => write!(f, "state: {e:?}"),
@@ -113,22 +117,12 @@ impl fmt::Display for BlockError {
 impl std::error::Error for BlockError {}
 
 impl Block {
-    /// The hash a header commits to: both lists (with output nonces) and
-    /// the proof's digest. `None` if a commitment isn't a field encoding.
-    pub fn body_hash(&self) -> Option<Hash> {
-        let mut data = vec![
-            BabyBear::new(self.inputs.len() as u32),
-            BabyBear::new(self.outputs.len() as u32),
-        ];
-        for c in &self.inputs {
-            data.extend(c.to_field()?);
-        }
-        for o in &self.outputs {
-            data.extend(o.commitment.to_field()?);
-            data.extend(output::nonce_limbs(&o.nonce));
-        }
-        data.extend(self.proof.digest());
-        Some(hash::sponge(domain::BLOCK_BODY, &[], &[&data]))
+    /// The hash a header commits to: the chunk hash ([`crate::chunk`]) of
+    /// the encoded body ([`encode_body`]), which covers both lists (with
+    /// output nonces) and the proof, and lets a peer check each chunk of a
+    /// body it downloads.
+    pub fn body_hash(&self) -> Hash {
+        chunk::hash_of(domain::BLOCK_BODY, &encode_body(self))
     }
 }
 
@@ -220,24 +214,26 @@ pub const OUTPUT_BYTES: usize = COMMITMENT_LEN + NONCE_LEN;
 
 /// The serialized size of a block with these list lengths and proof size.
 pub fn encoded_size(inputs: usize, outputs: usize, proof: usize) -> usize {
-    crate::header::HEADER_BYTES
-        + 12
-        + inputs * INPUT_BYTES
-        + outputs * OUTPUT_BYTES
-        + proof
+    crate::header::HEADER_BYTES + 12 + inputs * INPUT_BYTES + outputs * OUTPUT_BYTES + proof
 }
 
 /// Serializes a block with its header: `header | n_in (u32) | inputs |
 /// n_out (u32) | outputs (commitment, nonce) | proof length (u32) | proof`,
 /// integers little-endian.
 pub fn encode(header: &Header, block: &Block) -> Vec<u8> {
+    let mut out = header.to_bytes().to_vec();
+    out.extend(encode_body(block));
+    out
+}
+
+/// A block's body as on the wire, without its header: the input count and
+/// inputs, the output count and outputs, the proof length and proof.
+pub fn encode_body(block: &Block) -> Vec<u8> {
     let proof = block.proof.to_bytes();
-    let mut out = Vec::with_capacity(encoded_size(
-        block.inputs.len(),
-        block.outputs.len(),
-        proof.len(),
-    ));
-    out.extend(header.to_bytes());
+    let mut out = Vec::with_capacity(
+        encoded_size(block.inputs.len(), block.outputs.len(), proof.len())
+            - crate::header::HEADER_BYTES,
+    );
     out.extend((block.inputs.len() as u32).to_le_bytes());
     for c in &block.inputs {
         out.extend(c.0);
@@ -276,6 +272,20 @@ pub fn decode(bytes: &[u8]) -> Result<(Header, Block), DecodeError> {
     if bytes.len() > MAX_BLOCK_SIZE {
         return Err(DecodeError::Oversize(bytes.len()));
     }
+    let (h, body) = bytes
+        .split_at_checked(crate::header::HEADER_BYTES)
+        .ok_or(DecodeError::Malformed)?;
+    let header = Header::from_bytes(h).ok_or(DecodeError::Malformed)?;
+    Ok((header, decode_body(body)?))
+}
+
+/// The inverse of [`encode_body`].
+pub fn decode_body(bytes: &[u8]) -> Result<Block, DecodeError> {
+    if bytes.len() + crate::header::HEADER_BYTES > MAX_BLOCK_SIZE {
+        return Err(DecodeError::Oversize(
+            bytes.len() + crate::header::HEADER_BYTES,
+        ));
+    }
     let mut rest = bytes;
     let mut take = |n: usize| -> Result<&[u8], DecodeError> {
         if rest.len() < n {
@@ -286,12 +296,12 @@ pub fn decode(bytes: &[u8]) -> Result<(Header, Block), DecodeError> {
         Ok(a)
     };
     let count = |b: &[u8]| u32::from_le_bytes(b.try_into().expect("4 bytes")) as usize;
-    let header =
-        Header::from_bytes(take(crate::header::HEADER_BYTES)?).ok_or(DecodeError::Malformed)?;
     let n_in = count(take(4)?);
     let mut inputs = Vec::with_capacity(n_in.min(MAX_BLOCK_SIZE / INPUT_BYTES));
     for _ in 0..n_in {
-        inputs.push(Commitment(take(COMMITMENT_LEN)?.try_into().expect("length")));
+        inputs.push(Commitment(
+            take(COMMITMENT_LEN)?.try_into().expect("length"),
+        ));
     }
     let n_out = count(take(4)?);
     let mut outputs = Vec::with_capacity(n_out.min(MAX_BLOCK_SIZE / OUTPUT_BYTES));
@@ -305,71 +315,173 @@ pub fn decode(bytes: &[u8]) -> Result<(Header, Block), DecodeError> {
     if !rest.is_empty() {
         return Err(DecodeError::Malformed);
     }
-    Ok((
-        header,
-        Block {
-            inputs,
-            outputs,
-            proof,
-        },
-    ))
+    Ok(Block {
+        inputs,
+        outputs,
+        proof,
+    })
 }
 
 /// Applies `block`'s lists to `tree` (whose state in `txn` must be
-/// `parent`'s) and checks the result is `header`'s state. On error `txn`
-/// may be partly updated; abort it.
+/// `parent`'s) and checks the result is `header`'s state. Returns what
+/// undoes the changes ([`StateTree::revert`]). On error `txn` may be partly
+/// updated; abort it.
 pub fn apply(
     tree: &StateTree,
     txn: &mut heed::RwTxn,
     parent: &Header,
     header: &Header,
     block: &Block,
-) -> Result<(), BlockError> {
+) -> Result<Undo, BlockError> {
     if tree.state(txn).map_err(BlockError::State)? != parent.state {
         return Err(BlockError::StateMismatch);
     }
-    tree.apply_changes(txn, &block.outputs, &block.inputs)
+    let proofs = tree
+        .apply_block(txn, header.height, &block.outputs, &block.inputs)
         .map_err(BlockError::State)?;
     if tree.state(txn).map_err(BlockError::State)? != header.state {
         return Err(BlockError::StateMismatch);
     }
-    Ok(())
+    Ok(proofs.undo(parent.state.size))
 }
 
 /// A block's transition, proved: its lists and the final aggregation
-/// proof, which [`crate::chain`] turns into the block's chain proof.
+/// proof, which [`crate::chain`] turns into the block's chain proof, with
+/// what its statement's state hashes open to.
 #[derive(Clone, Debug)]
 pub struct Aggregated {
     pub inputs: Vec<Commitment>,
     pub outputs: Vec<OutputRecord>,
     pub node: NodeProof,
+    /// The state before and after.
+    pub prev: State,
+    pub new: State,
+    /// The last keys inserted and spent (zero if none).
+    pub last_insert: Hash,
+    pub last_spend: Hash,
+}
+
+/// A block ready to prove: its transactions, lists and state-tree
+/// witnesses ([`BlockProver::prepare`]).
+#[derive(Clone, Debug)]
+pub struct Prepared {
+    txs: Vec<Transaction>,
+    pub inputs: Vec<Commitment>,
+    pub outputs: Vec<OutputRecord>,
+    /// The state before and after.
+    pub prev: State,
+    pub new: State,
+    segments: Vec<(SegmentStart, Vec<InsertOp>, Vec<SpendOp>)>,
+    /// Where the last segment left off.
+    last: SegmentStart,
+}
+
+/// Item chunk shapes, smallest first: each fills a power-of-two trace
+/// (`2^12`, `2^14` rows).
+pub const ITEM_SHAPES: [ItemChunkAir; 2] =
+    [ItemChunkAir { items: 682 }, ItemChunkAir { items: 2730 }];
+
+/// Signature chunk shapes, smallest first (`2^12`, `2^14`, `2^16` rows).
+pub const SIG_SHAPES: [SigChunkAir; 3] = [
+    SigChunkAir { slots: 7 },
+    SigChunkAir { slots: 31 },
+    SigChunkAir { slots: 126 },
+];
+
+/// Cuts `n` things into chunks: full chunks of the largest capacity, then
+/// the smallest that holds the rest. Returns (shape index, range).
+fn cut(n: usize, capacities: &[usize]) -> Vec<(usize, std::ops::Range<usize>)> {
+    let largest = capacities.len() - 1;
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < n {
+        let left = n - at;
+        let shape = if left >= capacities[largest] {
+            largest
+        } else {
+            capacities
+                .iter()
+                .position(|&cap| cap >= left)
+                .expect("the largest holds it")
+        };
+        let take = left.min(capacities[shape]);
+        out.push((shape, at..at + take));
+        at += take;
+    }
+    out
 }
 
 /// Keys and shapes for proving blocks' transitions.
 pub struct BlockProver {
     params: FriParams,
-    sub: SubBlockAir,
-    sub_pk: ProvingKey,
+    /// Chunk shapes, smallest first, with their keys.
+    items: Vec<(ItemChunkAir, LazyKey)>,
+    sigs: Vec<(SigChunkAir, LazyKey)>,
     seg: StateSegmentAir,
-    seg_pk: ProvingKey,
+    seg_key: LazyKey,
     agg: Aggregator,
 }
 
 impl BlockProver {
-    /// Sets up proving with sub-blocks of shape `sub`, segments of shape
-    /// `seg`, and aggregation nodes of height `2^log_height`.
-    pub fn new(params: FriParams, sub: SubBlockAir, seg: StateSegmentAir, log_height: u32) -> Self {
-        let (sub_pk, sub_vk) = stark::setup(&params, &sub);
-        let (seg_pk, seg_vk) = stark::setup(&params, &seg);
-        let agg = Aggregator::new(params, sub, sub_vk, seg, seg_vk, log_height);
+    /// Sets up proving with item and signature chunks of the shapes
+    /// `items` and `sigs` (smallest first), segments of shape `seg`, and
+    /// aggregation nodes of height `2^log_height`, with verifying keys from
+    /// `keys` where it has them (proving keys are built on first use).
+    pub fn new(
+        params: FriParams,
+        items: &[ItemChunkAir],
+        sigs: &[SigChunkAir],
+        seg: StateSegmentAir,
+        log_height: u32,
+        keys: &KeyCache,
+    ) -> Self {
+        let items: Vec<_> = items
+            .iter()
+            .map(|&air| (air, LazyKey::new(keys, &params, &air)))
+            .collect();
+        let sigs: Vec<_> = sigs
+            .iter()
+            .map(|&air| (air, LazyKey::new(keys, &params, &air)))
+            .collect();
+        let seg_key = LazyKey::new(keys, &params, &seg);
+        let agg = Aggregator::new(
+            params,
+            items
+                .iter()
+                .map(|(air, k)| (*air, *k.verifying_key()))
+                .collect(),
+            sigs.iter()
+                .map(|(air, k)| (*air, *k.verifying_key()))
+                .collect(),
+            seg,
+            *seg_key.verifying_key(),
+            log_height,
+            keys,
+        );
         Self {
             params,
-            sub,
-            sub_pk,
+            items,
+            sigs,
             seg,
-            seg_pk,
+            seg_key,
             agg,
         }
+    }
+
+    /// Sets up the default shapes: [`ITEM_SHAPES`], [`SIG_SHAPES`], 16-op
+    /// segments, nodes at `2^15`.
+    pub fn standard(params: FriParams, keys: &KeyCache) -> Self {
+        Self::new(
+            params,
+            &ITEM_SHAPES,
+            &SIG_SHAPES,
+            StateSegmentAir {
+                inserts: 16,
+                spends: 16,
+            },
+            15,
+            keys,
+        )
     }
 
     /// The aggregator, whose merge key verifiers need.
@@ -378,9 +490,8 @@ impl BlockProver {
     }
 
     /// Proves the transition of a block of `txs` on top of `tree`'s state
-    /// in `txn`, applying its changes there (commit `txn` to keep them).
-    /// The transactions must create exactly `subsidy` in total and the
-    /// block must fit [`MAX_BLOCK_SIZE`]; both are checked before proving.
+    /// in `txn`, applying its changes there (commit `txn` to keep them):
+    /// [`BlockProver::prepare`] then [`BlockProver::prove_prepared`].
     pub fn prove(
         &self,
         tree: &StateTree,
@@ -388,13 +499,27 @@ impl BlockProver {
         txs: &[Transaction],
         subsidy: Amount,
     ) -> Result<Aggregated, BlockError> {
+        let prepared = self.prepare(tree, txn, txs, subsidy)?;
+        self.prove_prepared(&prepared)
+    }
+
+    /// The quick, stateful part of proving a block of `txs` on top of
+    /// `tree`'s state in `txn`: checks the transactions (they must create
+    /// exactly `subsidy` in total, and the block must fit
+    /// [`MAX_BLOCK_SIZE`]) and applies the changes in `txn`, recording the
+    /// segments' witnesses. The transaction can then be aborted and the
+    /// proving done without it.
+    pub fn prepare(
+        &self,
+        tree: &StateTree,
+        txn: &mut heed::RwTxn,
+        txs: &[Transaction],
+        subsidy: Amount,
+    ) -> Result<Prepared, BlockError> {
         let mut net: i128 = 0;
         for (i, tx) in txs.iter().enumerate() {
             let totals = tx.validate().map_err(|e| BlockError::Tx(i, e))?;
             net -= totals.fee();
-            if tx.body.inputs.len() > self.sub.inputs || tx.body.outputs.len() > self.sub.outputs {
-                return Err(BlockError::TooLarge(i));
-            }
         }
         if net != subsidy as i128 {
             return Err(BlockError::Net(net));
@@ -477,56 +602,150 @@ impl BlockProver {
             .flat_map(|(_, _, spends)| spends.iter().map(|s| (s.commitment, s.proof.position())))
             .collect();
         for (i, tx) in txs.iter().enumerate() {
-            if tx.body.inputs.iter().any(|input| positions.get(&input.commitment) != Some(&input.position)) {
+            if tx
+                .body
+                .inputs
+                .iter()
+                .any(|input| positions.get(&input.commitment) != Some(&input.position))
+            {
                 return Err(BlockError::Position(i));
             }
         }
+        Ok(Prepared {
+            txs: txs.to_vec(),
+            inputs,
+            outputs,
+            prev,
+            new,
+            segments,
+            last: start,
+        })
+    }
 
-        // Fix the transactions' blinded hashes, then derive the challenges
-        // from both halves.
+    /// The slow part: proves a [`BlockProver::prepare`]d block.
+    pub fn prove_prepared(&self, p: &Prepared) -> Result<Aggregated, BlockError> {
+        let Prepared {
+            txs,
+            inputs,
+            outputs,
+            prev,
+            new,
+            segments,
+            last: start,
+        } = p;
+        let (prev, new) = (*prev, *new);
+
+        // The item stream and the signatures, cut into chunks.
+        let items = item_chunk_air::stream(txs);
+        let item_caps: Vec<usize> = self.items.iter().map(|(a, _)| a.items).collect();
+        let item_chunks = cut(items.len(), &item_caps);
+        let sig_items: Vec<SigItem> = txs
+            .iter()
+            .flat_map(|tx| {
+                let msg = tx.body.digest().expect("validated");
+                tx.body
+                    .inputs
+                    .iter()
+                    .zip(&tx.signatures)
+                    .map(move |(input, sig)| SigItem {
+                        pubkey: input.pubkey.clone(),
+                        sig: sig.clone(),
+                        msg,
+                    })
+            })
+            .collect();
+        let sig_caps: Vec<usize> = self.sigs.iter().map(|(a, _)| a.slots).collect();
+        let sig_chunks = cut(sig_items.len(), &sig_caps);
+
+        // Fix each chunk's blinded hash, then derive the challenges from
+        // both halves.
         let mut rng = Rng::from_os().expect("OS randomness");
-        let mut blindings = Vec::with_capacity(txs.len());
+        let mut blinding = || {
+            let mut b = [BabyBear::ZERO; HASH_LEN];
+            rng.fill(&mut b);
+            b
+        };
         let mut leaves = vec![[BabyBear::ZERO; HASH_LEN]; segments.len()];
-        for tx in txs {
-            let mut blinding = [BabyBear::ZERO; HASH_LEN];
-            rng.fill(&mut blinding);
-            let digest = tx.body.digest().ok_or(BlockError::NotCanonical)?;
-            leaves.push(subblock_air::tx_hash(&digest, &blinding));
-            blindings.push(blinding);
+        let mut item_jobs = Vec::with_capacity(item_chunks.len());
+        let mut entry = Boundary::IDLE;
+        let mut msg = [BabyBear::ZERO; HASH_LEN];
+        for (shape, range) in &item_chunks {
+            let mut digests = Vec::new();
+            let mut exit = entry;
+            for item in &items[range.clone()] {
+                if let Item::Start { msg: m, .. } = item {
+                    msg = *m;
+                }
+                if *item == Item::End {
+                    digests.push(msg);
+                }
+                exit = exit.after(item);
+            }
+            let b = blinding();
+            leaves.push(item_chunk_air::chunk_hash(&b, &digests));
+            item_jobs.push((*shape, range.clone(), entry, b));
+            entry = exit;
+        }
+        debug_assert_eq!(entry, Boundary::IDLE);
+        let mut sig_jobs = Vec::with_capacity(sig_chunks.len());
+        for (shape, range) in &sig_chunks {
+            let pairs: Vec<(Hash, Hash)> = sig_items[range.clone()]
+                .iter()
+                .map(|s| (s.pubkey.hash(), s.msg))
+                .collect();
+            let b = blinding();
+            leaves.push(sig_chunk_air::chunk_hash(&b, &pairs));
+            sig_jobs.push((*shape, range.clone(), b));
         }
         let tx_hash = merge_tx_hashes(leaves);
         let (lambda, r) = challenges(&prev, &new, &tx_hash);
 
-        // Prove the segments, then the sub-blocks, then merge pairwise,
-        // keeping the segments' order.
-        let mut nodes: Vec<NodeProof> = Vec::with_capacity(segments.len() + txs.len());
-        for (start, inserts, spends) in &segments {
-            let (trace, public) = self.seg.trace(start, inserts, spends, lambda, r);
-            let proof = stark::prove(&self.params, &self.seg_pk, &self.seg, trace, &public);
-            nodes.push(
-                self.agg
-                    .prove_segment(&public, &proof)
-                    .map_err(BlockError::Proof)?,
-            );
+        // Prove the segments, item chunks and signature chunks, then merge
+        // pairwise, keeping the segments' and item chunks' order. Leaves,
+        // and merges on a level, are independent: a few run at once.
+        type Task<'a> = Box<dyn FnOnce() -> Result<NodeProof, AggError> + Send + 'a>;
+        let (params, items, sig_items) = (&self.params, &items, &sig_items);
+        let mut tasks: Vec<Task<'_>> = Vec::new();
+        for (start, inserts, spends) in segments {
+            tasks.push(Box::new(move || {
+                let (trace, public) = self.seg.trace(start, inserts, spends, lambda, r);
+                let pk = self.seg_key.proving_key(params, &self.seg);
+                let proof = stark::prove(params, pk, &self.seg, trace, &public);
+                self.agg.prove_segment(&public, &proof)
+            }));
         }
-        for (tx, blinding) in txs.iter().zip(&blindings) {
-            let (trace, public) = self.sub.trace(tx, blinding, lambda, r, &mut rng);
-            let proof = stark::prove(&self.params, &self.sub_pk, &self.sub, trace, &public);
-            nodes.push(
-                self.agg
-                    .prove_sub_block(&public, &proof)
-                    .map_err(BlockError::Proof)?,
-            );
+        for (shape, range, entry, b) in &item_jobs {
+            tasks.push(Box::new(move || {
+                let (air, key) = &self.items[*shape];
+                let (trace, public) = air.trace(&items[range.clone()], entry, b, lambda, r);
+                let proof = stark::prove(params, key.proving_key(params, air), air, trace, &public);
+                self.agg.prove_items(*shape, &public, &proof)
+            }));
         }
+        for (shape, range, b) in &sig_jobs {
+            tasks.push(Box::new(move || {
+                let (air, key) = &self.sigs[*shape];
+                let mut rng = Rng::from_os().expect("OS randomness");
+                let (trace, public) = air.trace(&sig_items[range.clone()], b, lambda, r, &mut rng);
+                let proof = stark::prove(params, key.proving_key(params, air), air, trace, &public);
+                self.agg.prove_sigs(*shape, &public, &proof)
+            }));
+        }
+        let mut nodes = par::run_jobs(tasks)
+            .into_iter()
+            .collect::<Result<Vec<NodeProof>, _>>()
+            .map_err(BlockError::Proof)?;
         while nodes.len() > 1 {
-            let mut next = Vec::with_capacity(nodes.len().div_ceil(2));
-            let mut it = nodes.into_iter();
-            while let Some(a) = it.next() {
-                match it.next() {
-                    Some(b) => next.push(self.agg.merge(&a, &b).map_err(BlockError::Proof)?),
-                    None => next.push(a),
-                }
-            }
+            let odd = (nodes.len() % 2 == 1).then(|| nodes.pop().expect("odd"));
+            let tasks: Vec<Task<'_>> = nodes
+                .chunks(2)
+                .map(|pair| Box::new(move || self.agg.merge(&pair[0], &pair[1])) as Task<'_>)
+                .collect();
+            let mut next = par::run_jobs(tasks)
+                .into_iter()
+                .collect::<Result<Vec<NodeProof>, _>>()
+                .map_err(BlockError::Proof)?;
+            next.extend(odd);
             nodes = next;
         }
         let top = nodes.pop().expect("at least one segment");
@@ -537,9 +756,13 @@ impl BlockProver {
         }
         debug_assert_eq!(top.statement.tx_hash(), tx_hash);
         Ok(Aggregated {
-            inputs,
-            outputs,
+            inputs: inputs.clone(),
+            outputs: outputs.clone(),
             node: top,
+            prev,
+            new,
+            last_insert: start.prev_insert,
+            last_spend: start.prev_spend,
         })
     }
 }
@@ -548,11 +771,44 @@ impl BlockProver {
 mod tests {
     use super::*;
     use crate::db::test::TempEnv;
-    use crate::output::{NONCE_LEN, Nonce, Output};
+    use crate::output::{self, NONCE_LEN, Nonce, Output};
     use crate::transaction::{Input, TxBody, pubkey_hash};
     use crate::wots::{SecretKey, keygen};
 
     const SUBSIDY: Amount = 50;
+
+    #[test]
+    fn shapes_fill_their_traces() {
+        for (shape, log) in ITEM_SHAPES.iter().zip([12, 14]) {
+            assert_eq!(shape.height(), 1 << log, "{shape:?}");
+            let bigger = ItemChunkAir {
+                items: shape.items + 1,
+            };
+            assert_eq!(bigger.height(), 2 << log, "{shape:?} isn't full");
+        }
+        for (shape, log) in SIG_SHAPES.iter().zip([12, 14, 16]) {
+            assert_eq!(shape.height(), 1 << log, "{shape:?}");
+            let bigger = SigChunkAir {
+                slots: shape.slots + 1,
+            };
+            assert_eq!(bigger.height(), 2 << log, "{shape:?} isn't full");
+        }
+    }
+
+    #[test]
+    fn cuts_into_full_chunks_and_a_fitting_rest() {
+        let caps = [7, 31, 126];
+        assert_eq!(cut(0, &caps), vec![]);
+        assert_eq!(cut(1, &caps), vec![(0, 0..1)]);
+        assert_eq!(cut(7, &caps), vec![(0, 0..7)]);
+        assert_eq!(cut(8, &caps), vec![(1, 0..8)]);
+        assert_eq!(cut(126, &caps), vec![(2, 0..126)]);
+        assert_eq!(cut(130, &caps), vec![(2, 0..126), (0, 126..130)]);
+        assert_eq!(
+            cut(300, &caps),
+            vec![(2, 0..126), (2, 126..252), (2, 252..300)]
+        );
+    }
 
     fn key(n: u32) -> (SecretKey, crate::wots::PublicKey) {
         keygen(BabyBear::new_array(core::array::from_fn(|i| {
@@ -591,18 +847,7 @@ mod tests {
     #[ignore = "slow: run in release"]
     fn proves_and_verifies_a_block() {
         let t = std::time::Instant::now();
-        let prover = BlockProver::new(
-            FriParams::default(),
-            SubBlockAir {
-                inputs: 16,
-                outputs: 16,
-            },
-            StateSegmentAir {
-                inserts: 16,
-                spends: 16,
-            },
-            15,
-        );
+        let prover = BlockProver::standard(FriParams::default(), &stark::KeyCache::none());
         eprintln!("setup {:.1} s", t.elapsed().as_secs_f64());
 
         // The chain so far holds one output of 100 to key 1.
@@ -678,7 +923,9 @@ mod tests {
         let t = std::time::Instant::now();
         let mut txn = env.env().write_txn().unwrap();
         let prev = tree.state(&txn).unwrap();
-        let agg = prover.prove(&tree, &mut txn, &[tx, reward], SUBSIDY).unwrap();
+        let agg = prover
+            .prove(&tree, &mut txn, &[tx, reward], SUBSIDY)
+            .unwrap();
         let claimed = tree.state(&txn).unwrap();
         txn.abort();
         eprintln!("prove {:.1} s", t.elapsed().as_secs_f64());
@@ -688,9 +935,26 @@ mod tests {
         let aggregator = prover.aggregator();
         let s = &agg.node.statement;
         assert_eq!(aggregator.verify(s, &agg.node.proof), Ok(()));
-        assert_eq!((s.old_state(), s.new_state()), (prev, claimed));
-        assert_eq!((s.lambda(), s.r()), challenges(&prev, &claimed, &s.tx_hash()));
-        assert_eq!((s.q_in(), s.q_out()), (BabyBear4::ONE, BabyBear4::ONE));
+        let zero = [BabyBear::ZERO; HASH_LEN];
+        assert_eq!((agg.prev, agg.new), (prev, claimed));
+        assert_eq!(
+            s.state_in(),
+            crate::aggregate::state_hash(&prev, &zero, &zero)
+        );
+        assert_eq!(
+            s.state_out(),
+            crate::aggregate::state_hash(&claimed, &agg.last_insert, &agg.last_spend)
+        );
+        let idle = crate::aggregate::stream_hash(&Boundary::IDLE);
+        assert_eq!((s.stream_in(), s.stream_out()), (idle, idle));
+        assert_eq!(
+            (s.lambda(), s.r()),
+            challenges(&prev, &claimed, &s.tx_hash())
+        );
+        assert_eq!(
+            (s.q_in(), s.q_out(), s.q_sig()),
+            (BabyBear4::ONE, BabyBear4::ONE, BabyBear4::ONE)
+        );
         assert_eq!(s.net(), SUBSIDY as i128);
 
         // Over the wire, with the aggregation proof standing in for the
@@ -712,7 +976,7 @@ mod tests {
             prev: parent.hash(),
             timestamp: 1600,
             state: claimed,
-            body: block.body_hash().unwrap(),
+            body: block.body_hash(),
             nonce: 0,
         };
         let bytes = encode(&header, &block);
@@ -723,7 +987,10 @@ mod tests {
         assert_eq!((&b2.inputs, &b2.outputs), (&block.inputs, &block.outputs));
         assert_eq!(b2.proof.elements(), block.proof.elements());
         assert_eq!(b2.body_hash(), block.body_hash());
-        assert_eq!(decode(&bytes[..bytes.len() - 1]).err(), Some(DecodeError::Malformed));
+        assert_eq!(
+            decode(&bytes[..bytes.len() - 1]).err(),
+            Some(DecodeError::Malformed)
+        );
         let mut long = bytes.clone();
         long.push(0);
         assert_eq!(decode(&long).err(), Some(DecodeError::Malformed));

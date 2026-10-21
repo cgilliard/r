@@ -238,7 +238,12 @@ pub(crate) struct DotState {
 /// per 8 elements, the first from the initial state. With `dot`, each
 /// block's values are also added to the running dot product, right after
 /// the block (so the two can share a row).
-pub(crate) fn sponge(c: &mut Circuit, dom: u32, elems: &[Cell], mut dot: Option<&mut DotState>) -> HashCells {
+pub(crate) fn sponge(
+    c: &mut Circuit,
+    dom: u32,
+    elems: &[Cell],
+    mut dot: Option<&mut DotState>,
+) -> HashCells {
     let zero = c.zero();
     let mut state = [zero; WIDTH];
     state[DOMAIN_SLOT] = c.constant(BabyBear::new(dom));

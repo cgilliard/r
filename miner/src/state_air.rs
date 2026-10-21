@@ -6,8 +6,7 @@
 //! input list (removals); segments cover consecutive slices, chained by
 //! their public states and last keys. Each segment also outputs multiset
 //! fingerprints of what it inserted (key and nonce) and removed (key and
-//! position), which the aggregation matches against the validity
-//! sub-blocks'.
+//! position), which the aggregation matches against the item chunks'.
 //!
 //! Every row holds one Poseidon2 permutation plus auxiliary columns, with
 //! preprocessed selectors giving each row its role. A leaf hash is four
@@ -364,12 +363,54 @@ impl Air for StateSegmentAir {
         // Which leaf: (selector, key, nonce, next key, next index lo, hi).
         type Kind<V> = (usize, [V; 8], [V; 8], [V; 8], V, V);
         let kinds: [Kind<V>; 6] = [
-            (K_INS_OLD, ext8(l, LK), ext8(l, LN), ext8(l, LNK), l[LNI_LO], l[LNI_HI]),
-            (K_INS_RELINK, ext8(l, LK), ext8(l, LN), ext8(l, KEY), l[SIZE_LO], l[SIZE_HI]),
-            (K_INS_NEW, ext8(l, KEY), ext8(l, NONCE), ext8(l, LNK), l[LNI_LO], l[LNI_HI]),
-            (K_PRED_OLD, ext8(l, LK), ext8(l, LN), ext8(l, KEY), l[POS_LO], l[POS_HI]),
-            (K_PRED_NEW, ext8(l, LK), ext8(l, LN), ext8(l, RNK), l[RNI_LO], l[RNI_HI]),
-            (K_REMOVED, ext8(l, KEY), ext8(l, NONCE), ext8(l, RNK), l[RNI_LO], l[RNI_HI]),
+            (
+                K_INS_OLD,
+                ext8(l, LK),
+                ext8(l, LN),
+                ext8(l, LNK),
+                l[LNI_LO],
+                l[LNI_HI],
+            ),
+            (
+                K_INS_RELINK,
+                ext8(l, LK),
+                ext8(l, LN),
+                ext8(l, KEY),
+                l[SIZE_LO],
+                l[SIZE_HI],
+            ),
+            (
+                K_INS_NEW,
+                ext8(l, KEY),
+                ext8(l, NONCE),
+                ext8(l, LNK),
+                l[LNI_LO],
+                l[LNI_HI],
+            ),
+            (
+                K_PRED_OLD,
+                ext8(l, LK),
+                ext8(l, LN),
+                ext8(l, KEY),
+                l[POS_LO],
+                l[POS_HI],
+            ),
+            (
+                K_PRED_NEW,
+                ext8(l, LK),
+                ext8(l, LN),
+                ext8(l, RNK),
+                l[RNI_LO],
+                l[RNI_HI],
+            ),
+            (
+                K_REMOVED,
+                ext8(l, KEY),
+                ext8(l, NONCE),
+                ext8(l, RNK),
+                l[RNI_LO],
+                l[RNI_HI],
+            ),
         ];
         for j in 0..HASH_LEN {
             let (mut dk, mut dn, mut dnk) = (zero, zero, zero);
@@ -407,9 +448,7 @@ impl Air for StateSegmentAir {
         }
         for col in [IDX_LO, IDX_HI] {
             c.assert_zero((p[SET_B] + p[RESET_B]) * n[col]);
-            c.assert_zero_transition(
-                (one - p[SET_B] - p[RESET_B] - ma) * (n[col] - l[col]),
-            );
+            c.assert_zero_transition((one - p[SET_B] - p[RESET_B] - ma) * (n[col] - l[col]));
         }
         let bit = l[BIT];
         for (sel, cur) in [(ma, CUR_A), (mb, CUR_B)] {
@@ -1084,10 +1123,10 @@ mod tests {
     use crate::air::check_constraints;
     use crate::db::test::TempEnv;
     use crate::fri::FriParams;
+    use crate::item_chunk_air::{input_element, output_element, product};
     use crate::output::NONCE_LEN;
     use crate::stark;
     use crate::state::StateTree;
-    use crate::subblock_air::{input_element, output_element, product};
 
     const LAMBDA: BabyBear4 = BabyBear4::new([3, 5, 7, 11]);
     const R: BabyBear4 = BabyBear4::new([13, 17, 19, 23]);
@@ -1188,7 +1227,11 @@ mod tests {
             state_at(&public, public::NEW_ROOT, public::NEW_SIZE),
             (after.root, after.size)
         );
-        let p_ins = product(R, ins.iter().map(|o| output_element(LAMBDA, &o.record).unwrap()));
+        let p_ins = product(
+            R,
+            ins.iter()
+                .map(|o| output_element(LAMBDA, &o.record).unwrap()),
+        );
         let p_sp = product(
             R,
             sp.iter()

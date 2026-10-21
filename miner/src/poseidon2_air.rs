@@ -43,7 +43,12 @@ pub fn eval_gated<V: Var>(c: &mut Constraints<'_, V>, cols: &[V], gate: Option<V
     let mut state: [V; WIDTH] = core::array::from_fn(|i| cols[i]);
     external_linear_layer(&mut state);
     for (r, rc) in RC_EXTERNAL_INITIAL.iter().enumerate() {
-        state = eval_full_round(&mut g, &cols[BEGIN_OFFSET + r * FULL_ROUND_COLS..], &state, rc);
+        state = eval_full_round(
+            &mut g,
+            &cols[BEGIN_OFFSET + r * FULL_ROUND_COLS..],
+            &state,
+            rc,
+        );
     }
     for (r, &rc) in RC_INTERNAL.iter().enumerate() {
         let col = &cols[PARTIAL_OFFSET + r * PARTIAL_ROUND_COLS..];
@@ -51,7 +56,12 @@ pub fn eval_gated<V: Var>(c: &mut Constraints<'_, V>, cols: &[V], gate: Option<V
         internal_linear_layer(&mut state);
     }
     for (r, rc) in RC_EXTERNAL_FINAL.iter().enumerate() {
-        state = eval_full_round(&mut g, &cols[END_OFFSET + r * FULL_ROUND_COLS..], &state, rc);
+        state = eval_full_round(
+            &mut g,
+            &cols[END_OFFSET + r * FULL_ROUND_COLS..],
+            &state,
+            rc,
+        );
     }
     state
 }

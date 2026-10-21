@@ -48,6 +48,15 @@ pub mod domain {
     pub const WALLET_VIEW: u32 = 23;
     pub const NONCE_TAG: u32 = 24;
     pub const NONCE_MASK: u32 = 25;
+    pub const GENESIS: u32 = 26;
+    pub const AGG_STATE: u32 = 27;
+    pub const AGG_STREAM: u32 = 28;
+    /// Not consensus: the local cache of verifying keys.
+    pub const KEY_CACHE: u32 = 29;
+    /// A data chunk's leaf hash ([`crate::chunk`]).
+    pub const BODY_CHUNK: u32 = 30;
+    /// Not consensus: handshake cookies ([`crate::net`]).
+    pub const NET_COOKIE: u32 = 31;
 
     #[cfg(test)]
     pub const ALL: &[u32] = &[
@@ -76,6 +85,12 @@ pub mod domain {
         WALLET_VIEW,
         NONCE_TAG,
         NONCE_MASK,
+        GENESIS,
+        AGG_STATE,
+        AGG_STREAM,
+        KEY_CACHE,
+        BODY_CHUNK,
+        NET_COOKIE,
     ];
 }
 

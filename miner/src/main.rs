@@ -28,9 +28,18 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    let dir = args.data_dir.join("devnet");
-    if let Some(blocks) = args.dev_chain {
-        return r::devnet::run(&dir, blocks);
+    if args.status {
+        return r::daemon::status(&args.data_dir.join("chain"));
     }
-    r::devnet::status(&dir)
+    let net = r::daemon::Net {
+        listen: args.listen,
+        peers: args.peers.clone(),
+        sync_depth: args.sync_depth,
+        max_peers: args.max_peers,
+        snap_sync_limit: args.snap_sync_limit,
+    };
+    if args.no_mine {
+        return r::daemon::follow(&args.data_dir, &net);
+    }
+    r::daemon::run(&args.data_dir, &net)
 }

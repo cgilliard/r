@@ -21,8 +21,8 @@ use crate::header::{
     Consensus, FRAC_BITS, Header, MAX_LOG_TARGET, MIN_LOG_TARGET, WORK_LIMB_BITS, WORK_LIMBS,
 };
 use crate::merkle::MerkleTree;
-use crate::pow::{self, LOG_ITEMS, ROUNDS, VALUE_BITS, VALUE_LIMB_BITS, u64_limbs};
 use crate::poseidon2::WIDTH;
+use crate::pow::{self, LOG_ITEMS, ROUNDS, VALUE_BITS, VALUE_LIMB_BITS, u64_limbs};
 use crate::verifier_circuit::{HashCells, canonical_bits, sponge, verify_path};
 
 /// Limbs of a `u64`.
@@ -160,12 +160,12 @@ pub fn check_header(
 }
 
 /// [`crate::header::work`] of the log-target with fraction `frac` and
-/// one-hot `shifts` (`shifts[s]` set for `int = 16 + s`): `(2^17 - frac)`
-/// placed at bit `108 - int`, as normalized limbs.
+/// one-hot `shifts` (`shifts[s]` set for `int = 16 + s`):
+/// `floor(2^33 / (2^16 + frac))` placed at bit `108 - int`, as normalized
+/// limbs.
 fn work(c: &mut Circuit, frac: Cell, shifts: &[Cell]) -> [Cell; WORK_LIMBS] {
     let bits = WORK_LIMB_BITS as usize;
-    let top = c.constant(BabyBear::new(1 << (FRAC_BITS + 1)));
-    let m = c.sub(top, frac);
+    let m = quotient(c, frac);
     let max_shift = shifts.len() - 1;
     let mut out = [c.zero(); WORK_LIMBS];
     let mut carry = c.zero();
@@ -187,6 +187,50 @@ fn work(c: &mut Circuit, frac: Cell, shifts: &[Cell]) -> [Cell; WORK_LIMBS] {
     }
     c.assert_zero(carry);
     out
+}
+
+/// `q = floor(2^33 / d)` for `d = 2^16 + frac` (`frac` 16 bits), so
+/// `q` is in `(2^16, 2^17]`.
+///
+/// The prover supplies `q` as `q1 2^9 + q0` (9 bits each) and the remainder
+/// `r = 2^33 - q d`, and the circuit checks `0 <= r < d`. The products stay
+/// far below `p` by splitting the equation at bit 9: `q0 d + r = c 2^9` and
+/// `q1 d + c = 2^24`, with `c` hinted.
+fn quotient(c: &mut Circuit, frac: Cell) -> Cell {
+    quotient_claiming(c, frac, 0)
+}
+
+/// [`quotient`], with the prover claiming the true quotient plus `error`.
+fn quotient_claiming(c: &mut Circuit, frac: Cell, error: i64) -> Cell {
+    let d = c.add_const(frac, BabyBear::new(1 << FRAC_BITS));
+    let dv = c.value(d).as_u32() as u64;
+    let num = 1u64 << (2 * FRAC_BITS + 1);
+    let qv = (num / dv).wrapping_add_signed(error);
+    let rv = num.wrapping_sub(qv * dv) & 0xffff_ffff;
+    let q0 = c.hint(BabyBear::new((qv & 0x1ff) as u32));
+    let q1 = c.hint(BabyBear::new((qv >> 9) as u32));
+    let r = c.hint(BabyBear::new(rv as u32));
+    let carry = c.hint(BabyBear::new(((qv & 0x1ff) * dv + rv) as u32 >> 9));
+    c.bits(q0, 9);
+    c.bits(q1, 9);
+    c.bits(carry, 18);
+    // 0 <= r < d.
+    c.bits(r, 17);
+    let room = c.sub(d, r);
+    let room = c.add_const(room, -BabyBear::ONE);
+    c.bits(room, 17);
+    // q0 d + r = carry 2^9.
+    let low = c.mul(q0, d);
+    let low = c.add(low, r);
+    let shifted = c.mul_const(carry, BabyBear::new(1 << 9));
+    c.assert_eq(low, shifted);
+    // q1 d + carry = 2^24.
+    let high = c.mul(q1, d);
+    let high = c.add(high, carry);
+    let top = c.constant(BabyBear::new(1 << 24));
+    c.assert_eq(high, top);
+    let q1_shifted = c.mul_const(q1, BabyBear::new(1 << 9));
+    c.add(q1_shifted, q0)
 }
 
 /// `t = lo + 2^12 next` with `lo` 12 bits and `next` `next_bits` bits.
@@ -220,7 +264,12 @@ pub fn add_work(c: &mut Circuit, a: &[Cell], b: &[Cell]) -> [Cell; WORK_LIMBS] {
 
 /// The PoW hash for `seed` and `nonce`, with each round's item opened
 /// against [`pow::ROOT`].
-fn pow_hash(c: &mut Circuit, tree: &MerkleTree, seed: &HashCells, nonce: &[Cell; LIMBS]) -> HashCells {
+fn pow_hash(
+    c: &mut Circuit,
+    tree: &MerkleTree,
+    seed: &HashCells,
+    nonce: &[Cell; LIMBS],
+) -> HashCells {
     let zero = c.zero();
     let mut s = [zero; WIDTH];
     s[..HASH_LEN].copy_from_slice(seed);
@@ -440,10 +489,9 @@ fn from_signed(x: i64) -> BabyBear {
 
 /// The `u64` in 16-bit limb cells (their current values).
 fn u64_of(c: &Circuit, limbs: &[Cell; LIMBS]) -> u64 {
-    limbs
-        .iter()
-        .enumerate()
-        .fold(0, |acc, (k, &l)| acc | (c.value(l).as_u32() as u64 & 0xffff) << (16 * k))
+    limbs.iter().enumerate().fold(0, |acc, (k, &l)| {
+        acc | (c.value(l).as_u32() as u64 & 0xffff) << (16 * k)
+    })
 }
 
 #[cfg(test)]
@@ -484,10 +532,10 @@ mod tests {
                 (10, g + 10 * s),
                 (10, g + 10 * s + 12345),
                 (10, g + 10 * s - 12345),
-                (5000, g + 1),            // far ahead: clamps low
-                (1, u64::MAX),            // far behind: clamps high
-                (u64::MAX / 2, g),        // huge height
-                (0, 0),                   // before genesis
+                (5000, g + 1),     // far ahead: clamps low
+                (1, u64::MAX),     // far behind: clamps high
+                (u64::MAX / 2, g), // huge height
+                (0, 0),            // before genesis
                 (3, g + 3 * s + (1 << 30)),
             ] {
                 let parent = header(h, t);
@@ -496,7 +544,10 @@ mod tests {
                 let l = log_target(&mut c, &consensus, &cells.height, &cells.timestamp);
                 assert!(c.failures().is_empty(), "{h} {t}");
                 assert!(c.check().is_ok());
-                assert_eq!(c.value(l), BabyBear::new(consensus.log_target(&parent) as u32));
+                assert_eq!(
+                    c.value(l),
+                    BabyBear::new(consensus.log_target(&parent) as u32)
+                );
                 for error in [-1, 1] {
                     let mut c = Circuit::new();
                     let cells = HeaderCells::input(&mut c, &parent);
@@ -607,7 +658,10 @@ mod tests {
         assert_eq!(check.hash.map(|x| c.value(x)), h.hash());
         assert_eq!(check.parent_hash.map(|x| c.value(x)), parent.hash());
         let work = crate::header::work(consensus.log_target(&parent));
-        assert_eq!(check.work.map(|x| c.value(x)), crate::header::work_limbs(work));
+        assert_eq!(
+            check.work.map(|x| c.value(x)),
+            crate::header::work_limbs(work)
+        );
         eprintln!("{:?}", c.stats());
 
         let target = consensus.target(&parent);
@@ -615,12 +669,49 @@ mod tests {
             .find(|&n| pow::value(&data.hash(&h.seed(), n)) >= target)
             .unwrap();
         for (what, bad) in [
-            ("nonce", Header { nonce: bad_nonce, ..h }),
+            (
+                "nonce",
+                Header {
+                    nonce: bad_nonce,
+                    ..h
+                },
+            ),
             ("height", Header { height: 43, ..h }),
-            ("prev", Header { prev: [BabyBear::ONE; HASH_LEN], ..h }),
-            ("timestamp", Header { timestamp: parent.timestamp, ..h }),
+            (
+                "prev",
+                Header {
+                    prev: [BabyBear::ONE; HASH_LEN],
+                    ..h
+                },
+            ),
+            (
+                "timestamp",
+                Header {
+                    timestamp: parent.timestamp,
+                    ..h
+                },
+            ),
         ] {
             assert!(!build(&bad).0.failures().is_empty(), "{what}");
+        }
+    }
+
+    #[test]
+    fn quotient_is_exact() {
+        for frac in (0..1u32 << FRAC_BITS).step_by(97).chain([1, 65534, 65535]) {
+            let mut c = Circuit::new();
+            let f = c.input(BabyBear::new(frac));
+            let q = quotient(&mut c, f);
+            assert!(c.failures().is_empty(), "{frac}");
+            assert!(c.check().is_ok());
+            let want = (1u64 << 33) / ((1 << 16) + frac as u64);
+            assert_eq!(c.value(q).as_u32() as u64, want, "{frac}");
+            for error in [-1, 1] {
+                let mut c = Circuit::new();
+                let f = c.input(BabyBear::new(frac));
+                quotient_claiming(&mut c, f, error);
+                assert!(!c.failures().is_empty(), "{frac} accepted {error}");
+            }
         }
     }
 

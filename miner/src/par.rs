@@ -64,6 +64,63 @@ pub fn par_chunks_mut<T: Send>(
     });
 }
 
+/// Proofs to run at once: `R_JOBS` if set, else 1. A proof's phases don't
+/// all use every core, so two at a time are a few percent faster, at the
+/// cost of a second proof's memory (about 2 GB).
+pub fn jobs() -> usize {
+    static JOBS: OnceLock<usize> = OnceLock::new();
+    *JOBS.get_or_init(|| {
+        std::env::var("R_JOBS")
+            .ok()
+            .and_then(|t| t.parse().ok())
+            .filter(|&t| t > 0)
+            .unwrap_or(1)
+    })
+}
+
+/// Runs `tasks`, up to [`jobs`] at a time, and returns their results in
+/// order.
+pub fn run_jobs<T: Send>(tasks: Vec<Box<dyn FnOnce() -> T + Send + '_>>) -> Vec<T> {
+    let n = tasks.len();
+    let workers = jobs().min(n);
+    if workers <= 1 {
+        return tasks.into_iter().map(|f| f()).collect();
+    }
+    let tasks: Vec<std::sync::Mutex<Option<_>>> = tasks
+        .into_iter()
+        .map(|f| std::sync::Mutex::new(Some(f)))
+        .collect();
+    let results: Vec<std::sync::Mutex<Option<T>>> =
+        (0..n).map(|_| std::sync::Mutex::new(None)).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    let f = tasks[i]
+                        .lock()
+                        .expect("task lock")
+                        .take()
+                        .expect("taken once");
+                    *results[i].lock().expect("result lock") = Some(f());
+                }
+            });
+        }
+    });
+    results
+        .into_iter()
+        .map(|r| {
+            r.into_inner()
+                .expect("result lock")
+                .expect("every task ran")
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,6 +135,14 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn jobs_return_in_order() {
+        let tasks: Vec<Box<dyn FnOnce() -> usize + Send>> = (0..20usize)
+            .map(|i| Box::new(move || i * i) as Box<_>)
+            .collect();
+        assert_eq!(run_jobs(tasks), (0..20).map(|i| i * i).collect::<Vec<_>>());
     }
 
     #[test]

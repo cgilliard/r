@@ -120,10 +120,9 @@ pub fn net_limbs(net: i128) -> [BabyBear; NET_LIMBS] {
 
 /// Inverse of [`net_limbs`] for canonical limbs.
 pub fn net_value(limbs: &[BabyBear]) -> i128 {
-    let v = limbs
-        .iter()
-        .enumerate()
-        .fold(0u128, |acc, (i, x)| acc | (x.as_u32() as u128) << (LIMB_BITS as usize * i));
+    let v = limbs.iter().enumerate().fold(0u128, |acc, (i, x)| {
+        acc | (x.as_u32() as u128) << (LIMB_BITS as usize * i)
+    });
     v as i128 - NET_OFFSET as i128
 }
 

@@ -8,57 +8,57 @@
 //! its body hash, so a header's PoW is proven one block later, by its
 //! child's chain proof.
 //!
-//! Four recursion circuits:
+//! Three recursion circuits:
 //!
 //! - **first** (block 1): verifies block 1's aggregation proof and checks
 //!   its transition starts at genesis, which is built in; tip = genesis,
 //!   work 0.
-//! - **block** (block `N >= 2`): checks header `N - 1` against header
-//!   `N - 2` ([`pow_circuit::check_header`]: link, time, ASERT, PoW) and
-//!   verifies block `N`'s aggregation proof, starting at header `N - 1`'s
-//!   state. States the two header hashes, header `N - 1`'s state, the new
-//!   state and header `N - 1`'s work ([`block_statement`]).
 //! - **chain** (block `N >= 2`): verifies block `N - 1`'s published (wrap)
-//!   proof and a block proof; checks the block proof extends the previous
-//!   one (its parent hash is the previous tip, its tip's state the previous
-//!   state); adds the work. Its own key is part of the statement, since it
-//!   can't be a constant of its own circuit.
+//!   proof; checks header `N - 1` against header `N - 2`
+//!   ([`pow_circuit::check_header`]: link, time, ASERT, PoW), that it
+//!   extends the previous proof's tip and has its state; verifies block
+//!   `N`'s aggregation proof as a transition from that state; adds header
+//!   `N - 1`'s work. Its own key is part of the statement, since it can't
+//!   be a constant of its own circuit.
 //! - **wrap**: verifies a first or chain proof (keyed by the first key or
 //!   the statement's key) and restates its statement, in a smaller trace
-//!   with a larger blowup ([`wrap_params`]), so it needs half the queries:
-//!   the published proof is about half the size. Every block publishes a
+//!   with a larger blowup ([`wrap_params`]), so it needs fewer queries:
+//!   the published proof is about two thirds the size. Every block publishes a
 //!   wrap proof, and the next block's chain proof verifies that, so anyone
 //!   with the chain can extend it.
 //!
-//! The first, block and chain circuits run at the aggregation height with
+//! The first and chain circuits run at the aggregation height with
 //! its parameters.
 //!
 //! For each aggregation proof the circuits check what a full node can't see
-//! without the transactions: it names the merge key, its challenges are
-//! derived from its old and new state and its transaction hash
-//! ([`block::challenges`]), its fingerprint ratios are 1, its net value is
-//! the subsidy for the block's height ([`Consensus::subsidy`], which also
-//! ends the chain at its final height), and its segments start from an
-//! empty key chain.
+//! without the transactions: it names the merge key; its state hashes open
+//! (with the new root, size and last keys as witness) to a change starting
+//! at the old state with an empty key chain; its item stream starts and
+//! ends between transactions; its challenges are derived from its old and
+//! new state and its transaction hash ([`block::challenges`]); its three
+//! fingerprint ratios are 1; and its net value is the subsidy for the
+//! block's height ([`Consensus::subsidy`], which also ends the chain at its
+//! final height).
 //!
 //! A node fast-syncing from block `N` needs only headers `N - 1` and `N` and
 //! block `N`'s proof: [`Chain::verify_proof`] with header `N`'s `prev` and
 //! state and the claimed work, plus header `N`'s own PoW natively; then the
 //! state tree from peers, checked against header `N`'s root.
 
-use crate::aggregate::{AggError, Aggregator, Node, inputs, publish, statement as ast};
+use crate::aggregate::{self, AggError, Aggregator, Node, inputs, publish, statement as ast};
 use crate::babybear::BabyBear;
 use crate::block::{self, Aggregated, Block, BlockError, BlockProver, MAX_BLOCK_SIZE};
 use crate::circuit::{Cell, Circuit};
 use crate::fri::FriParams;
 use crate::hash::{HASH_LEN, Hash, domain};
 use crate::header::{self, Consensus, Header, WORK_LIMBS};
+use crate::item_chunk_air::Boundary;
 use crate::merkle::MerkleTree;
 use crate::output;
 use crate::pow_circuit::{self, HeaderCells};
 use crate::recursion_air::RecursionAir;
-use crate::stark::{self, StarkError, StarkProof};
-use crate::state::{self, StateTree};
+use crate::stark::{self, KeyCache, StarkError, StarkProof};
+use crate::state::{self, StateTree, Undo};
 use crate::symbolic::{Program, compile};
 use crate::verifier_circuit::{self, Inner, ProofCells};
 
@@ -79,39 +79,20 @@ pub mod statement {
     pub const LEN: usize = WORK + WORK_LIMBS;
 }
 
-/// Offsets in a block proof's statement.
-pub mod block_statement {
-    use crate::hash::HASH_LEN;
-    use crate::header::WORK_LIMBS;
-
-    /// Header `N - 2`'s hash.
-    pub const PARENT: usize = 0;
-    /// Header `N - 1`'s hash.
-    pub const TIP: usize = PARENT + HASH_LEN;
-    /// Header `N - 1`'s state.
-    pub const TIP_ROOT: usize = TIP + HASH_LEN;
-    pub const TIP_SIZE: usize = TIP_ROOT + HASH_LEN;
-    /// Block `N`'s new state.
-    pub const NEW_ROOT: usize = TIP_SIZE + 2;
-    pub const NEW_SIZE: usize = NEW_ROOT + HASH_LEN;
-    /// Header `N - 1`'s work.
-    pub const WORK: usize = NEW_SIZE + 2;
-    pub const LEN: usize = WORK + WORK_LIMBS;
-}
-
-use block_statement as bs;
 use statement as st;
 
 /// The wrap circuit's height.
 pub const WRAP_LOG_HEIGHT: u32 = 14;
 
-/// The wrap proof's parameters: blowup 64 with 14 queries and 16 grinding
-/// bits, the same ~100 bits of conjectured security as the default with
-/// half the queries.
+/// The wrap proof's parameters: blowup 32 with 16 queries and 20 grinding
+/// bits: the default's ~100 bits of conjectured security with 16 queries
+/// instead of 28, so a published proof of about 163 KB. (Blowup 64 with 14
+/// queries gave 150 KB but took twice as long to prove.)
 pub fn wrap_params() -> FriParams {
     FriParams {
-        log_blowup: 6,
-        num_queries: 14,
+        log_blowup: 5,
+        num_queries: 16,
+        grinding_bits: 20,
         ..FriParams::default()
     }
 }
@@ -133,13 +114,11 @@ pub struct Chain {
     /// The PoW dataset's tree, for opening items in header checks.
     tree: MerkleTree,
     first: Node,
-    block: Node,
     chain: Node,
     wrap: Node,
-    /// Constraints of first and chain proofs (they share a shape), block
-    /// proofs and wrap proofs.
+    /// Constraints of first and chain proofs (they share a shape) and of
+    /// wrap proofs.
     chain_program: Program,
-    block_program: Program,
     wrap_program: Program,
 }
 
@@ -200,50 +179,82 @@ fn subsidy_net(c: &mut Circuit, consensus: &Consensus, parent_height: &[Cell; 4]
         .collect()
 }
 
+/// Elements of a transition's witness: the new root and size and the
+/// last keys inserted and spent, which with the old state open the final
+/// aggregation statement's state hashes.
+const WITNESS_LEN: usize = 3 * HASH_LEN + 2;
+
+/// A transition's witness ([`WITNESS_LEN`]).
+fn witness(agg: &Aggregated) -> Vec<BabyBear> {
+    let (lo, hi) = state::split(agg.new.size);
+    let mut w = agg.new.root.to_vec();
+    w.extend([lo, hi]);
+    w.extend(agg.last_insert);
+    w.extend(agg.last_spend);
+    w
+}
+
 /// The checks on a final aggregation statement `s` that its proof can't
 /// make itself, for a transition starting at `old_root`, `old_size` and
-/// creating `net` ([`output::net_limbs`] cells).
+/// creating `net` ([`output::net_limbs`] cells), with witness `w`
+/// ([`WITNESS_LEN`] cells). Returns the new root and size cells.
 fn check_transition(
     c: &mut Circuit,
     merge_key: &Hash,
     s: &[Cell],
+    w: &[Cell],
     old_root: &[Cell],
     old_size: &[Cell],
     net: &[Cell],
-) {
+) -> Vec<Cell> {
     let key = consts(c, merge_key);
     assert_eq_all(c, &s[ast::VK..ast::VK + HASH_LEN], &key);
-    assert_eq_all(c, &s[ast::OLD_ROOT..ast::OLD_ROOT + HASH_LEN], old_root);
-    assert_eq_all(c, &s[ast::OLD_SIZE..ast::OLD_SIZE + 2], old_size);
+    let new_state = &w[..HASH_LEN + 2];
+
+    // The state goes from the old one, with segments starting from an
+    // empty key chain, to the witness's.
+    let zeros = consts(c, &[BabyBear::ZERO; 2 * HASH_LEN]);
+    let mut before = old_root.to_vec();
+    before.extend_from_slice(old_size);
+    before.extend_from_slice(&zeros);
+    let h = aggregate::state_hash_cells(c, &before);
+    assert_eq_all(c, &s[ast::STATE_IN..ast::STATE_IN + HASH_LEN], &h);
+    let h = aggregate::state_hash_cells(c, w);
+    assert_eq_all(c, &s[ast::STATE_OUT..ast::STATE_OUT + HASH_LEN], &h);
+
+    // The item stream starts and ends idle: every transaction is whole.
+    let idle = consts(c, &aggregate::stream_hash(&Boundary::IDLE));
+    assert_eq_all(c, &s[ast::STREAM_IN..ast::STREAM_IN + HASH_LEN], &idle);
+    assert_eq_all(c, &s[ast::STREAM_OUT..ast::STREAM_OUT + HASH_LEN], &idle);
+    let one = c.one();
+    c.assert_eq(s[ast::HAS_STATE], one);
+    c.assert_eq(s[ast::HAS_STREAM], one);
 
     // lambda, r = H(old state, new state, transaction hash).
     let mut elems = Vec::with_capacity(28);
-    for (at, len) in [
-        (ast::OLD_ROOT, HASH_LEN),
-        (ast::OLD_SIZE, 2),
-        (ast::NEW_ROOT, HASH_LEN),
-        (ast::NEW_SIZE, 2),
-        (ast::TX_HASH, HASH_LEN),
-    ] {
-        elems.extend_from_slice(&s[at..at + len]);
-    }
+    elems.extend_from_slice(old_root);
+    elems.extend_from_slice(old_size);
+    elems.extend_from_slice(new_state);
+    elems.extend_from_slice(&s[ast::TX_HASH..ast::TX_HASH + HASH_LEN]);
     let h = verifier_circuit::sponge(c, domain::BLOCK_CHALLENGES, &elems, None);
     assert_eq_all(c, &s[ast::LAMBDA..ast::LAMBDA + 4], &h[..4]);
     assert_eq_all(c, &s[ast::R..ast::R + 4], &h[4..8]);
 
     let one_ext = consts(c, &crate::babybear4::BabyBear4::ONE.0);
-    assert_eq_all(c, &s[ast::Q_IN..ast::Q_IN + 4], &one_ext);
-    assert_eq_all(c, &s[ast::Q_OUT..ast::Q_OUT + 4], &one_ext);
+    for at in [ast::Q_IN, ast::Q_OUT, ast::Q_SIG] {
+        assert_eq_all(c, &s[at..at + 4], &one_ext);
+    }
     assert_eq_all(c, &s[ast::NET..ast::NET + output::NET_LIMBS], net);
-    let one = c.one();
-    c.assert_eq(s[ast::HAS_STATE], one);
-    let zeros = consts(c, &[BabyBear::ZERO; HASH_LEN]);
-    assert_eq_all(c, &s[ast::PREV_INS_IN..ast::PREV_INS_IN + HASH_LEN], &zeros);
-    assert_eq_all(c, &s[ast::PREV_SP_IN..ast::PREV_SP_IN + HASH_LEN], &zeros);
+    new_state.to_vec()
 }
 
 /// Loads an aggregation statement and proof and verifies it.
-fn load_aggregate(c: &mut Circuit, agg: &Aggregator, statement: &[BabyBear], proof: &StarkProof) -> Vec<Cell> {
+fn load_aggregate(
+    c: &mut Circuit,
+    agg: &Aggregator,
+    statement: &[BabyBear],
+    proof: &StarkProof,
+) -> Vec<Cell> {
     let s = inputs(c, statement);
     let cells = ProofCells::load(c, proof);
     verifier_circuit::verify(c, &agg.merge_inner(), &s, &cells);
@@ -257,49 +268,22 @@ fn first_circuit(
     vk: &Hash,
     statement: &[BabyBear],
     proof: &StarkProof,
+    witness: &[BabyBear],
 ) -> (Circuit, Vec<Cell>) {
     let mut c = Circuit::new();
     let vk = inputs(&mut c, vk);
     let s = load_aggregate(&mut c, agg, statement, proof);
+    let w = inputs(&mut c, witness);
     let (lo, hi) = state::split(genesis.state.size);
     let old_root = consts(&mut c, &genesis.state.root);
     let old_size = consts(&mut c, &[lo, hi]);
     let subsidy = consensus.subsidy(1).expect("block 1 is valid");
     let net = consts(&mut c, &output::net_limbs(subsidy as i128));
-    check_transition(&mut c, &agg.merge_key(), &s, &old_root, &old_size, &net);
+    let new = check_transition(&mut c, &agg.merge_key(), &s, &w, &old_root, &old_size, &net);
     let mut out = vk;
     out.extend(consts(&mut c, &genesis.hash()));
-    out.extend_from_slice(&s[ast::NEW_ROOT..ast::NEW_ROOT + HASH_LEN]);
-    out.extend_from_slice(&s[ast::NEW_SIZE..ast::NEW_SIZE + 2]);
+    out.extend(new);
     out.extend(consts(&mut c, &header::work_limbs(0)));
-    let public = publish(&mut c, &out);
-    (c, public)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn block_circuit(
-    consensus: &Consensus,
-    tree: &MerkleTree,
-    agg: &Aggregator,
-    parent: &Header,
-    header: &Header,
-    statement: &[BabyBear],
-    proof: &StarkProof,
-) -> (Circuit, Vec<Cell>) {
-    let mut c = Circuit::new();
-    let p = HeaderCells::input(&mut c, parent);
-    let h = HeaderCells::input(&mut c, header);
-    let check = pow_circuit::check_header(&mut c, consensus, tree, &p, &h);
-    let s = load_aggregate(&mut c, agg, statement, proof);
-    let net = subsidy_net(&mut c, consensus, &h.height);
-    check_transition(&mut c, &agg.merge_key(), &s, &h.root, &h.size, &net);
-    let mut out = check.parent_hash.to_vec();
-    out.extend(check.hash);
-    out.extend(h.root);
-    out.extend(h.size);
-    out.extend_from_slice(&s[ast::NEW_ROOT..ast::NEW_ROOT + HASH_LEN]);
-    out.extend_from_slice(&s[ast::NEW_SIZE..ast::NEW_SIZE + 2]);
-    out.extend(check.work);
     let public = publish(&mut c, &out);
     (c, public)
 }
@@ -330,14 +314,23 @@ fn wrap_circuit(
     (c, public)
 }
 
-/// Extends block `N - 1`'s wrap proof (`prev`) with a block proof.
+/// Extends block `N - 1`'s wrap proof (`prev`) to block `N`: checks header
+/// `N - 1` (`header`) against header `N - 2` (`parent`) and that it's the
+/// previous proof's tip state, verifies block `N`'s aggregation proof as a
+/// transition from header `N - 1`'s state, and adds header `N - 1`'s work.
+#[allow(clippy::too_many_arguments)]
 fn chain_circuit(
+    consensus: &Consensus,
+    tree: &MerkleTree,
+    agg: &Aggregator,
     wrap: &Inner<'_, RecursionAir>,
-    block: &Inner<'_, RecursionAir>,
     vk: &Hash,
     prev: &ChainProof,
-    block_statement: &[BabyBear],
-    block_proof: &StarkProof,
+    parent: &Header,
+    header: &Header,
+    statement: &[BabyBear],
+    proof: &StarkProof,
+    witness: &[BabyBear],
 ) -> (Circuit, Vec<Cell>) {
     let mut c = Circuit::new();
     let vk = inputs(&mut c, vk);
@@ -347,27 +340,24 @@ fn chain_circuit(
     verifier_circuit::verify(&mut c, wrap, &ps, &cells);
     assert_eq_all(&mut c, &ps[st::VK..st::VK + HASH_LEN], &vk);
 
-    // The block proof extends it.
-    let b = inputs(&mut c, block_statement);
-    let cells = ProofCells::load(&mut c, block_proof);
-    verifier_circuit::verify(&mut c, block, &b, &cells);
-    assert_eq_all(&mut c, &b[bs::PARENT..bs::PARENT + HASH_LEN], &ps[st::TIP..st::TIP + HASH_LEN]);
-    assert_eq_all(
-        &mut c,
-        &b[bs::TIP_ROOT..bs::TIP_ROOT + HASH_LEN],
-        &ps[st::ROOT..st::ROOT + HASH_LEN],
-    );
-    assert_eq_all(&mut c, &b[bs::TIP_SIZE..bs::TIP_SIZE + 2], &ps[st::SIZE..st::SIZE + 2]);
-    let work = pow_circuit::add_work(
-        &mut c,
-        &ps[st::WORK..st::WORK + WORK_LIMBS],
-        &b[bs::WORK..bs::WORK + WORK_LIMBS],
-    );
+    // Header N - 1 extends the previous proof's tip and has its state.
+    let p = HeaderCells::input(&mut c, parent);
+    let h = HeaderCells::input(&mut c, header);
+    let check = pow_circuit::check_header(&mut c, consensus, tree, &p, &h);
+    assert_eq_all(&mut c, &check.parent_hash, &ps[st::TIP..st::TIP + HASH_LEN]);
+    assert_eq_all(&mut c, &h.root, &ps[st::ROOT..st::ROOT + HASH_LEN]);
+    assert_eq_all(&mut c, &h.size, &ps[st::SIZE..st::SIZE + 2]);
 
+    // Block N's transition from there.
+    let s = load_aggregate(&mut c, agg, statement, proof);
+    let w = inputs(&mut c, witness);
+    let net = subsidy_net(&mut c, consensus, &h.height);
+    let new = check_transition(&mut c, &agg.merge_key(), &s, &w, &h.root, &h.size, &net);
+
+    let work = pow_circuit::add_work(&mut c, &ps[st::WORK..st::WORK + WORK_LIMBS], &check.work);
     let mut out = vk;
-    out.extend_from_slice(&b[bs::TIP..bs::TIP + HASH_LEN]);
-    out.extend_from_slice(&b[bs::NEW_ROOT..bs::NEW_ROOT + HASH_LEN]);
-    out.extend_from_slice(&b[bs::NEW_SIZE..bs::NEW_SIZE + 2]);
+    out.extend(check.hash);
+    out.extend(new);
     out.extend(work);
     let public = publish(&mut c, &out);
     (c, public)
@@ -380,7 +370,13 @@ impl Chain {
     ///
     /// # Panics
     /// If a circuit doesn't fit the aggregation height.
-    pub fn new(consensus: Consensus, genesis: Header, blocks: BlockProver, tree: MerkleTree) -> Self {
+    pub fn new(
+        consensus: Consensus,
+        genesis: Header,
+        blocks: BlockProver,
+        tree: MerkleTree,
+        keys: &KeyCache,
+    ) -> Self {
         let agg = blocks.aggregator();
         let params = *agg.params();
         let log_height = agg.log_height();
@@ -388,15 +384,19 @@ impl Chain {
         let agg_statement = vec![BabyBear::ZERO; ast::LEN];
         let agg_proof = StarkProof::placeholder(&params, &merge_air, log_height);
         let zero_vk = [BabyBear::ZERO; HASH_LEN];
+        let w = [BabyBear::ZERO; WITNESS_LEN];
 
-        let (c, public) = first_circuit(&consensus, &genesis, agg, &zero_vk, &agg_statement, &agg_proof);
-        let first = Node::new(&params, &c, &public, log_height);
-        let default = Header::default();
-        let (c, public) =
-            block_circuit(&consensus, &tree, agg, &default, &default, &agg_statement, &agg_proof);
-        let block = Node::new(&params, &c, &public, log_height);
+        let (c, public) = first_circuit(
+            &consensus,
+            &genesis,
+            agg,
+            &zero_vk,
+            &agg_statement,
+            &agg_proof,
+            &w,
+        );
+        let first = Node::new(&params, &c, &public, log_height, keys);
         let chain_program = compile(&first.air, st::LEN);
-        let block_program = compile(&block.air, bs::LEN);
 
         // The wrap circuit verifies first and chain proofs, which share a
         // shape: lay it out with the first circuit standing in.
@@ -418,15 +418,18 @@ impl Chain {
             &inner.proof,
             false,
         );
-        let wrap = Node::new(&wrap_params, &c, &public, WRAP_LOG_HEIGHT);
+        let wrap = Node::new(&wrap_params, &c, &public, WRAP_LOG_HEIGHT, keys);
         let wrap_program = compile(&wrap.air, st::LEN);
 
         let prev = ChainProof {
             statement: vec![BabyBear::ZERO; st::LEN],
             proof: StarkProof::placeholder(&wrap_params, &wrap.air, WRAP_LOG_HEIGHT),
         };
-        let block_proof = StarkProof::placeholder(&params, &block.air, log_height);
+        let default = Header::default();
         let (c, public) = chain_circuit(
+            &consensus,
+            &tree,
+            agg,
             &Inner {
                 params: &wrap_params,
                 vk: &wrap.vk,
@@ -434,19 +437,15 @@ impl Chain {
                 program: &wrap_program,
                 log_n: WRAP_LOG_HEIGHT,
             },
-            &Inner {
-                params: &params,
-                vk: &block.vk,
-                air: &block.air,
-                program: &block_program,
-                log_n: log_height,
-            },
             &zero_vk,
             &prev,
-            &[BabyBear::ZERO; bs::LEN],
-            &block_proof,
+            &default,
+            &default,
+            &agg_statement,
+            &agg_proof,
+            &w,
         );
-        let chain = Node::new(&params, &c, &public, log_height);
+        let chain = Node::new(&params, &c, &public, log_height, keys);
         Self {
             consensus,
             genesis,
@@ -455,11 +454,9 @@ impl Chain {
             blocks,
             tree,
             first,
-            block,
             chain,
             wrap,
             chain_program,
-            block_program,
             wrap_program,
         }
     }
@@ -481,17 +478,22 @@ impl Chain {
         self.chain.root()
     }
 
-    /// Rows used by the first, block and chain circuits (of
-    /// `2^log_height`) and the wrap circuit (of `2^WRAP_LOG_HEIGHT`).
-    pub fn used_rows(&self) -> ([usize; 4], u32) {
+    /// Rows used by the first and chain circuits (of `2^log_height`) and
+    /// the wrap circuit (of `2^WRAP_LOG_HEIGHT`).
+    pub fn used_rows(&self) -> ([usize; 3], u32) {
         (
-            [&self.first, &self.block, &self.chain, &self.wrap].map(|n| n.air.used_rows()),
+            [&self.first, &self.chain, &self.wrap].map(|n| n.air.used_rows()),
             self.log_height,
         )
     }
 
     /// Wraps a first (`is_first`) or chain proof.
-    fn wrap(&self, statement: Vec<BabyBear>, proof: StarkProof, is_first: bool) -> Result<ChainProof, AggError> {
+    fn wrap(
+        &self,
+        statement: Vec<BabyBear>,
+        proof: StarkProof,
+        is_first: bool,
+    ) -> Result<ChainProof, AggError> {
         let inner = Inner {
             params: &self.params,
             vk: &self.chain.vk,
@@ -516,6 +518,7 @@ impl Chain {
             &self.key(),
             &agg.node.statement.0,
             &agg.node.proof,
+            &witness(agg),
         );
         let (statement, proof) = self
             .first
@@ -534,21 +537,11 @@ impl Chain {
         parent: &Header,
         agg: &Aggregated,
     ) -> Result<ChainProof, AggError> {
-        let (c, public) = block_circuit(
+        let wrap_params = wrap_params();
+        let (c, public) = chain_circuit(
             &self.consensus,
             &self.tree,
             self.blocks.aggregator(),
-            grandparent,
-            parent,
-            &agg.node.statement.0,
-            &agg.node.proof,
-        );
-        let (block_statement, block_proof) = self
-            .block
-            .prove(&self.params, &c, &public)
-            .ok_or(AggError::Invalid)?;
-        let wrap_params = wrap_params();
-        let (c, public) = chain_circuit(
             &Inner {
                 params: &wrap_params,
                 vk: &self.wrap.vk,
@@ -556,17 +549,13 @@ impl Chain {
                 program: &self.wrap_program,
                 log_n: WRAP_LOG_HEIGHT,
             },
-            &Inner {
-                params: &self.params,
-                vk: &self.block.vk,
-                air: &self.block.air,
-                program: &self.block_program,
-                log_n: self.log_height,
-            },
             &self.key(),
             prev,
-            &block_statement,
-            &block_proof,
+            grandparent,
+            parent,
+            &agg.node.statement.0,
+            &agg.node.proof,
+            &witness(agg),
         );
         let (statement, proof) = self
             .chain
@@ -599,7 +588,13 @@ impl Chain {
             return Err(StarkError::Shape);
         }
         let statement = self.statement(header, work_before);
-        stark::verify(&wrap_params(), &self.wrap.vk, &self.wrap.air, &statement, proof)
+        stark::verify(
+            &wrap_params(),
+            &self.wrap.vk,
+            &self.wrap.air,
+            &statement,
+            proof,
+        )
     }
 
     /// Checks `block` as the body of `header`: it fits [`MAX_BLOCK_SIZE`],
@@ -621,7 +616,7 @@ impl Chain {
         {
             return Err(BlockError::NotCanonical);
         }
-        if block.body_hash() != Some(header.body) {
+        if block.body_hash() != header.body {
             return Err(BlockError::Body);
         }
         self.verify_proof(header, work_before, &block.proof)
@@ -638,7 +633,7 @@ impl Chain {
         header: &Header,
         block: &Block,
         work_before: u128,
-    ) -> Result<(), BlockError> {
+    ) -> Result<Undo, BlockError> {
         self.verify_block(header, block, work_before)?;
         block::apply(tree, txn, parent, header, block)
     }
@@ -656,8 +651,6 @@ mod tests {
     use crate::header::FRAC_BITS;
     use crate::output::Output;
     use crate::pow::Dataset;
-    use crate::state_air::StateSegmentAir;
-    use crate::subblock_air::SubBlockAir;
     use crate::transaction::{Transaction, TxBody};
     use crate::wallet::{Coin, Wallet};
 
@@ -693,20 +686,13 @@ mod tests {
             ..Header::default()
         };
         let t = std::time::Instant::now();
-        let blocks = BlockProver::new(
-            FriParams::default(),
-            SubBlockAir {
-                inputs: 16,
-                outputs: 16,
-            },
-            StateSegmentAir {
-                inserts: 16,
-                spends: 16,
-            },
-            15,
+        let blocks = BlockProver::standard(FriParams::default(), &KeyCache::none());
+        let chain = Chain::new(consensus, genesis, blocks, data.tree(), &KeyCache::none());
+        eprintln!(
+            "setup {:.1} s, rows {:?}",
+            t.elapsed().as_secs_f64(),
+            chain.used_rows()
         );
-        let chain = Chain::new(consensus, genesis, blocks, data.tree());
-        eprintln!("setup {:.1} s, rows {:?}", t.elapsed().as_secs_f64(), chain.used_rows());
 
         let (early, late) = (consensus.first_subsidy, consensus.second_subsidy);
         let wallet = Wallet::from_seed(BabyBear::new_array([9, 8, 7, 6, 5, 4, 3, 2]));
@@ -741,7 +727,10 @@ mod tests {
             let parent = *headers.last().unwrap();
             let t = std::time::Instant::now();
             let mut txn = env.env().write_txn().unwrap();
-            let agg = chain.block_prover().prove(&tree, &mut txn, txs, subsidy).unwrap();
+            let agg = chain
+                .block_prover()
+                .prove(&tree, &mut txn, txs, subsidy)
+                .unwrap();
             let state = tree.state(&txn).unwrap();
             txn.abort();
             let proof = match proofs.last() {
@@ -765,7 +754,7 @@ mod tests {
                 prev: parent.hash(),
                 timestamp: parent.timestamp + 600,
                 state,
-                body: block.body_hash().unwrap(),
+                body: block.body_hash(),
                 nonce: 0,
             };
             assert!(header.mine(data, consensus.target(&parent)));
@@ -800,21 +789,36 @@ mod tests {
         // Mismatches.
         let rejects = |h: &Header, w: u128, p: &StarkProof| chain.verify_proof(h, w, p).is_err();
         assert!(rejects(&tip, work[2] + 1, &proofs[2].proof), "wrong work");
-        assert!(rejects(&tip, work[1], &proofs[2].proof), "work one block short");
+        assert!(
+            rejects(&tip, work[1], &proofs[2].proof),
+            "work one block short"
+        );
         let other_state = Header {
             state: headers[2].state,
             ..tip
         };
-        assert!(rejects(&other_state, work[2], &proofs[2].proof), "wrong state");
+        assert!(
+            rejects(&other_state, work[2], &proofs[2].proof),
+            "wrong state"
+        );
         let other_parent = Header {
             prev: headers[1].hash(),
             ..tip
         };
-        assert!(rejects(&other_parent, work[2], &proofs[2].proof), "wrong parent");
-        assert!(rejects(&tip, work[2], &proofs[1].proof), "previous block's proof");
-        assert!(rejects(&headers[1], work[0], &proofs[2].proof), "tip's proof for block 1");
-        // Every published proof is a wrap proof, about half the size of the
-        // inner proofs.
+        assert!(
+            rejects(&other_parent, work[2], &proofs[2].proof),
+            "wrong parent"
+        );
+        assert!(
+            rejects(&tip, work[2], &proofs[1].proof),
+            "previous block's proof"
+        );
+        assert!(
+            rejects(&headers[1], work[0], &proofs[2].proof),
+            "tip's proof for block 1"
+        );
+        // Every published proof is a wrap proof, about two thirds the size
+        // of the inner proofs.
         for p in &proofs {
             assert_eq!(p.proof.size(), proofs[0].proof.size());
         }
@@ -832,7 +836,12 @@ mod tests {
         let mut txn = env.env().write_txn().unwrap();
         let agg = chain
             .block_prover()
-            .prove(&tree, &mut txn, &[spend(&wallet, &[], vec![pay(6, late)])], late)
+            .prove(
+                &tree,
+                &mut txn,
+                &[spend(&wallet, &[], vec![pay(6, late)])],
+                late,
+            )
             .unwrap();
         txn.abort();
         assert_eq!(
@@ -863,4 +872,3 @@ mod tests {
         );
     }
 }
-
