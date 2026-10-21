@@ -1115,15 +1115,20 @@ mod tests {
     ) -> (Header, Block) {
         let l = &nodes[0].cli.ledger;
         let (tip, _) = l.tip().unwrap();
-        let state = {
+        let (state, mut inputs) = {
             let mut txn = l.env.write_txn().unwrap();
+            let positions: Vec<u64> = spent
+                .iter()
+                .map(|c| l.tree.get(&txn, c).unwrap().unwrap().0)
+                .collect();
             l.tree.apply_changes(&mut txn, created, spent).unwrap();
             let s = l.tree.state(&txn).unwrap();
             txn.abort();
-            s
+            (s, positions)
         };
+        inputs.sort_unstable();
         let block = Block {
-            inputs: spent.to_vec(),
+            inputs,
             outputs: created.to_vec(),
             proof: tiny_proof(),
         };

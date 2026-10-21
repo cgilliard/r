@@ -656,15 +656,23 @@ pub(crate) mod tests {
         /// The next block on this branch creating `created` and spending
         /// `spent` (by record number).
         fn next(&mut self, created: &[u32], spent: &[u32]) -> (Header, Block) {
+            let spent: Vec<_> = spent.iter().map(|&n| record(n).commitment).collect();
+            let outputs: Vec<_> = created.iter().map(|&n| record(n)).collect();
+            let mut txn = self.env.env().write_txn().unwrap();
+            // Inserts first, as the tree applies a block, so a spend of a
+            // new output finds its slot.
+            self.tree.apply_changes(&mut txn, &outputs, &[]).unwrap();
+            let mut inputs: Vec<u64> = spent
+                .iter()
+                .map(|c| self.tree.get(&txn, c).unwrap().unwrap().0)
+                .collect();
+            inputs.sort_unstable();
+            self.tree.apply_changes(&mut txn, &[], &spent).unwrap();
             let block = Block {
-                inputs: spent.iter().map(|&n| record(n).commitment).collect(),
-                outputs: created.iter().map(|&n| record(n)).collect(),
+                inputs,
+                outputs,
                 proof: tiny_proof(),
             };
-            let mut txn = self.env.env().write_txn().unwrap();
-            self.tree
-                .apply_changes(&mut txn, &block.outputs, &block.inputs)
-                .unwrap();
             txn.commit().unwrap();
             let header = Header {
                 height: self.tip.height + 1,
@@ -852,6 +860,44 @@ pub(crate) mod tests {
         let b2 = b.next(&[3], &[1]);
         l.add(&b1.0, &b1.1).unwrap();
         assert_eq!(l.add(&b2.0, &b2.1).unwrap(), Added::Extended);
+    }
+
+    #[test]
+    fn blocks_spend_by_the_position_of_an_unspent_output() {
+        let genesis = Header {
+            timestamp: now() - 1_000_000,
+            state: crate::state::empty_state(),
+            ..Header::default()
+        };
+        let env = TempEnv::new();
+        let l = ledger(&env, &genesis);
+        let mut b = Branch::new(genesis);
+        let b1 = b.next(&[1, 2], &[]);
+        let b2 = b.next(&[3], &[1]);
+        l.add(&b1.0, &b1.1).unwrap();
+        l.add(&b2.0, &b2.1).unwrap();
+        let spent = b2.1.inputs[0];
+        // A block naming the slot just emptied, or the sentinel's.
+        let (h3, block3) = b.next(&[4], &[]);
+        fn refusal(l: &Ledger, h3: &Header, block3: &Block, inputs: Vec<u64>) -> BlockError {
+            let block = Block {
+                inputs,
+                ..block3.clone()
+            };
+            let h = Header {
+                body: block.body_hash(),
+                ..*h3
+            };
+            match l.add(&h, &block).unwrap_err() {
+                LedgerError::Block(e) => e,
+                e => panic!("{e}"),
+            }
+        }
+        let e = refusal(&l, &h3, &block3, vec![spent]);
+        assert!(matches!(e, BlockError::NotAnOutput(p) if p == spent), "{e}");
+        let e = refusal(&l, &h3, &block3, vec![0]);
+        assert!(matches!(e, BlockError::NotCanonical), "{e}");
+        assert_eq!(l.tip().unwrap().0, b2.0);
     }
 
     #[test]

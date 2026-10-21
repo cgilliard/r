@@ -343,10 +343,8 @@ mod tests {
     }
 
     fn block(n: u8) -> Block {
-        let mut c = [BabyBear::new(n as u32 + 1); HASH_LEN];
-        c[0] = BabyBear::new(9);
         Block {
-            inputs: vec![Commitment(hash::to_bytes(&c))],
+            inputs: vec![n as u64 + 1],
             outputs: vec![OutputRecord {
                 commitment: Commitment(hash::to_bytes(&[BabyBear::new(n as u32 + 3); HASH_LEN])),
                 nonce: [n; NONCE_LEN],

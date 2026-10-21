@@ -567,6 +567,17 @@ impl StateTree {
         }
     }
 
+    /// The commitment of the unspent output in slot `index`, if any.
+    pub fn commitment_at(&self, txn: &RoTxn, index: u64) -> Result<Option<Commitment>, Error> {
+        if index == 0 {
+            return Ok(None);
+        }
+        match self.leaves.get(txn, &index.to_be_bytes())? {
+            Some(bytes) => Ok(Some(Commitment(hash::to_bytes(&decode_leaf(bytes)?.key)))),
+            None => Ok(None),
+        }
+    }
+
     /// Every unspent output with its slot, in slot order: what a wallet
     /// scans and a syncing node downloads.
     pub fn outputs(&self, txn: &RoTxn) -> Result<Vec<(u64, OutputRecord)>, Error> {

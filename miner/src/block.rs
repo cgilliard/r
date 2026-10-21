@@ -1,12 +1,13 @@
 //! Blocks: the published input and output lists, how a block's state
 //! transition is proved, and how its lists are applied.
 //!
-//! A block publishes its spent input commitments and its new output
-//! records, each in canonical order (ascending state-tree key, no
-//! duplicates), and one chain proof ([`crate::chain`]) covering its own
+//! A block publishes the positions of the outputs it spends (ascending
+//! state-tree slots) and its new output records (ascending state-tree key,
+//! no duplicates), and one chain proof ([`crate::chain`]) covering its own
 //! transition and the whole history before it. Transactions stay private.
-//! No commitment may be in both lists: a block can't spend an output it
-//! creates, so every input was confirmed in an earlier block.
+//! A block can't spend an output it creates (every spent position is
+//! below the slot counter before the block), so every input was confirmed
+//! in an earlier block.
 //!
 //! Fees are implicit and there is no separate reward rule: transactions
 //! need not balance, and the only value rule is the block's, that
@@ -33,7 +34,10 @@
 //!
 //! The published lists are bound through the state: applying them to the
 //! previous tree must give the header's new state ([`apply`]). Output
-//! nonces are in the tree's leaves, so the state binds them too.
+//! nonces are in the tree's leaves, so the state binds them too. Spent
+//! outputs are listed by their position (state-tree slot, 5 bytes), not
+//! their commitment: every node has the tree, so it looks the commitment
+//! up, and slots are never reused, so a position names one output.
 //!
 //! On the wire a block is its header and body ([`encode`]), at most
 //! [`MAX_BLOCK_SIZE`] bytes. A [`Header`] commits to the block through
@@ -61,8 +65,8 @@ use crate::transaction::{Transaction, TxError};
 /// What a block publishes.
 #[derive(Clone, Debug)]
 pub struct Block {
-    /// Spent commitments, in canonical order.
-    pub inputs: Vec<Commitment>,
+    /// Spent outputs' positions (state-tree slots), ascending.
+    pub inputs: Vec<u64>,
     /// New outputs, in canonical order.
     pub outputs: Vec<OutputRecord>,
     /// The chain proof ([`crate::chain`]).
@@ -76,13 +80,15 @@ pub enum BlockError {
     /// A transaction's input names a position other than the spent
     /// output's slot.
     Position(usize),
-    /// The lists aren't in canonical order, repeat a commitment, or hold a
-    /// commitment that isn't a valid key.
+    /// The lists aren't in canonical order, repeat a commitment or
+    /// position, or hold a commitment that isn't a valid key or a position
+    /// that can't hold an output.
     NotCanonical,
-    /// A commitment is in both lists: the block spends an output it
-    /// creates, which isn't allowed (every input must be confirmed in an
-    /// earlier block).
+    /// The block spends an output it creates, which isn't allowed (every
+    /// input must be confirmed in an earlier block).
     SpendsItsOwnOutput,
+    /// An input's position holds no unspent output.
+    NotAnOutput(u64),
     /// The state tree rejected an operation (a missing or spent input, a
     /// duplicate output).
     State(state::Error),
@@ -110,6 +116,7 @@ impl fmt::Display for BlockError {
             Self::Position(i) => write!(f, "transaction {i} names the wrong position for an input"),
             Self::NotCanonical => write!(f, "lists not in canonical order"),
             Self::SpendsItsOwnOutput => write!(f, "spends an output it creates"),
+            Self::NotAnOutput(p) => write!(f, "spends position {p}, which holds no unspent output"),
             Self::State(e) => write!(f, "state: {e:?}"),
             Self::Proof(e) => write!(f, "proof: {e}"),
             Self::Net(n) => write!(f, "transactions create {n}, not the subsidy"),
@@ -139,6 +146,20 @@ pub(crate) fn spends_own_output(inputs: &[Commitment], outputs: &[OutputRecord])
     let created: std::collections::HashSet<&Commitment> =
         outputs.iter().map(|o| &o.commitment).collect();
     inputs.iter().any(|c| created.contains(c))
+}
+
+/// Whether `positions` are strictly ascending slots that can hold an
+/// output (slot 0 is the tree's sentinel).
+pub(crate) fn positions_canonical(positions: &[u64]) -> bool {
+    positions.first().is_none_or(|&p| p > 0)
+        && positions.last().is_none_or(|&p| p < state::CAPACITY)
+        && positions.windows(2).all(|w| w[0] < w[1])
+}
+
+/// Whether ascending `positions` reach a slot filled by the block itself:
+/// one at or above `prev_size`, the slot counter before the block.
+pub(crate) fn spends_new_slot(positions: &[u64], prev_size: u64) -> bool {
+    positions.last().is_some_and(|&p| p >= prev_size)
 }
 
 /// The canonical order: ascending key, compared on canonical limbs.
@@ -222,8 +243,10 @@ fn merge_tx_hashes(mut level: Vec<Hash>) -> Hash {
 /// The most bytes a serialized block ([`encode`]) may take.
 pub const MAX_BLOCK_SIZE: usize = 2_000_000;
 
-/// Bytes per serialized input: its commitment.
-pub const INPUT_BYTES: usize = COMMITMENT_LEN;
+/// Bytes per serialized input: its position (a slot below
+/// [`state::CAPACITY`]).
+pub const INPUT_BYTES: usize = state::DEPTH / 8;
+const _: () = assert!(state::DEPTH.is_multiple_of(8));
 /// Bytes per serialized output: its commitment and nonce.
 pub const OUTPUT_BYTES: usize = COMMITMENT_LEN + NONCE_LEN;
 
@@ -232,8 +255,8 @@ pub fn encoded_size(inputs: usize, outputs: usize, proof: usize) -> usize {
     crate::header::HEADER_BYTES + 12 + inputs * INPUT_BYTES + outputs * OUTPUT_BYTES + proof
 }
 
-/// Serializes a block with its header: `header | n_in (u32) | inputs |
-/// n_out (u32) | outputs (commitment, nonce) | proof length (u32) | proof`,
+/// Serializes a block with its header: `header | n_in (u32) | inputs
+/// (positions, 5 bytes each) | n_out (u32) | outputs (commitment, nonce) | proof length (u32) | proof`,
 /// integers little-endian.
 pub fn encode(header: &Header, block: &Block) -> Vec<u8> {
     let mut out = header.to_bytes().to_vec();
@@ -250,8 +273,8 @@ pub fn encode_body(block: &Block) -> Vec<u8> {
             - crate::header::HEADER_BYTES,
     );
     out.extend((block.inputs.len() as u32).to_le_bytes());
-    for c in &block.inputs {
-        out.extend(c.0);
+    for p in &block.inputs {
+        out.extend(&p.to_le_bytes()[..INPUT_BYTES]);
     }
     out.extend((block.outputs.len() as u32).to_le_bytes());
     for o in &block.outputs {
@@ -314,9 +337,9 @@ pub fn decode_body(bytes: &[u8]) -> Result<Block, DecodeError> {
     let n_in = count(take(4)?);
     let mut inputs = Vec::with_capacity(n_in.min(MAX_BLOCK_SIZE / INPUT_BYTES));
     for _ in 0..n_in {
-        inputs.push(Commitment(
-            take(COMMITMENT_LEN)?.try_into().expect("length"),
-        ));
+        let mut p = [0; 8];
+        p[..INPUT_BYTES].copy_from_slice(take(INPUT_BYTES)?);
+        inputs.push(u64::from_le_bytes(p));
     }
     let n_out = count(take(4)?);
     let mut outputs = Vec::with_capacity(n_out.min(MAX_BLOCK_SIZE / OUTPUT_BYTES));
@@ -351,11 +374,23 @@ pub fn apply(
     if tree.state(txn).map_err(BlockError::State)? != parent.state {
         return Err(BlockError::StateMismatch);
     }
-    if spends_own_output(&block.inputs, &block.outputs) {
+    if !positions_canonical(&block.inputs) {
+        return Err(BlockError::NotCanonical);
+    }
+    if spends_new_slot(&block.inputs, parent.state.size) {
         return Err(BlockError::SpendsItsOwnOutput);
     }
+    // What the positions hold, before the block's outputs go in.
+    let mut spent = Vec::with_capacity(block.inputs.len());
+    for &p in &block.inputs {
+        spent.push(
+            tree.commitment_at(txn, p)
+                .map_err(BlockError::State)?
+                .ok_or(BlockError::NotAnOutput(p))?,
+        );
+    }
     let proofs = tree
-        .apply_block(txn, header.height, &block.outputs, &block.inputs)
+        .apply_block(txn, header.height, &block.outputs, &spent)
         .map_err(BlockError::State)?;
     if tree.state(txn).map_err(BlockError::State)? != header.state {
         return Err(BlockError::StateMismatch);
@@ -368,7 +403,8 @@ pub fn apply(
 /// what its statement's state hashes open to.
 #[derive(Clone, Debug)]
 pub struct Aggregated {
-    pub inputs: Vec<Commitment>,
+    /// Spent positions, ascending.
+    pub inputs: Vec<u64>,
     pub outputs: Vec<OutputRecord>,
     pub node: NodeProof,
     /// The state before and after.
@@ -384,7 +420,8 @@ pub struct Aggregated {
 #[derive(Clone, Debug)]
 pub struct Prepared {
     txs: Vec<Transaction>,
-    pub inputs: Vec<Commitment>,
+    /// Spent positions, ascending.
+    pub inputs: Vec<u64>,
     pub outputs: Vec<OutputRecord>,
     /// The state before and after.
     pub prev: State,
@@ -632,9 +669,12 @@ impl BlockProver {
                 return Err(BlockError::Position(i));
             }
         }
+        // Published by position.
+        let mut spent: Vec<u64> = positions.into_values().collect();
+        spent.sort_unstable();
         Ok(Prepared {
             txs: txs.to_vec(),
-            inputs,
+            inputs: spent,
             outputs,
             prev,
             new,
@@ -816,6 +856,30 @@ mod tests {
             };
             assert_eq!(bigger.height(), 2 << log, "{shape:?} isn't full");
         }
+    }
+
+    #[test]
+    fn inputs_are_ascending_positions_of_five_bytes() {
+        assert_eq!(INPUT_BYTES, 5);
+        assert!(positions_canonical(&[]));
+        assert!(positions_canonical(&[1, 7, state::CAPACITY - 1]));
+        for bad in [&[0][..], &[3, 3], &[4, 2], &[state::CAPACITY]] {
+            assert!(!positions_canonical(bad), "{bad:?}");
+        }
+        assert!(spends_new_slot(&[2, 9], 9) && !spends_new_slot(&[2, 9], 10));
+        assert!(!spends_new_slot(&[], 0));
+        // The largest position survives encoding.
+        let block = Block {
+            inputs: vec![1, state::CAPACITY - 1],
+            outputs: vec![],
+            proof: crate::ledger::tests::tiny_proof(),
+        };
+        let bytes = encode_body(&block);
+        assert_eq!(
+            &bytes[..4 + 2 * INPUT_BYTES],
+            &[2, 0, 0, 0, 1, 0, 0, 0, 0, 255, 255, 255, 255, 255]
+        );
+        assert_eq!(decode_body(&bytes).unwrap().inputs, block.inputs);
     }
 
     #[test]

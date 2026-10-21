@@ -598,8 +598,9 @@ impl Chain {
     }
 
     /// Checks `block` as the body of `header`: it fits [`MAX_BLOCK_SIZE`],
-    /// its lists are canonical and share no commitment (no input is created
-    /// in the same block), the header commits to it, and its chain
+    /// its lists are canonical, no input is in a slot the block fills (no
+    /// input is created in the same block), the header commits to it, and
+    /// its chain
     /// proof holds. Header rules ([`header::check`]) and applying the lists
     /// ([`block::apply`]) are separate.
     pub fn verify_block(
@@ -612,12 +613,18 @@ impl Chain {
         if size > MAX_BLOCK_SIZE {
             return Err(BlockError::Oversize(size));
         }
-        if !block::is_canonical(&block.inputs)
+        if !block::positions_canonical(&block.inputs)
             || !block::is_canonical(block.outputs.iter().map(|o| &o.commitment))
         {
             return Err(BlockError::NotCanonical);
         }
-        if block::spends_own_output(&block.inputs, &block.outputs) {
+        // The slot counter before the block: each output fills one slot.
+        let prev_size = header
+            .state
+            .size
+            .checked_sub(block.outputs.len() as u64)
+            .ok_or(BlockError::StateMismatch)?;
+        if block::spends_new_slot(&block.inputs, prev_size) {
             return Err(BlockError::SpendsItsOwnOutput);
         }
         if block.body_hash() != header.body {
