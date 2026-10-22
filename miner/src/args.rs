@@ -9,7 +9,7 @@ pub const USAGE: &str = "\
 Usage: r [OPTIONS]
 
 Runs a node on the chain in <PATH>/chain (creating it if needed): it finds
-peers (from --peer, the peer list saved in <PATH>/peers, and what peers pass
+peers (from --peer, the peer list saved with the chain, and what peers pass
 on; with none of those, from the seed nodes tabernacle1.root.sx:3737 and
 tabernacle2.root.sx:3737), syncs the chain, verifies and follows peers' blocks, relays
 transactions, and mines (unless --no-mine) once caught up. Its log goes to

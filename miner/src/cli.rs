@@ -2003,8 +2003,13 @@ impl Cli {
         let missing = missing_signatures(&tx);
         if missing > 0 {
             let file = file.ok_or("others must sign too: give a file to write it to")?;
-            write_new(file, &partial_text(&tx))?;
+            // Our keys' use is recorded before any signature leaves us (a
+            // file already there is refused first, so no key is spent).
+            if Path::new(file).exists() {
+                return Err(format!("{file} exists already"));
+            }
             txn.commit().map_err(err)?;
+            write_new(file, &partial_text(&tx))?;
             return Ok(format!(
                 "signed with {added} key{} of ours; {missing} more signature{} needed: send \
                  {file} to the other signers (cosign {file})",
@@ -2043,8 +2048,12 @@ impl Cli {
         let missing = missing_signatures(&tx);
         if missing > 0 {
             let out_file = format!("{file}.cosigned");
-            write_new(&out_file, &partial_text(&tx))?;
+            // Our keys' use is recorded before any signature leaves us.
+            if Path::new(&out_file).exists() {
+                return Err(format!("{out_file} exists already"));
+            }
             txn.commit().map_err(err)?;
+            write_new(&out_file, &partial_text(&tx))?;
             return Ok(format!(
                 "added {added} signature{s} ({summary}); {missing} still needed: {out_file}"
             ));

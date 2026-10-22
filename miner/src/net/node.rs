@@ -18,7 +18,7 @@
 //! [`cap::LISTENING`], and addresses learned from peers (`GET_PEERS` /
 //! `PEERS`, asked of every new outbound peer and now and then of a random
 //! one). Learned addresses are tried, and dropped after a few failures; the
-//! ones that worked are saved to [`Config::peer_file`]. So that one hostile
+//! ones that worked are saved ([`Config::peer_store`]). So that one hostile
 //! peer can't fill the book with made-up addresses, a `PEERS` we didn't ask
 //! for is ignored, one peer's IP can have at most `MAX_FROM_ONE`
 //! untried addresses in it, and when it's full, new addresses push out
@@ -69,12 +69,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::peers::PeerStore;
 use super::wire::{
     self, COOKIE_LEN, MAX_ADDRS, MAX_HEADERS, MAX_LOCATOR, MAX_PACKET, MAX_RANGES, MAX_STATE_DATA,
     MAX_TX_IDS, Message, Packet, Tip, cap,
@@ -234,7 +234,7 @@ pub struct Config {
     /// Outbound connections to keep, configured peers included.
     pub outbound: usize,
     /// Where to keep the address book, if anywhere.
-    pub peer_file: Option<PathBuf>,
+    pub peer_store: Option<PeerStore>,
     /// Most open sessions, inbound and outbound.
     pub max_peers: usize,
     /// Fast sync: a new node starts this many blocks below the best peer's
@@ -255,7 +255,7 @@ impl Config {
             seeds: vec![],
             outbound: 8,
             max_peers: 64,
-            peer_file: None,
+            peer_store: None,
             sync_depth: None,
             loss_per_mille: 0,
         }
@@ -592,24 +592,24 @@ impl<B: Backend> Node<B> {
         widen_buffers(&socket);
         let now = Instant::now();
         let mut book = HashMap::new();
-        if let Some(path) = &cfg.peer_file
-            && let Ok(text) = std::fs::read_to_string(path)
-        {
-            for addr in text
-                .lines()
-                .filter_map(|l| l.trim().parse::<SocketAddr>().ok())
-            {
-                if dialable(&addr) && book.len() < MAX_BOOK {
-                    book.insert(
-                        addr,
-                        Known {
-                            verified: true,
-                            source: None,
-                            failures: 0,
-                            next_try: now,
-                        },
-                    );
-                }
+        let saved = match &cfg.peer_store {
+            Some(store) => store.load().unwrap_or_else(|e| {
+                log(format!("couldn't read the saved peer list: {e}"));
+                vec![]
+            }),
+            None => vec![],
+        };
+        for addr in saved {
+            if dialable(&addr) && book.len() < MAX_BOOK {
+                book.insert(
+                    addr,
+                    Known {
+                        verified: true,
+                        source: None,
+                        failures: 0,
+                        next_try: now,
+                    },
+                );
             }
         }
         let long_ago = now.checked_sub(PEERS_EVERY).unwrap_or(now);
@@ -1221,25 +1221,19 @@ impl<B: Backend> Node<B> {
         }
     }
 
-    /// Writes the book's verified addresses to the peer file.
+    /// Saves the book's verified addresses.
     fn save_book(&mut self) {
-        let Some(path) = &self.cfg.peer_file else {
-            return;
-        };
-        let mut addrs: Vec<String> = self
+        let mut addrs: Vec<SocketAddr> = self
             .book
             .iter()
             .filter(|(_, k)| k.verified)
-            .map(|(a, _)| a.to_string())
+            .map(|(a, _)| *a)
             .collect();
         addrs.sort();
-        let mut text = addrs.join("\n");
-        text.push('\n');
-        if let Err(e) = std::fs::write(path, text) {
-            (self.log)(format!(
-                "couldn't save the peer list to {}: {e}",
-                path.display()
-            ));
+        if let Some(store) = &self.cfg.peer_store
+            && let Err(e) = store.save(&addrs)
+        {
+            (self.log)(format!("couldn't save the peer list: {e}"));
         }
         self.book_dirty = false;
         self.last_save = Instant::now();
@@ -3473,35 +3467,33 @@ mod tests {
 
     #[test]
     fn the_address_book_is_saved_and_loaded() {
-        let dir = std::env::temp_dir().join(format!("r-peers-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("peers");
+        let env = crate::db::test::TempEnv::new();
+        let store = PeerStore::open(env.env()).unwrap();
         let a: SocketAddr = "10.1.2.3:7333".parse().unwrap();
-        std::fs::write(&file, format!("{a}\nnonsense\n0.0.0.0:1\n")).unwrap();
+        store.save(&[a, "0.0.0.0:1".parse().unwrap()]).unwrap();
         let mut n = Node::new(
             UdpSocket::bind("127.0.0.1:0").unwrap(),
             Config {
-                peer_file: Some(file.clone()),
+                peer_store: Some(store.clone()),
                 ..Config::new(*b"test")
             },
             Mock::new(),
             Box::new(|_| {}),
         );
+        // Undialable addresses aren't loaded.
         assert_eq!(n.book.keys().copied().collect::<Vec<_>>(), vec![a]);
         let b: SocketAddr = "[2001:db8::1]:9".parse().unwrap();
         asked(&mut n, 1, "10.9.9.9:1");
         n.on_peers(1, &[b, a]);
         // Only addresses that have worked are saved.
         n.save_book();
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), format!("{a}\n"));
+        assert_eq!(store.load().unwrap(), vec![a]);
         n.book.get_mut(&b).unwrap().verified = true;
         n.save_book();
-        let mut want = [a.to_string(), b.to_string()];
+        let mut saved = store.load().unwrap();
+        saved.sort();
+        let mut want = vec![a, b];
         want.sort();
-        assert_eq!(
-            std::fs::read_to_string(&file).unwrap(),
-            want.join("\n") + "\n"
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(saved, want);
     }
 }

@@ -7,7 +7,7 @@
 //! Three threads share the ledger and the mempool:
 //!
 //! - the network node ([`crate::net`]) finds peers (from `--peer`, the saved
-//!   peer list in `<data dir>/peers`, and what peers tell it, or else the
+//!   peer list (in the chain database), and what peers tell it, or else the
 //!   [`SEEDS`]), syncs the
 //!   chain (a new node fast-syncs from `--sync-depth` blocks below the best
 //!   tip), serves it, relays transactions, and adds peers' blocks to the
@@ -51,6 +51,7 @@ use crate::ledger::{Added, Ledger, Verifier};
 use crate::mempool::Mempool;
 use crate::net::LedgerBackend;
 use crate::net::node::{self, Config, Event, Node};
+use crate::net::peers::PeerStore;
 use crate::net::wire::cap;
 use crate::output::{Amount, format_coins};
 use crate::pow::{self, Dataset, DatasetTree};
@@ -322,12 +323,12 @@ const DEBUG_MARKER: &str = "debug-no-proofs";
 pub const SEEDS: [&str; 2] = ["tabernacle1.root.sx:3737", "tabernacle2.root.sx:3737"];
 
 /// A node on `net.listen` (or any port), dialing `net.peers` and the saved
-/// peer list (or the [`SEEDS`], when it has no one else to dial), serving the ledger and mempool and adding peers' blocks and
-/// transactions to them.
+/// peer list (kept in the chain database; or the [`SEEDS`], when it has no
+/// one else to dial), serving the ledger and mempool and adding peers'
+/// blocks and transactions to them.
 fn node(
     log: &Log,
     o: &Opened,
-    data_dir: &Path,
     net: &Net,
     mempool: Arc<Mempool>,
 ) -> Result<Node<LedgerBackend>, Box<dyn Error>> {
@@ -358,7 +359,7 @@ fn node(
         } else {
             SEEDS.map(String::from).to_vec()
         },
-        peer_file: Some(data_dir.join("peers")),
+        peer_store: Some(PeerStore::open(&o.ledger.env)?),
         sync_depth: Some(net.sync_depth),
         max_peers: net.max_peers,
         ..Config::new(magic)
@@ -473,7 +474,7 @@ pub fn run(data_dir: &Path, net: &Net, opts: &Options) -> Result<(), Box<dyn Err
     }
     let stop = Arc::new(AtomicBool::new(false));
 
-    let mut n = node(&log, &o, data_dir, net, mempool.clone())?;
+    let mut n = node(&log, &o, net, mempool.clone())?;
     let synced = n.synced();
     let (events, rx) = channel();
     let node_thread = {

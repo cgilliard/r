@@ -1,7 +1,9 @@
-//! Networking: the UDP wire format ([`wire`]), the node ([`node`]), and the
+//! Networking: the UDP wire format ([`wire`]), the node ([`node`]), its
+//! saved address book ([`peers`]), and the
 //! ledger and mempool it serves and follows ([`LedgerBackend`]).
 
 pub mod node;
+pub mod peers;
 pub mod wire;
 
 use std::collections::HashSet;
