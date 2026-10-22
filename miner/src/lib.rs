@@ -10,6 +10,7 @@ pub mod challenger;
 pub mod chunk;
 pub mod circuit;
 pub mod cli;
+pub mod cond_chunk_air;
 pub mod daemon;
 pub mod db;
 pub mod fri;

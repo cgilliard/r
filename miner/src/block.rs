@@ -21,9 +21,12 @@
 //! (each transaction's start, inputs, outputs and end), cut into item
 //! chunks of a few fixed sizes ([`ITEM_SHAPES`]) wherever the stream
 //! happens to cross a chunk boundary, so a transaction of any size fits and
-//! only the last chunk has padding. Each input's signature is checked in a
-//! signature chunk ([`SIG_SHAPES`]), and the tree updates in segments. The
-//! three are tied together by multiset fingerprints, under challenges
+//! only the last chunk has padding. Each signature is checked in a
+//! signature chunk ([`SIG_SHAPES`]), each condition spend's rules
+//! (timelocks against the block's height and the spent output's, a
+//! hashlock, a state number, the message its signers sign) in a condition
+//! chunk ([`COND_SHAPES`]), and the tree updates in segments. They are
+//! tied together by multiset fingerprints, under challenges
 //! `lambda, r` that must be fixed only after everything is
 //! ([`challenges`]): they hash the previous and new state, whose roots
 //! commit to every key inserted and spent, and the transaction hash, which
@@ -49,10 +52,11 @@ use crate::aggregate::{AggError, Aggregator, NodeProof};
 use crate::babybear::BabyBear;
 use crate::babybear4::BabyBear4;
 use crate::chunk;
+use crate::cond_chunk_air::{self, CondChunkAir, CondItem};
 use crate::fri::FriParams;
 use crate::hash::{self, HASH_LEN, Hash, domain};
 use crate::header::Header;
-use crate::item_chunk_air::{self, Boundary, Item, ItemChunkAir};
+use crate::item_chunk_air::{self, Boundary, CondClaim, ItemChunkAir};
 use crate::output::{Amount, COMMITMENT_LEN, Commitment, NONCE_LEN, OutputRecord};
 use crate::par;
 use crate::rng::Rng;
@@ -60,7 +64,7 @@ use crate::sig_chunk_air::{self, SigChunkAir, SigItem};
 use crate::stark::{self, KeyCache, LazyKey, StarkProof};
 use crate::state::{self, State, StateTree, Undo, key_of};
 use crate::state_air::{InsertOp, SegmentStart, SpendOp, StateSegmentAir};
-use crate::transaction::{Transaction, TxError};
+use crate::transaction::{Spend, Transaction, TxError, preimage_limbs};
 
 /// What a block publishes.
 #[derive(Clone, Debug)]
@@ -426,21 +430,25 @@ pub struct Prepared {
     /// The state before and after.
     pub prev: State,
     pub new: State,
+    /// The block's height.
+    pub height: u64,
     segments: Vec<(SegmentStart, Vec<InsertOp>, Vec<SpendOp>)>,
     /// Where the last segment left off.
     last: SegmentStart,
 }
 
-/// The quick, stateful part of proving a block of `txs` on top of
-/// `tree`'s state in `txn`: checks the transactions (they must create
-/// exactly `subsidy` in total, and the block must fit
-/// [`MAX_BLOCK_SIZE`] with a proof of `proof_size` bytes) and applies the changes in `txn`, recording the
-/// witnesses of segments shaped `seg`. The transaction can then be aborted and the
-/// proving done without it.
+/// The quick, stateful part of proving the block at `height`, of `txs`,
+/// on top of `tree`'s state in `txn`: checks the transactions (they must
+/// create exactly `subsidy` in total, and the block must fit
+/// [`MAX_BLOCK_SIZE`] with a proof of `proof_size` bytes) and applies the
+/// changes in `txn`, recording the witnesses of segments shaped `seg`. The
+/// transaction can then be aborted and the proving done without it.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare(
     tree: &StateTree,
     txn: &mut heed::RwTxn,
     txs: &[Transaction],
+    height: u64,
     subsidy: Amount,
     seg: &StateSegmentAir,
     proof_size: usize,
@@ -498,7 +506,7 @@ pub fn prepare(
             .iter()
             .map(|record| {
                 Ok(InsertOp {
-                    proof: tree.insert(txn, record)?,
+                    proof: tree.insert(txn, record, height)?,
                     record: *record,
                 })
             })
@@ -528,23 +536,32 @@ pub fn prepare(
     }
     let new = start.state;
 
-    // Each input must sign the position the tree removed it from.
-    let positions: std::collections::HashMap<Commitment, u64> = segments
+    // Each input must sign the position the tree removed it from, and its
+    // timelocks must have passed (counting from the removed leaf's height).
+    let positions: std::collections::HashMap<Commitment, (u64, u32)> = segments
         .iter()
-        .flat_map(|(_, _, spends)| spends.iter().map(|s| (s.commitment, s.proof.position())))
+        .flat_map(|(_, _, spends)| {
+            spends
+                .iter()
+                .map(|s| (s.commitment, (s.proof.position(), s.proof.leaf.leaf.height)))
+        })
         .collect();
     for (i, tx) in txs.iter().enumerate() {
         if tx
             .body
             .inputs
             .iter()
-            .any(|input| positions.get(&input.commitment) != Some(&input.position))
+            .any(|input| positions.get(&input.commitment).map(|p| p.0) != Some(input.position))
         {
             return Err(BlockError::Position(i));
         }
+        tx.check_locks(height, |input| {
+            positions.get(&input.commitment).map(|p| p.1)
+        })
+        .map_err(|e| BlockError::Tx(i, e))?;
     }
     // Published by position.
-    let mut spent: Vec<u64> = positions.into_values().collect();
+    let mut spent: Vec<u64> = positions.into_values().map(|p| p.0).collect();
     spent.sort_unstable();
     Ok(Prepared {
         txs: txs.to_vec(),
@@ -552,6 +569,7 @@ pub fn prepare(
         outputs,
         prev,
         new,
+        height,
         segments,
         last: start,
     })
@@ -589,9 +607,15 @@ pub const ITEM_SHAPES: [ItemChunkAir; 2] =
 /// Signature chunk shapes, smallest first (`2^12`, `2^14`, `2^16` rows).
 pub const SIG_SHAPES: [SigChunkAir; 3] = [
     SigChunkAir { slots: 7 },
-    SigChunkAir { slots: 31 },
-    SigChunkAir { slots: 124 },
+    SigChunkAir { slots: 30 },
+    SigChunkAir { slots: 120 },
 ];
+
+/// Condition chunk shapes, smallest first (`2^10`, `2^12` rows: shorter
+/// traces can't hide what a proof reveals). Blocks without condition
+/// spends have none.
+pub const COND_SHAPES: [CondChunkAir; 2] =
+    [CondChunkAir { slots: 48 }, CondChunkAir { slots: 195 }];
 
 /// Cuts `n` things into chunks: full chunks of the largest capacity, then
 /// the smallest that holds the rest. Returns (shape index, range).
@@ -616,26 +640,98 @@ fn cut(n: usize, capacities: &[usize]) -> Vec<(usize, std::ops::Range<usize>)> {
     out
 }
 
+/// The signatures `txs` carry, in order (a key spend's under its output's
+/// key tree, a condition signer's under its own), and their condition
+/// spends, with what the item chunks claim for each (`created` gives the
+/// spent outputs' creation heights, by position).
+///
+/// # Panics
+/// If a transaction isn't valid.
+fn signatures_and_conditions(
+    txs: &[Transaction],
+    created: &std::collections::HashMap<u64, u32>,
+) -> (Vec<SigItem>, Vec<CondItem>) {
+    let (mut sigs, mut conds) = (Vec::new(), Vec::new());
+    for tx in txs {
+        let body = &tx.body;
+        let digest = body.digest().expect("validated");
+        let omsg = body.signed_digest().expect("validated");
+        let mut signatures = tx.signatures.iter();
+        let mut index = 0;
+        for (i, input) in body.inputs.iter().enumerate() {
+            let msg = body.message(i).expect("validated");
+            match &input.spend {
+                Spend::Key { pubkey, leaf, path } => sigs.push(SigItem {
+                    pubkey: pubkey.clone(),
+                    index: *leaf as u32,
+                    path: path.to_vec(),
+                    sig: signatures.next().expect("validated").clone(),
+                    msg,
+                }),
+                Spend::Condition {
+                    condition,
+                    leaf,
+                    path,
+                    signers,
+                    preimage,
+                } => {
+                    for s in signers {
+                        sigs.push(SigItem {
+                            pubkey: s.pubkey.clone(),
+                            index: s.index,
+                            path: s.path.clone(),
+                            sig: signatures.next().expect("validated").clone(),
+                            msg,
+                        });
+                    }
+                    conds.push(CondItem {
+                        claim: CondClaim {
+                            hash: input.key_root(),
+                            commitment: input.commitment.to_field().expect("validated"),
+                            position: input.position,
+                            amount: crate::output::amount_limbs(input.amount),
+                            created: created[&input.position],
+                            msg: digest,
+                            omsg,
+                            index,
+                        },
+                        condition: condition.clone(),
+                        leaf: *leaf,
+                        path: *path,
+                        indices: signers.iter().map(|s| s.index).collect(),
+                        preimage: preimage.map(|p| preimage_limbs(&p)),
+                    });
+                    index += 1;
+                }
+            }
+        }
+    }
+    (sigs, conds)
+}
+
 /// Keys and shapes for proving blocks' transitions.
 pub struct BlockProver {
     params: FriParams,
     /// Chunk shapes, smallest first, with their keys.
     items: Vec<(ItemChunkAir, LazyKey)>,
     sigs: Vec<(SigChunkAir, LazyKey)>,
+    conds: Vec<(CondChunkAir, LazyKey)>,
     seg: StateSegmentAir,
     seg_key: LazyKey,
     agg: Aggregator,
 }
 
 impl BlockProver {
-    /// Sets up proving with item and signature chunks of the shapes
-    /// `items` and `sigs` (smallest first), segments of shape `seg`, and
-    /// aggregation nodes of height `2^log_height`, with verifying keys from
-    /// `keys` where it has them (proving keys are built on first use).
+    /// Sets up proving with item, signature and condition chunks of the
+    /// shapes `items`, `sigs` and `conds` (smallest first), segments of
+    /// shape `seg`, and aggregation nodes of height `2^log_height`, with
+    /// verifying keys from `keys` where it has them (proving keys are built
+    /// on first use).
     pub fn new(
         params: FriParams,
         items: &[ItemChunkAir],
         sigs: &[SigChunkAir],
+        conds: &[CondChunkAir],
         seg: StateSegmentAir,
         log_height: u32,
         keys: &KeyCache,
@@ -645,6 +741,10 @@ impl BlockProver {
             .map(|&air| (air, LazyKey::new(keys, &params, &air)))
             .collect();
         let sigs: Vec<_> = sigs
+            .iter()
+            .map(|&air| (air, LazyKey::new(keys, &params, &air)))
+            .collect();
+        let conds: Vec<_> = conds
             .iter()
             .map(|&air| (air, LazyKey::new(keys, &params, &air)))
             .collect();
@@ -658,6 +758,10 @@ impl BlockProver {
             sigs.iter()
                 .map(|(air, k)| (*air, *k.verifying_key()))
                 .collect(),
+            conds
+                .iter()
+                .map(|(air, k)| (*air, *k.verifying_key()))
+                .collect(),
             seg,
             *seg_key.verifying_key(),
             log_height,
@@ -667,19 +771,21 @@ impl BlockProver {
             params,
             items,
             sigs,
+            conds,
             seg,
             seg_key,
             agg,
         }
     }
 
-    /// Sets up the default shapes: [`ITEM_SHAPES`], [`SIG_SHAPES`], 16-op
-    /// segments, nodes at `2^15`.
+    /// Sets up the default shapes: [`ITEM_SHAPES`], [`SIG_SHAPES`],
+    /// [`COND_SHAPES`], 16-op segments, nodes at `2^15`.
     pub fn standard(params: FriParams, keys: &KeyCache) -> Self {
         Self::new(
             params,
             &ITEM_SHAPES,
             &SIG_SHAPES,
+            &COND_SHAPES,
             STANDARD_SEGMENT,
             15,
             keys,
@@ -691,31 +797,42 @@ impl BlockProver {
         &self.agg
     }
 
-    /// Proves the transition of a block of `txs` on top of `tree`'s state
-    /// in `txn`, applying its changes there (commit `txn` to keep them):
-    /// [`BlockProver::prepare`] then [`BlockProver::prove_prepared`].
+    /// Proves the transition of the block at `height`, of `txs`, on top of
+    /// `tree`'s state in `txn`, applying its changes there (commit `txn` to
+    /// keep them): [`BlockProver::prepare`] then
+    /// [`BlockProver::prove_prepared`].
     pub fn prove(
         &self,
         tree: &StateTree,
         txn: &mut heed::RwTxn,
         txs: &[Transaction],
+        height: u64,
         subsidy: Amount,
     ) -> Result<Aggregated, BlockError> {
-        let prepared = self.prepare(tree, txn, txs, subsidy)?;
+        let prepared = self.prepare(tree, txn, txs, height, subsidy)?;
         self.prove_prepared(&prepared)
     }
 
-    /// The quick, stateful part of proving a block of `txs` on top of
-    /// `tree`'s state in `txn`: [`prepare`], with this prover's segments and
-    /// proof size.
+    /// The quick, stateful part of proving the block at `height`, of `txs`,
+    /// on top of `tree`'s state in `txn`: [`prepare`], with this prover's
+    /// segments and proof size.
     pub fn prepare(
         &self,
         tree: &StateTree,
         txn: &mut heed::RwTxn,
         txs: &[Transaction],
+        height: u64,
         subsidy: Amount,
     ) -> Result<Prepared, BlockError> {
-        prepare(tree, txn, txs, subsidy, &self.seg, self.agg.proof_size())
+        prepare(
+            tree,
+            txn,
+            txs,
+            height,
+            subsidy,
+            &self.seg,
+            self.agg.proof_size(),
+        )
     }
 
     /// The slow part: proves a [`BlockProver::prepare`]d block.
@@ -726,37 +843,35 @@ impl BlockProver {
             outputs,
             prev,
             new,
+            height,
             segments,
             last: start,
         } = p;
         let (prev, new) = (*prev, *new);
+        let height = u32::try_from(*height).expect("chain heights fit in 32 bits");
 
-        // The item stream and the signatures, cut into chunks.
-        let items = item_chunk_air::stream(txs);
-        let item_caps: Vec<usize> = self.items.iter().map(|(a, _)| a.items).collect();
-        let item_chunks = cut(items.len(), &item_caps);
-        let sig_items: Vec<SigItem> = txs
+        // The item stream, the signatures and the condition spends, cut
+        // into chunks. Inputs carry their outputs' creation heights, from
+        // the removals.
+        let created: std::collections::HashMap<u64, u32> = segments
             .iter()
-            .flat_map(|tx| {
-                let msg = tx.body.digest().expect("validated");
-                tx.body
-                    .inputs
+            .flat_map(|(_, _, spends)| {
+                spends
                     .iter()
-                    .zip(&tx.signatures)
-                    .map(move |(input, sig)| SigItem {
-                        pubkey: input.pubkey.clone(),
-                        leaf: input.leaf,
-                        path: input.path,
-                        sig: sig.clone(),
-                        msg,
-                    })
+                    .map(|s| (s.proof.position(), s.proof.leaf.leaf.height))
             })
             .collect();
+        let items = item_chunk_air::stream(txs, |p| created[&p]);
+        let item_caps: Vec<usize> = self.items.iter().map(|(a, _)| a.items).collect();
+        let item_chunks = cut(items.len(), &item_caps);
+        let (sig_items, cond_items) = signatures_and_conditions(txs, &created);
         let sig_caps: Vec<usize> = self.sigs.iter().map(|(a, _)| a.slots).collect();
         let sig_chunks = cut(sig_items.len(), &sig_caps);
+        let cond_caps: Vec<usize> = self.conds.iter().map(|(a, _)| a.slots).collect();
+        let cond_chunks = cut(cond_items.len(), &cond_caps);
 
         // Fix each chunk's blinded hash, then derive the challenges from
-        // both halves.
+        // all of them.
         let mut rng = Rng::from_os().expect("OS randomness");
         let mut blinding = || {
             let mut b = [BabyBear::ZERO; HASH_LEN];
@@ -766,47 +881,43 @@ impl BlockProver {
         let mut leaves = vec![[BabyBear::ZERO; HASH_LEN]; segments.len()];
         let mut item_jobs = Vec::with_capacity(item_chunks.len());
         let mut entry = Boundary::IDLE;
-        let mut msg = [BabyBear::ZERO; HASH_LEN];
         for (shape, range) in &item_chunks {
-            let mut digests = Vec::new();
-            let mut exit = entry;
-            for item in &items[range.clone()] {
-                if let Item::Start { msg: m, .. } = item {
-                    msg = *m;
-                }
-                if *item == Item::End {
-                    digests.push(msg);
-                }
-                exit = exit.after(item);
-            }
+            let chunk = &items[range.clone()];
             let b = blinding();
-            leaves.push(item_chunk_air::chunk_hash(&b, &digests));
+            leaves.push(item_chunk_air::chunk_hash(&b, &entry, chunk));
             item_jobs.push((*shape, range.clone(), entry, b));
-            entry = exit;
+            entry = chunk.iter().fold(entry, |e, item| e.after(item));
         }
         debug_assert_eq!(entry, Boundary::IDLE);
         let mut sig_jobs = Vec::with_capacity(sig_chunks.len());
         for (shape, range) in &sig_chunks {
-            let pairs: Vec<(Hash, Hash)> = sig_items[range.clone()]
+            let triples: Vec<_> = sig_items[range.clone()]
                 .iter()
-                .map(|s| (s.root(), s.msg))
+                .map(SigItem::triple)
                 .collect();
             let b = blinding();
-            leaves.push(sig_chunk_air::chunk_hash(&b, &pairs));
+            leaves.push(sig_chunk_air::chunk_hash(&b, &triples));
             sig_jobs.push((*shape, range.clone(), b));
+        }
+        let mut cond_jobs = Vec::with_capacity(cond_chunks.len());
+        for (shape, range) in &cond_chunks {
+            let b = blinding();
+            leaves.push(cond_chunk_air::chunk_hash(&b, &cond_items[range.clone()]));
+            cond_jobs.push((*shape, range.clone(), b));
         }
         let tx_hash = merge_tx_hashes(leaves);
         let (lambda, r) = challenges(&prev, &new, &tx_hash);
 
-        // Prove the segments, item chunks and signature chunks, then merge
-        // pairwise, keeping the segments' and item chunks' order. Leaves,
-        // and merges on a level, are independent: a few run at once.
+        // Prove the segments, item, signature and condition chunks, then
+        // merge pairwise, keeping the segments' and item chunks' order.
+        // Leaves, and merges on a level, are independent: a few run at once.
         type Task<'a> = Box<dyn FnOnce() -> Result<NodeProof, AggError> + Send + 'a>;
-        let (params, items, sig_items) = (&self.params, &items, &sig_items);
+        let (params, items, sig_items, cond_items) =
+            (&self.params, &items, &sig_items, &cond_items);
         let mut tasks: Vec<Task<'_>> = Vec::new();
         for (start, inserts, spends) in segments {
             tasks.push(Box::new(move || {
-                let (trace, public) = self.seg.trace(start, inserts, spends, lambda, r);
+                let (trace, public) = self.seg.trace(start, inserts, spends, height, lambda, r);
                 let pk = self.seg_key.proving_key(params, &self.seg);
                 let proof = stark::prove(params, pk, &self.seg, trace, &public);
                 self.agg.prove_segment(&public, &proof)
@@ -817,7 +928,7 @@ impl BlockProver {
                 let (air, key) = &self.items[*shape];
                 let (trace, public) = air.trace(&items[range.clone()], entry, b, lambda, r);
                 let proof = stark::prove(params, key.proving_key(params, air), air, trace, &public);
-                self.agg.prove_items(*shape, &public, &proof)
+                self.agg.prove_items(*shape, &public, &proof, height)
             }));
         }
         for (shape, range, b) in &sig_jobs {
@@ -826,7 +937,15 @@ impl BlockProver {
                 let mut rng = Rng::from_os().expect("OS randomness");
                 let (trace, public) = air.trace(&sig_items[range.clone()], b, lambda, r, &mut rng);
                 let proof = stark::prove(params, key.proving_key(params, air), air, trace, &public);
-                self.agg.prove_sigs(*shape, &public, &proof)
+                self.agg.prove_sigs(*shape, &public, &proof, height)
+            }));
+        }
+        for (shape, range, b) in &cond_jobs {
+            tasks.push(Box::new(move || {
+                let (air, key) = &self.conds[*shape];
+                let (trace, public) = air.trace(&cond_items[range.clone()], height, b, lambda, r);
+                let proof = stark::prove(params, key.proving_key(params, air), air, trace, &public);
+                self.agg.prove_conds(*shape, &public, &proof)
             }));
         }
         let mut nodes = par::run_jobs(tasks)
@@ -887,6 +1006,13 @@ mod tests {
         for (shape, log) in SIG_SHAPES.iter().zip([12, 14, 16]) {
             assert_eq!(shape.height(), 1 << log, "{shape:?}");
             let bigger = SigChunkAir {
+                slots: shape.slots + 1,
+            };
+            assert_eq!(bigger.height(), 2 << log, "{shape:?} isn't full");
+        }
+        for (shape, log) in COND_SHAPES.iter().zip([10, 12]) {
+            assert_eq!(shape.height(), 1 << log, "{shape:?}");
+            let bigger = CondChunkAir {
                 slots: shape.slots + 1,
             };
             assert_eq!(bigger.height(), 2 << log, "{shape:?} isn't full");
@@ -956,11 +1082,13 @@ mod tests {
             Input {
                 commitment,
                 position,
-                pubkey,
-                leaf: 0,
-                path: tree.path(0),
                 amount,
                 nonce,
+                spend: Spend::Key {
+                    pubkey,
+                    leaf: 0,
+                    path: tree.path(0),
+                },
             },
         )
     }
@@ -980,66 +1108,43 @@ mod tests {
         let env = TempEnv::new();
         let tree = StateTree::open(env.env()).unwrap();
         let mut txn = env.env().write_txn().unwrap();
-        tree.insert(&mut txn, &funding.record().unwrap()).unwrap();
+        tree.insert(&mut txn, &funding.record().unwrap(), 1)
+            .unwrap();
         txn.commit().unwrap();
 
         // It's in slot 1 (the sentinel has slot 0). Signing another slot is
         // refused before proving.
         let (sk, input) = spend(1, 100, funding.nonce, 2);
         let wrong = Transaction::sign(
-            TxBody {
-                inputs: vec![input],
-                outputs: vec![pay(2, 60), pay(3, 30)],
-            },
+            TxBody::new(vec![input], vec![pay(2, 60), pay(3, 30)]),
             vec![sk],
         )
         .unwrap();
-        let reward = Transaction::sign(
-            TxBody {
-                inputs: vec![],
-                outputs: vec![pay(4, SUBSIDY + 10)],
-            },
-            vec![],
-        )
-        .unwrap();
+        let reward =
+            Transaction::sign(TxBody::new(vec![], vec![pay(4, SUBSIDY + 10)]), vec![]).unwrap();
         let mut txn = env.env().write_txn().unwrap();
         assert!(matches!(
-            prover.prove(&tree, &mut txn, &[wrong, reward], SUBSIDY),
+            prover.prove(&tree, &mut txn, &[wrong, reward], 2, SUBSIDY),
             Err(BlockError::Position(0))
         ));
         txn.abort();
 
         let (sk, input) = spend(1, 100, funding.nonce, 1);
         let tx = Transaction::sign(
-            TxBody {
-                inputs: vec![input],
-                outputs: vec![pay(2, 60), pay(3, 30)],
-            },
+            TxBody::new(vec![input], vec![pay(2, 60), pay(3, 30)]),
             vec![sk],
         )
         .unwrap();
-        let reward = Transaction::sign(
-            TxBody {
-                inputs: vec![],
-                outputs: vec![pay(4, SUBSIDY + 10)],
-            },
-            vec![],
-        )
-        .unwrap();
+        let reward =
+            Transaction::sign(TxBody::new(vec![], vec![pay(4, SUBSIDY + 10)]), vec![]).unwrap();
 
         // Transactions that don't create exactly the subsidy are refused
         // before proving: here the reward claims one unit too many.
-        let greedy = Transaction::sign(
-            TxBody {
-                inputs: vec![],
-                outputs: vec![pay(5, SUBSIDY + 11)],
-            },
-            vec![],
-        )
-        .unwrap();
+        let greedy =
+            Transaction::sign(TxBody::new(vec![], vec![pay(5, SUBSIDY + 11)]), vec![]).unwrap();
         let mut txn = env.env().write_txn().unwrap();
         assert!(matches!(
-            prover.prove(&tree, &mut txn, &[tx.clone(), greedy], SUBSIDY),
+            prover.prove(&tree, &mut txn, &[tx.clone(), greedy], 2, SUBSIDY),
             Err(BlockError::Net(51))
         ));
         txn.abort();
@@ -1049,7 +1154,7 @@ mod tests {
         let mut txn = env.env().write_txn().unwrap();
         let prev = tree.state(&txn).unwrap();
         let agg = prover
-            .prove(&tree, &mut txn, &[tx, reward], SUBSIDY)
+            .prove(&tree, &mut txn, &[tx, reward], 2, SUBSIDY)
             .unwrap();
         let claimed = tree.state(&txn).unwrap();
         txn.abort();
@@ -1091,13 +1196,13 @@ mod tests {
             proof: agg.node.proof.clone(),
         };
         let parent = Header {
-            height: 7,
+            height: 1,
             timestamp: 1000,
             state: prev,
             ..Header::default()
         };
         let header = Header {
-            height: 8,
+            height: 2,
             prev: parent.hash(),
             timestamp: 1600,
             state: claimed,
@@ -1147,5 +1252,151 @@ mod tests {
         apply(&tree, &mut txn, &parent, &header, &block).unwrap();
         assert_eq!(tree.state(&txn).unwrap(), claimed);
         txn.commit().unwrap();
+    }
+
+    /// A block with condition spends: a 2-of-2 channel update (any-prevout,
+    /// a later state's keys) and a hashlocked, timelocked output claimed
+    /// with its preimage (anyone-can-pay, with a fee input added), proved
+    /// and checked; and a spend before its timelock is refused.
+    #[test]
+    #[ignore = "slow: run in release"]
+    fn proves_a_block_with_condition_spends() {
+        use crate::transaction::{Condition, SigMode, Signer, SignerTree, hashlock};
+        let prover = BlockProver::standard(FriParams::default(), &stark::KeyCache::none());
+        let party = |seed: u32| {
+            let keys: Vec<_> = (0..8).map(|i| key(seed + i).1).collect();
+            let tree = SignerTree::new(keys.iter().map(|k| k.hash()).collect());
+            (seed, keys, tree)
+        };
+        let (a, b) = (party(100), party(200));
+        let signer = |p: &(u32, Vec<crate::wots::PublicKey>, SignerTree), i: u32| Signer {
+            pubkey: p.1[i as usize].clone(),
+            index: i,
+            path: p.2.path(i),
+        };
+        let channel = |state: u32| Condition {
+            keys: vec![a.2.root(), b.2.root()],
+            min_state: Some(state),
+            mode: SigMode::AnyPrevout,
+            after_height: 0,
+            after_blocks: 0,
+            hashlock: None,
+        };
+        let pre = [42u8; 15];
+        let htlc = Condition {
+            hashlock: Some(hashlock(&pre)),
+            after_blocks: 2,
+            mode: SigMode::AnyoneCanPay,
+            ..Condition::key(a.2.root())
+        };
+        let output = |conds: &[Condition], amount, tag: u8| Output {
+            hash: KeyTree::of_conditions(conds).output_hash(),
+            amount,
+            nonce: [tag; NONCE_LEN],
+        };
+        // The chain holds, from block 1: the channel at state 3, the
+        // HTLC, and a coin for fees.
+        let funds = [
+            output(&[channel(3)], 1000, 1),
+            output(std::slice::from_ref(&htlc), 300, 2),
+            pay(9, 50),
+        ];
+        let env = TempEnv::new();
+        let tree = StateTree::open(env.env()).unwrap();
+        let mut txn = env.env().write_txn().unwrap();
+        for f in &funds {
+            tree.insert(&mut txn, &f.record().unwrap(), 1).unwrap();
+        }
+        txn.commit().unwrap();
+        let cond_input = |f: &Output, cond: &Condition, position, signers, preimage| Input {
+            commitment: f.commitment().unwrap(),
+            position,
+            amount: f.amount,
+            nonce: f.nonce,
+            spend: Spend::Condition {
+                condition: cond.clone(),
+                leaf: 0,
+                path: KeyTree::of_conditions(std::slice::from_ref(cond)).path(0),
+                signers,
+                preimage,
+            },
+        };
+        // Update to state 6, signed with both parties' key 6.
+        let update = Transaction::sign(
+            TxBody {
+                inputs: vec![cond_input(
+                    &funds[0],
+                    &channel(3),
+                    1,
+                    vec![signer(&a, 6), signer(&b, 6)],
+                    None,
+                )],
+                outputs: vec![output(&[channel(6)], 990, 3)],
+                signed_outputs: 1,
+            },
+            vec![key(106).0, key(206).0],
+        )
+        .unwrap();
+        // The claim pays out with the preimage; the fee coin is added.
+        let mut claim_out = pay(5, 300);
+        claim_out.nonce[..15].copy_from_slice(&pre);
+        let mut body = TxBody {
+            inputs: vec![cond_input(
+                &funds[1],
+                &htlc,
+                2,
+                vec![signer(&a, 0)],
+                Some(pre),
+            )],
+            outputs: vec![claim_out],
+            signed_outputs: 1,
+        };
+        let claim_sig = body.messages().unwrap()[0];
+        let (fee_sk, fee_input) = spend(9, 50, funds[2].nonce, 3);
+        body.inputs.push(fee_input);
+        body.outputs.push(pay(6, 30));
+        let messages = body.messages().unwrap();
+        let claim = Transaction {
+            signatures: vec![key(100).0.sign(&claim_sig), fee_sk.sign(&messages[1])],
+            body,
+        };
+        assert!(update.validate().is_ok() && claim.validate().is_ok());
+        let reward =
+            Transaction::sign(TxBody::new(vec![], vec![pay(4, SUBSIDY + 30)]), vec![]).unwrap();
+        let txs = [update, claim, reward];
+
+        // At height 2 the HTLC is still locked (created at 1, 2 blocks).
+        let mut txn = env.env().write_txn().unwrap();
+        assert!(matches!(
+            prover.prove(&tree, &mut txn, &txs, 2, SUBSIDY),
+            Err(BlockError::Tx(1, TxError::Locked(0)))
+        ));
+        txn.abort();
+
+        let t = std::time::Instant::now();
+        let mut txn = env.env().write_txn().unwrap();
+        let prev = tree.state(&txn).unwrap();
+        let agg = prover.prove(&tree, &mut txn, &txs, 3, SUBSIDY).unwrap();
+        let claimed = tree.state(&txn).unwrap();
+        txn.abort();
+        eprintln!("prove {:.1} s", t.elapsed().as_secs_f64());
+        let s = &agg.node.statement;
+        assert_eq!(prover.aggregator().verify(s, &agg.node.proof), Ok(()));
+        assert_eq!(
+            (s.q_in(), s.q_out(), s.q_sig(), s.q_cond()),
+            (
+                BabyBear4::ONE,
+                BabyBear4::ONE,
+                BabyBear4::ONE,
+                BabyBear4::ONE
+            )
+        );
+        assert_eq!(s.height(), BabyBear::new(3));
+        assert_eq!(s.net(), SUBSIDY as i128);
+        assert_eq!(
+            (s.lambda(), s.r()),
+            challenges(&prev, &claimed, &s.tx_hash())
+        );
+        assert_eq!((agg.inputs, agg.outputs.len()), (vec![1, 2, 3], 4));
     }
 }

@@ -62,6 +62,17 @@ pub mod domain {
     /// Not consensus: a wallet's seed from its recovery entropy
     /// ([`crate::mnemonic`]).
     pub const WALLET_SEED: u32 = 33;
+    /// A spending condition's leaf in an output's key tree
+    /// ([`crate::transaction::Condition`]).
+    pub const CONDITION: u32 = 34;
+    /// A hashlock's hash of its preimage.
+    pub const HASHLOCK: u32 = 35;
+    /// The message an anyone-can-pay signature signs.
+    pub const SIG_ACP: u32 = 36;
+    /// The message an any-prevout signature signs.
+    pub const SIG_APO: u32 = 37;
+    /// The outputs anyone-can-pay and any-prevout signatures cover.
+    pub const SIGNED_OUTPUTS: u32 = 38;
 
     #[cfg(test)]
     pub const ALL: &[u32] = &[
@@ -98,6 +109,11 @@ pub mod domain {
         NET_COOKIE,
         TX_ID,
         WALLET_SEED,
+        CONDITION,
+        HASHLOCK,
+        SIG_ACP,
+        SIG_APO,
+        SIGNED_OUTPUTS,
     ];
 }
 

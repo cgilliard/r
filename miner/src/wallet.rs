@@ -50,7 +50,10 @@ use crate::output::{
     self, Amount, COMMITMENT_LEN, Commitment, NONCE_LEN, OUTPUT_HASH_LEN, Output, OutputHash,
     OutputRecord,
 };
-use crate::transaction::{Input, KEY_LEAVES, KeyTree};
+use crate::transaction::{
+    Condition, Input, KEY_LEAVES, KeyTree, MAX_KEY_DEPTH, PREIMAGE_LEN, Preimage, SigMode,
+    SignerTree, Spend,
+};
 use crate::wots::{self, PublicKey, SecretKey};
 
 /// Bytes of an output's key seed `r`.
@@ -165,6 +168,35 @@ impl Wallet {
         ))
     }
 
+    /// The one-time key pair at `index` of the signer key tree `id`
+    /// ([`Wallet::signer_tree`]).
+    pub fn signer_key(&self, id: &KeySeed, index: u32) -> (SecretKey, PublicKey) {
+        wots::keygen(hash::sponge(
+            domain::WALLET_KEY,
+            &[],
+            &[
+                &self.seed,
+                &seed_limbs(id),
+                &[BabyBear::new(index), BabyBear::new(2)],
+            ],
+        ))
+    }
+
+    /// The signer key tree `id` of `2^depth` one-time keys, for a
+    /// condition's key: key generations in parallel.
+    ///
+    /// # Panics
+    /// If `depth` is over [`MAX_KEY_DEPTH`].
+    pub fn signer_tree(&self, id: &KeySeed, depth: usize) -> SignerTree {
+        assert!(
+            depth <= MAX_KEY_DEPTH,
+            "signer trees are at most 2^{MAX_KEY_DEPTH} keys"
+        );
+        SignerTree::new(crate::par::par_map(1 << depth, 16, |i| {
+            self.signer_key(id, i as u32).1.hash()
+        }))
+    }
+
     /// The key tree for `r`: [`KEY_LEAVES`] key generations (in parallel).
     pub fn key_tree(&self, r: &KeySeed) -> KeyTree {
         if self.cheap {
@@ -267,11 +299,13 @@ impl Wallet {
         let input = Input {
             commitment: coin.record.commitment,
             position: coin.position,
-            pubkey,
-            leaf,
-            path: self.key_tree(&coin.r).path(leaf as usize),
             amount: coin.amount,
             nonce: coin.record.nonce,
+            spend: Spend::Key {
+                pubkey,
+                leaf,
+                path: self.key_tree(&coin.r).path(leaf as usize),
+            },
         };
         (sk, input)
     }
@@ -647,6 +681,276 @@ impl Leaves {
     }
 }
 
+/// One of our signer key trees: its id (what its keys derive from), its
+/// keys' hashes, and the indices that have signed (each signs once).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignerRecord {
+    pub id: KeySeed,
+    pub tree: SignerTree,
+    pub used: Vec<u32>,
+}
+
+impl SignerRecord {
+    /// The smallest index that hasn't signed and is above `above`, if any.
+    pub fn next_index(&self, above: Option<u32>) -> Option<u32> {
+        let from = above.map_or(0, |m| m as u64 + 1);
+        (from..self.tree.leaves().len() as u64)
+            .map(|i| i as u32)
+            .find(|i| !self.used.contains(i))
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = vec![self.tree.depth() as u8];
+        for h in self.tree.leaves() {
+            out.extend(hash::to_bytes(h));
+        }
+        for i in &self.used {
+            out.extend(i.to_le_bytes());
+        }
+        out
+    }
+
+    fn from_bytes(id: KeySeed, b: &[u8]) -> Option<Self> {
+        let (&depth, rest) = b.split_first()?;
+        let n = 1usize.checked_shl(depth as u32)?;
+        if depth as usize > MAX_KEY_DEPTH || rest.len() < n * hash::HASH_BYTES {
+            return None;
+        }
+        let (keys, used) = rest.split_at(n * hash::HASH_BYTES);
+        let leaves = keys
+            .chunks_exact(hash::HASH_BYTES)
+            .map(|c| hash::from_bytes(c.try_into().ok()?))
+            .collect::<Option<Vec<_>>>()?;
+        if !used.len().is_multiple_of(4) {
+            return None;
+        }
+        Some(Self {
+            id,
+            tree: SignerTree::new(leaves),
+            used: used
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes")))
+                .collect(),
+        })
+    }
+}
+
+/// An output paid to conditions, which we watch: the output (hash, amount,
+/// nonce), its conditions (its key tree's leaves, in order), when we
+/// learned of it, and (once seen in the state) its slot and creation
+/// height.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Locked {
+    pub output: Output,
+    pub conditions: Vec<Condition>,
+    pub created: u64,
+    pub seen: Option<(u64, u32)>,
+}
+
+impl Locked {
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = self.output.hash.to_vec();
+        out.extend(self.output.amount.to_le_bytes());
+        out.extend(self.output.nonce);
+        out.extend(self.created.to_le_bytes());
+        let (slot, height) = self.seen.unwrap_or((u64::MAX, 0));
+        out.extend(slot.to_le_bytes());
+        out.extend(height.to_le_bytes());
+        for c in &self.conditions {
+            let b = c.to_bytes();
+            out.extend((b.len() as u16).to_le_bytes());
+            out.extend(b);
+        }
+        out
+    }
+
+    fn from_bytes(b: &[u8]) -> Option<Self> {
+        let (hash, b) = b.split_at_checked(OUTPUT_HASH_LEN)?;
+        let (amount, b) = b.split_at_checked(8)?;
+        let (nonce, b) = b.split_at_checked(NONCE_LEN)?;
+        let (created, b) = b.split_at_checked(8)?;
+        let (slot, b) = b.split_at_checked(8)?;
+        let (height, mut b) = b.split_at_checked(4)?;
+        let slot = u64::from_le_bytes(slot.try_into().ok()?);
+        let height = u32::from_le_bytes(height.try_into().ok()?);
+        let mut conditions = Vec::new();
+        while !b.is_empty() {
+            let (len, rest) = b.split_at_checked(2)?;
+            let len = u16::from_le_bytes(len.try_into().ok()?) as usize;
+            let (c, rest) = rest.split_at_checked(len)?;
+            conditions.push(Condition::from_bytes(c)?);
+            b = rest;
+        }
+        Some(Self {
+            output: Output {
+                hash: hash.try_into().ok()?,
+                amount: u64::from_le_bytes(amount.try_into().ok()?),
+                nonce: nonce.try_into().ok()?,
+            },
+            conditions,
+            created: u64::from_le_bytes(created.try_into().ok()?),
+            seen: (slot != u64::MAX).then_some((slot, height)),
+        })
+    }
+
+    /// The key tree its output pays to.
+    pub fn key_tree(&self) -> KeyTree {
+        KeyTree::of_conditions(&self.conditions)
+    }
+
+    /// The file describing it for others: its output and conditions.
+    pub fn to_text(&self) -> String {
+        let mut out = self.output.hash.to_vec();
+        out.extend(self.output.amount.to_le_bytes());
+        out.extend(self.output.nonce);
+        format!(
+            "{LOCKED_HEADER}\noutput {}\n{}",
+            hex(&out),
+            conditions_to_text(&self.conditions)
+        )
+    }
+
+    pub fn from_text(text: &str) -> Result<Self, String> {
+        let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+        if lines.next() != Some(LOCKED_HEADER) {
+            return Err(format!(
+                "not a locked-output file (expected \"{LOCKED_HEADER}\" first)"
+            ));
+        }
+        let first = lines.next().unwrap_or("");
+        let bytes = first
+            .strip_prefix("output ")
+            .and_then(|h| unhex(h.trim()))
+            .filter(|b| b.len() == OUTPUT_HASH_LEN + 8 + NONCE_LEN)
+            .ok_or("bad output line")?;
+        let output = Output {
+            hash: bytes[..OUTPUT_HASH_LEN].try_into().expect("length"),
+            amount: u64::from_le_bytes(
+                bytes[OUTPUT_HASH_LEN..OUTPUT_HASH_LEN + 8]
+                    .try_into()
+                    .expect("8 bytes"),
+            ),
+            nonce: bytes[OUTPUT_HASH_LEN + 8..].try_into().expect("length"),
+        };
+        let rest: Vec<&str> = lines.collect();
+        let conditions = conditions_from_text(&rest.join("\n"))?;
+        let locked = Self {
+            output,
+            conditions,
+            created: 0,
+            seen: None,
+        };
+        if locked.key_tree().output_hash() != output.hash {
+            return Err("the output doesn't pay to these conditions".into());
+        }
+        Ok(locked)
+    }
+}
+
+const LOCKED_HEADER: &str = "r locked output 1";
+
+/// Conditions as text: each starts with a `branch` line, then one line per
+/// rule: `key <hex>` (once, or twice for 2-of-2), `state <n>` (each
+/// signing key's index must be above `n`), `mode all | anyone-can-pay |
+/// any-prevout`, `after-height <h>`, `after-blocks <n>`, `hashlock <hex>`.
+/// Lines starting with `#` are comments.
+pub fn conditions_from_text(text: &str) -> Result<Vec<Condition>, String> {
+    let mut out: Vec<Condition> = Vec::new();
+    let hash_of = |v: &str| -> Result<Hash, String> {
+        unhex(v)
+            .and_then(|b| hash::from_bytes(b.as_slice().try_into().ok()?))
+            .ok_or(format!("bad hash \"{v}\""))
+    };
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line == "branch" {
+            out.push(Condition {
+                keys: vec![],
+                ..Condition::key([BabyBear::ZERO; hash::HASH_LEN])
+            });
+            continue;
+        }
+        let c = out
+            .last_mut()
+            .ok_or("conditions start with a \"branch\" line")?;
+        let (k, v) = line.split_once(' ').ok_or(format!("bad line \"{line}\""))?;
+        let v = v.trim();
+        let number = |v: &str| v.parse::<u32>().map_err(|_| format!("bad number \"{v}\""));
+        match k {
+            "key" => c.keys.push(hash_of(v)?),
+            "state" => c.min_state = Some(number(v)?),
+            "after-height" => c.after_height = number(v)?,
+            "after-blocks" => c.after_blocks = number(v)?,
+            "hashlock" => c.hashlock = Some(hash_of(v)?),
+            "mode" => {
+                c.mode = match v {
+                    "all" => SigMode::All,
+                    "anyone-can-pay" => SigMode::AnyoneCanPay,
+                    "any-prevout" => SigMode::AnyPrevout,
+                    _ => return Err(format!("bad mode \"{v}\"")),
+                }
+            }
+            _ => return Err(format!("unknown rule \"{k}\"")),
+        }
+    }
+    if out.is_empty() {
+        return Err("no conditions".into());
+    }
+    if out.len() > KEY_LEAVES {
+        return Err(format!("at most {KEY_LEAVES} branches"));
+    }
+    for (i, c) in out.iter().enumerate() {
+        if !c.is_well_formed() {
+            return Err(format!(
+                "branch {}: it needs one or two keys, a state number and locks in range",
+                i + 1
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// The text form of `conditions` ([`conditions_from_text`]).
+pub fn conditions_to_text(conditions: &[Condition]) -> String {
+    let mut out = String::new();
+    for c in conditions {
+        out.push_str("branch\n");
+        for k in &c.keys {
+            out.push_str(&format!("key {}\n", hex(&hash::to_bytes(k))));
+        }
+        if let Some(m) = c.min_state {
+            out.push_str(&format!("state {m}\n"));
+        }
+        let mode = match c.mode {
+            SigMode::All => "all",
+            SigMode::AnyoneCanPay => "anyone-can-pay",
+            SigMode::AnyPrevout => "any-prevout",
+        };
+        out.push_str(&format!("mode {mode}\n"));
+        if c.after_height > 0 {
+            out.push_str(&format!("after-height {}\n", c.after_height));
+        }
+        if c.after_blocks > 0 {
+            out.push_str(&format!("after-blocks {}\n", c.after_blocks));
+        }
+        if let Some(h) = c.hashlock {
+            out.push_str(&format!("hashlock {}\n", hex(&hash::to_bytes(&h))));
+        }
+    }
+    out
+}
+
+/// A random preimage, with a key seed that starts with it (so an output
+/// publishing it is still found by its wallet): the preimage, then one
+/// random byte.
+pub fn new_preimage() -> std::io::Result<Preimage> {
+    let mut p = [0u8; PREIMAGE_LEN];
+    std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut p)?;
+    Ok(p)
+}
+
 /// The node's wallet in LMDB (database `wallet`):
 /// - `entropy`: the 32 bytes behind the recovery words ([`crate::mnemonic`]);
 /// - `sent/<id>`, `recv/<id>`: payments being sent and received;
@@ -656,7 +960,11 @@ impl Leaves {
 /// - `reward/<r>`: key seeds our mining rewards went to;
 /// - `leaf/<commitment>`: the leaves of an output's key tree that have
 ///   signed ([`Leaves`]);
-/// - `restoring`: set while a restored wallet looks for its outputs.
+/// - `restoring`: set while a restored wallet looks for its outputs;
+/// - `signer/<id>`: signer key trees for conditions ([`SignerRecord`]);
+/// - `pre/<hash>`: hashlock preimages we know, by their hash;
+/// - `lock/<commitment>`: outputs with conditions that we watch
+///   ([`Locked`]).
 #[derive(Clone, Copy, Debug)]
 pub struct WalletStore {
     db: Database<Bytes, Bytes>,
@@ -671,6 +979,9 @@ const REWARD_PREFIX: &[u8] = b"reward/";
 const LEAF_PREFIX: &[u8] = b"leaf/";
 const SENT_PREFIX: &[u8] = b"sent/";
 const RECV_PREFIX: &[u8] = b"recv/";
+const SIGNER_PREFIX: &[u8] = b"signer/";
+const PRE_PREFIX: &[u8] = b"pre/";
+const LOCK_PREFIX: &[u8] = b"lock/";
 
 impl WalletStore {
     pub fn open(env: &Env) -> heed::Result<Self> {
@@ -833,6 +1144,57 @@ impl WalletStore {
             }
         }
         out.sort_by_key(|r| r.created);
+        Ok(out)
+    }
+
+    pub fn put_signer(&self, txn: &mut RwTxn, s: &SignerRecord) -> heed::Result<()> {
+        self.db
+            .put(txn, &[SIGNER_PREFIX, &s.id].concat(), &s.to_bytes())
+    }
+
+    /// Our signer key trees.
+    pub fn signers(&self, txn: &RoTxn) -> heed::Result<Vec<SignerRecord>> {
+        let mut out = Vec::new();
+        for entry in self.db.prefix_iter(txn, SIGNER_PREFIX)? {
+            let (k, v) = entry?;
+            let id = k[SIGNER_PREFIX.len()..].try_into().ok();
+            if let Some(s) = id.and_then(|id| SignerRecord::from_bytes(id, v)) {
+                out.push(s);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn put_preimage(&self, txn: &mut RwTxn, p: &Preimage) -> heed::Result<()> {
+        let h = hash::to_bytes(&crate::transaction::hashlock(p));
+        self.db.put(txn, &[PRE_PREFIX, &h].concat(), p)
+    }
+
+    /// The preimage we know for hashlock `h`, if any.
+    pub fn preimage(&self, txn: &RoTxn, h: &Hash) -> heed::Result<Option<Preimage>> {
+        Ok(self
+            .db
+            .get(txn, &[PRE_PREFIX, &hash::to_bytes(h)].concat())?
+            .and_then(|b| b.try_into().ok()))
+    }
+
+    pub fn put_locked(&self, txn: &mut RwTxn, l: &Locked) -> heed::Result<()> {
+        let c = l.output.commitment().ok_or(heed::Error::Encoding(
+            "locked output with a non-canonical hash".into(),
+        ))?;
+        self.db
+            .put(txn, &[LOCK_PREFIX, &c.0].concat(), &l.to_bytes())
+    }
+
+    /// The locked outputs we watch.
+    pub fn locked(&self, txn: &RoTxn) -> heed::Result<Vec<Locked>> {
+        let mut out = Vec::new();
+        for entry in self.db.prefix_iter(txn, LOCK_PREFIX)? {
+            if let Some(l) = Locked::from_bytes(entry?.1) {
+                out.push(l);
+            }
+        }
+        out.sort_by_key(|l| l.created);
         Ok(out)
     }
 
@@ -1069,7 +1431,7 @@ mod tests {
         for leaf in [0, 5, 128, 255] {
             let (_, input) = w.input(&coin, leaf);
             assert!(input.opens_commitment());
-            assert_eq!((input.position, input.leaf), (77, leaf));
+            assert_eq!((input.position, input.key_leaf()), (77, Some(leaf)));
         }
     }
 

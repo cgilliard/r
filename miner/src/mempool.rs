@@ -49,6 +49,10 @@ pub trait Chainstate {
     fn tip_hash(&self) -> Hash;
     /// The slot of the unspent output with commitment `c`, if there is one.
     fn unspent(&self, c: &Commitment) -> Option<u64>;
+    /// The creation height of the unspent output with commitment `c`.
+    fn created(&self, c: &Commitment) -> Option<u32>;
+    /// The height of the next block.
+    fn next_height(&self) -> u64;
 }
 
 impl Chainstate for Ledger {
@@ -60,6 +64,19 @@ impl Chainstate for Ledger {
     fn unspent(&self, c: &Commitment) -> Option<u64> {
         let txn = self.env.read_txn().ok()?;
         self.tree.get(&txn, c).ok().flatten().map(|(slot, _)| slot)
+    }
+
+    fn created(&self, c: &Commitment) -> Option<u32> {
+        let txn = self.env.read_txn().ok()?;
+        self.tree
+            .get(&txn, c)
+            .ok()
+            .flatten()
+            .map(|(_, leaf)| leaf.height)
+    }
+
+    fn next_height(&self) -> u64 {
+        self.tip().map_or(1, |(h, _)| h.height + 1)
     }
 }
 
@@ -90,6 +107,12 @@ impl Entry {
     /// Whether this pays less per byte than `fee` for `len` bytes.
     fn pays_less_than(&self, fee: Amount, len: usize) -> bool {
         (self.fee as u128 * len as u128) < fee as u128 * self.bytes.len() as u128
+    }
+
+    /// Whether `fee` for `len` bytes is at least twice this one's rate (and
+    /// more than nothing).
+    fn pays_half_rate_of(&self, fee: Amount, len: usize) -> bool {
+        fee > 0 && 2 * self.fee as u128 * len as u128 <= fee as u128 * self.bytes.len() as u128
     }
 }
 
@@ -156,19 +179,25 @@ impl Mempool {
         let mut p = self.lock(chain);
         let result = checked.and_then(|(tx, fee)| {
             // Replace by fee: pool transactions spending its inputs give way
-            // if it pays more than all of them, and more per byte than each.
+            // if it pays more than all of them and more per byte than each,
+            // or at least twice as much per byte as each (so a large, cheap
+            // transaction can't pin a smaller one that pays at a higher
+            // rate; each such replacement doubles the rate, so there can't
+            // be many).
             let replaced = p.conflicts(&tx);
             let (sum, len) = (
                 replaced.iter().map(|r| p.txs[r].fee as u128).sum::<u128>(),
                 bytes.len(),
             );
-            if !replaced.is_empty()
-                && (fee as u128 <= sum
-                    || replaced.iter().any(|r| !p.txs[r].pays_less_than(fee, len)))
-            {
+            let more =
+                fee as u128 > sum && replaced.iter().all(|r| p.txs[r].pays_less_than(fee, len));
+            let double_rate = replaced
+                .iter()
+                .all(|r| p.txs[r].pays_half_rate_of(fee, len));
+            if !replaced.is_empty() && !more && !double_rate {
                 return Err(Refused::Unfit(
                     "spends an output a pool transaction spends, and doesn't pay enough more \
-                     to replace it (more in all, and more per byte)"
+                     to replace it (more in all and more per byte, or twice as much per byte)"
                         .into(),
                 ));
             }
@@ -376,10 +405,13 @@ impl Pool {
     /// Whether `tx` fits the state and conflicts with nothing in the pool.
     fn fits(&self, chain: &impl Chainstate, tx: &Transaction) -> Result<(), Refused> {
         let unfit = |e: &str| Err(Refused::Unfit(e.into()));
-        if !state_fits(chain, tx) {
+        if !unspent_fits(chain, tx) {
             return unfit(
                 "spends an output that isn't unspent at that slot, or creates one that exists",
             );
+        }
+        if !unlocked(chain, tx) {
+            return unfit("still timelocked: it can be sent once its locks have passed");
         }
         if tx
             .body
@@ -470,9 +502,20 @@ impl Pool {
     }
 }
 
-/// Whether each input of `tx` is unspent at the slot it signs, and none of
-/// its outputs exists.
+/// Whether each input of `tx` is unspent at the slot it signs and its
+/// timelocks have passed, and none of its outputs exists.
 fn state_fits(chain: &impl Chainstate, tx: &Transaction) -> bool {
+    unspent_fits(chain, tx) && unlocked(chain, tx)
+}
+
+/// Whether `tx`'s timelocks have passed for the next block.
+fn unlocked(chain: &impl Chainstate, tx: &Transaction) -> bool {
+    tx.check_locks(chain.next_height(), |i| chain.created(&i.commitment))
+        .is_ok()
+}
+
+/// Whether `tx`'s inputs are unspent at their slots and its outputs new.
+fn unspent_fits(chain: &impl Chainstate, tx: &Transaction) -> bool {
     tx.body
         .inputs
         .iter()
@@ -509,6 +552,14 @@ mod tests {
 
         fn unspent(&self, c: &Commitment) -> Option<u64> {
             self.unspent.borrow().get(c).copied()
+        }
+
+        fn created(&self, c: &Commitment) -> Option<u32> {
+            self.unspent(c).map(|_| 1)
+        }
+
+        fn next_height(&self) -> u64 {
+            self.tip as u64 + 2
         }
     }
 
@@ -551,7 +602,7 @@ mod tests {
         let (keys, inputs) = coins.iter().map(|c| w.input(c, leaf)).unzip();
         let total: Amount = coins.iter().map(|c| c.amount).sum();
         let outputs: Vec<Output> = vec![w.keys_for(&[to; 16]).pay(total - fee)];
-        Transaction::sign(TxBody { inputs, outputs }, keys)
+        Transaction::sign(TxBody::new(inputs, outputs), keys)
             .unwrap()
             .to_bytes()
     }
@@ -609,7 +660,7 @@ mod tests {
         let (c, new) = pool.add(&chain, &bumped).unwrap();
         assert!(new && pool.get(&a).is_none() && pool.get(&c).is_some());
         let spender = pool.spender(&coins[0].record.commitment).unwrap();
-        assert_eq!(spender.body.inputs[0].leaf, 1);
+        assert_eq!(spender.body.inputs[0].key_leaf(), Some(1));
         // One spending both pool transactions' inputs must pay more than
         // both together, and more per byte than each (it's about twice
         // their size).
@@ -622,6 +673,33 @@ mod tests {
         pool.add(&chain, &both).unwrap();
         assert!(pool.get(&b).is_none() && pool.get(&c).is_none());
         assert_eq!(pool.size(&chain).0, 1);
+    }
+
+    /// A large transaction paying a big fee at a low rate can't pin a
+    /// small one paying less in all: twice the rate replaces it.
+    #[test]
+    fn twice_the_fee_rate_replaces_a_larger_transaction() {
+        let (chain, coins) = chain(1, COIN);
+        let pool = Mempool::new();
+        let w = wallet();
+        let (keys, inputs) = coins.iter().map(|c| w.input(c, 0)).unzip();
+        let outputs: Vec<Output> = (0..200u8)
+            .map(|i| w.keys_for(&[i; 16]).pay(COIN / 1000))
+            .collect();
+        let pin = Transaction::sign(TxBody::new(inputs, outputs), keys)
+            .unwrap()
+            .to_bytes();
+        let pin_fee = COIN - 200 * (COIN / 1000);
+        let (p_id, _) = pool.add(&chain, &pin).unwrap();
+        let small = spend_with(&coins, 250, pin_fee / 2, 1);
+        assert!(small.len() * 5 < pin.len());
+        // At one and a half times the pin's rate (far less in all): no.
+        let rate = pin_fee as u128 * small.len() as u128 / pin.len() as u128;
+        let low = spend_with(&coins, 251, (rate * 3 / 2) as Amount, 2);
+        assert!(matches!(pool.add(&chain, &low), Err(Refused::Unfit(_))));
+        // At more than twice the rate: yes.
+        let (id, new) = pool.add(&chain, &small).unwrap();
+        assert!(new && pool.get(&p_id).is_none() && pool.knows(&id));
     }
 
     #[test]

@@ -6,7 +6,8 @@
 //! input list (removals); segments cover consecutive slices, chained by
 //! their public states and last keys. Each segment also outputs multiset
 //! fingerprints of what it inserted (key and nonce) and removed (key and
-//! position), which the aggregation matches against the item chunks'.
+//! position, height), which the aggregation matches against the item
+//! chunks'.
 //!
 //! Every row holds one Poseidon2 permutation plus auxiliary columns, with
 //! preprocessed selectors giving each row its role. A leaf hash is four
@@ -40,9 +41,13 @@
 //! Inactive operations leave the state alone; their rows are filled with
 //! dummy values satisfying the ungated constraints.
 //!
+//! Leaves carry their creation height: new leaves get the block's height
+//! (a public value), and the removal fingerprint includes the removed
+//! leaf's, which relative timelocks count from.
+//!
 //! Public values (see [`public`]): state before (`root 8 | size lo, hi`),
-//! state after, `lambda (4) | r (4)`, `P_ins (4) | P_sp (4)`, and the last
-//! inserted and spent keys before and after (`8` each).
+//! state after, `lambda (4) | r (4)`, `P_ins (4) | P_sp (4)`, the last
+//! inserted and spent keys before and after (`8` each), and the height.
 //!
 //! [`verify_insert`]: crate::state::verify_insert
 //! [`verify_remove`]: crate::state::verify_remove
@@ -96,15 +101,19 @@ const RNI_LO: usize = RNK + HASH_LEN;
 const RNI_HI: usize = RNI_LO + 1;
 const POS_LO: usize = RNI_HI + 1;
 const POS_HI: usize = POS_LO + 1;
-const MID: usize = POS_HI + 1;
+/// The low leaf's (or predecessor's) and the removed leaf's heights.
+const LH: usize = POS_HI + 1;
+const RH: usize = LH + 1;
+const MID: usize = RH + 1;
 // Leaf hash rows.
 const LEAF_K: usize = MID + HASH_LEN;
 const LEAF_N: usize = LEAF_K + HASH_LEN;
 const LEAF_NK: usize = LEAF_N + NONCE_LIMBS;
 const LEAF_LO: usize = LEAF_NK + HASH_LEN;
 const LEAF_HI: usize = LEAF_LO + 1;
+const LEAF_HT: usize = LEAF_HI + 1;
 // Merge rows.
-const CUR_A: usize = LEAF_HI + 1;
+const CUR_A: usize = LEAF_HT + 1;
 const CUR_B: usize = CUR_A + HASH_LEN;
 const SIB: usize = CUR_B + HASH_LEN;
 const BIT: usize = SIB + HASH_LEN;
@@ -172,7 +181,9 @@ pub mod public {
     pub const PREV_INS_OUT: usize = 44;
     pub const PREV_SP_IN: usize = 52;
     pub const PREV_SP_OUT: usize = 60;
-    pub const LEN: usize = 68;
+    /// The block's height: inserted leaves' creation height.
+    pub const HEIGHT: usize = 68;
+    pub const LEN: usize = 69;
 }
 
 /// A segment's capacity.
@@ -332,7 +343,7 @@ impl Air for StateSegmentAir {
         }
 
         // Leaf hash rows: sponge(STATE_LEAF, [], [key, nonce head, next
-        // key, lo, hi, nonce tail]), one block per row.
+        // key, lo, hi, nonce tail, height]), one block per row.
         let h1 = p[H1];
         for j in 0..HASH_LEN {
             c.assert_zero(h1 * (l[j] - l[LEAF_K + j]));
@@ -343,7 +354,7 @@ impl Air for StateSegmentAir {
         c.assert_zero(h1 * (l[13] - k(domain::STATE_LEAF)));
         c.assert_zero(h1 * (l[14] - k(LEAF_LEN as u32)));
         c.assert_zero(h1 * l[15]);
-        for col in LEAF_K..LEAF_HI + 1 {
+        for col in LEAF_K..LEAF_HT + 1 {
             c.assert_zero((h1 + p[H2] + p[H3]) * (n[col] - l[col]));
         }
         for (sel, block) in [(h1, LEAF_N), (p[H2], LEAF_NK)] {
@@ -357,12 +368,15 @@ impl Air for StateSegmentAir {
                 0 => l[LEAF_LO],
                 1 => l[LEAF_HI],
                 j if j < 2 + state::NONCE_TAIL => l[LEAF_N + HASH_LEN + j - 2],
+                j if j == 2 + state::NONCE_TAIL => l[LEAF_HT],
                 _ => zero,
             };
             c.assert_zero(p[H3] * (x - out(j) - absorbed));
         }
-        // Which leaf: (selector, key, nonce, next key, next index lo, hi).
-        type Kind<V> = (usize, [V; 8], usize, [V; 8], V, V);
+        // Which leaf: (selector, key, nonce, next key, next index lo, hi,
+        // height). New leaves get the block's height; the rest keep theirs.
+        let height = public[public::HEIGHT];
+        type Kind<V> = (usize, [V; 8], usize, [V; 8], V, V, V);
         let kinds: [Kind<V>; 6] = [
             (
                 K_INS_OLD,
@@ -371,6 +385,7 @@ impl Air for StateSegmentAir {
                 ext8(l, LNK),
                 l[LNI_LO],
                 l[LNI_HI],
+                l[LH],
             ),
             (
                 K_INS_RELINK,
@@ -379,6 +394,7 @@ impl Air for StateSegmentAir {
                 ext8(l, KEY),
                 l[SIZE_LO],
                 l[SIZE_HI],
+                l[LH],
             ),
             (
                 K_INS_NEW,
@@ -387,6 +403,7 @@ impl Air for StateSegmentAir {
                 ext8(l, LNK),
                 l[LNI_LO],
                 l[LNI_HI],
+                height,
             ),
             (
                 K_PRED_OLD,
@@ -395,6 +412,7 @@ impl Air for StateSegmentAir {
                 ext8(l, KEY),
                 l[POS_LO],
                 l[POS_HI],
+                l[LH],
             ),
             (
                 K_PRED_NEW,
@@ -403,6 +421,7 @@ impl Air for StateSegmentAir {
                 ext8(l, RNK),
                 l[RNI_LO],
                 l[RNI_HI],
+                l[LH],
             ),
             (
                 K_REMOVED,
@@ -411,6 +430,7 @@ impl Air for StateSegmentAir {
                 ext8(l, RNK),
                 l[RNI_LO],
                 l[RNI_HI],
+                l[RH],
             ),
         ];
         for j in 0..HASH_LEN {
@@ -429,13 +449,15 @@ impl Air for StateSegmentAir {
             }
             c.assert_zero(dn);
         }
-        let (mut dlo, mut dhi) = (zero, zero);
-        for (kind, _, _, _, lo, hi) in &kinds {
+        let (mut dlo, mut dhi, mut dht) = (zero, zero, zero);
+        for (kind, _, _, _, lo, hi, ht) in &kinds {
             dlo = dlo + p[*kind] * (l[LEAF_LO] - *lo);
             dhi = dhi + p[*kind] * (l[LEAF_HI] - *hi);
+            dht = dht + p[*kind] * (l[LEAF_HT] - *ht);
         }
         c.assert_zero(dlo);
         c.assert_zero(dhi);
+        c.assert_zero(dht);
 
         // Running nodes: set from leaf hashes, reset to the empty leaf,
         // advanced by merges, else carried.
@@ -562,7 +584,8 @@ impl Air for StateSegmentAir {
                 c.assert_zero_transition((one - end) * (n[prev + j] - l[prev + j]));
             }
         }
-        // Fingerprints: inserted (key, nonce), removed (key, position).
+        // Fingerprints: inserted (key, nonce), removed (key, position,
+        // height).
         let (lambda, r) = (pub4(public::LAMBDA), pub4(public::R));
         let mut powers = [[zero; 4]; HASH_LEN + NONCE_LIMBS];
         powers[0][0] = one;
@@ -583,7 +606,7 @@ impl Air for StateSegmentAir {
         let e_ins = element(&mut (KEY..NONCE + NONCE_LIMBS).map(|col| l[col]));
         let e_sp = element(
             &mut (KEY..KEY + HASH_LEN)
-                .chain([POS_LO, POS_HI])
+                .chain([POS_LO, POS_HI, RH])
                 .map(|col| l[col]),
         );
         for (end, col, e) in [(ei, PINS, e_ins), (es, PSP, e_sp)] {
@@ -651,7 +674,8 @@ pub struct SegmentStart {
 }
 
 impl StateSegmentAir {
-    /// The trace and public values for applying `inserts` then `spends`,
+    /// The trace and public values for applying `inserts` then `spends`
+    /// for the block at `height`,
     /// whose proofs must come from applying them in this order (e.g. with
     /// [`StateTree`](crate::state::StateTree)). Invalid operations give a
     /// trace that fails the constraints.
@@ -664,6 +688,7 @@ impl StateSegmentAir {
         start: &SegmentStart,
         inserts: &[InsertOp],
         spends: &[SpendOp],
+        height: u32,
         lambda: BabyBear4,
         r: BabyBear4,
     ) -> (RowMajorMatrix, Vec<BabyBear>) {
@@ -703,6 +728,7 @@ impl StateSegmentAir {
                     new_siblings: *op.proof.new_siblings,
                     removed_next_key: [BabyBear::ZERO; HASH_LEN],
                     removed_next_index: 0,
+                    removed_height: 0,
                     position: 0,
                 },
                 None => OpFields::dummy_insert(),
@@ -718,6 +744,7 @@ impl StateSegmentAir {
                 nonce: o.nonce,
                 next_key: o.low.next_key,
                 next_index: o.low.next_index,
+                height,
             };
             o.write_constants(&mut m, b, INS_ROWS);
             compare(&mut m, b + ins::ORD, &g.prev_ins, &o.key);
@@ -789,6 +816,7 @@ impl StateSegmentAir {
                     new_siblings: *op.proof.leaf.siblings,
                     removed_next_key: op.proof.leaf.leaf.next_key,
                     removed_next_index: op.proof.leaf.leaf.next_index,
+                    removed_height: op.proof.leaf.leaf.height,
                     position: op.proof.position(),
                 },
                 None => OpFields::dummy_spend(),
@@ -810,6 +838,7 @@ impl StateSegmentAir {
                 nonce: o.nonce,
                 next_key: o.removed_next_key,
                 next_index: o.removed_next_index,
+                height: o.removed_height,
             };
             let h_old = leaf_rows(&mut m, b + sp::H_PRED_OLD, &pred_old);
             let h_new = leaf_rows(&mut m, b + sp::H_PRED_NEW, &pred_new);
@@ -840,15 +869,15 @@ impl StateSegmentAir {
                 g.prev_sp = o.key;
                 let (lo, hi) = state::split(o.position);
                 let mut xs = o.key.to_vec();
-                xs.extend([lo, hi]);
+                xs.extend([lo, hi, BabyBear::new(o.removed_height)]);
                 g.psp *= r - fp(&xs);
             }
         }
 
         let fin = self.final_row();
-        let height = m.height();
-        g.write(&mut m, fin, height - fin);
-        for row in fin..height {
+        let rows = m.height();
+        g.write(&mut m, fin, rows - fin);
+        for row in fin..rows {
             poseidon2_air::generate([BabyBear::ZERO; WIDTH], m.row_mut(row));
         }
         self.propagate_nodes(&mut m);
@@ -871,6 +900,7 @@ impl StateSegmentAir {
         public[public::PREV_INS_OUT..public::PREV_INS_OUT + 8].copy_from_slice(&g.prev_ins);
         public[public::PREV_SP_IN..public::PREV_SP_IN + 8].copy_from_slice(&start.prev_spend);
         public[public::PREV_SP_OUT..public::PREV_SP_OUT + 8].copy_from_slice(&g.prev_sp);
+        public[public::HEIGHT] = BabyBear::new(height);
         (m, public)
     }
 }
@@ -962,9 +992,10 @@ struct OpFields {
     low_siblings: [Hash; DEPTH],
     /// Insert: the path to slot `size`. Removal: the removed leaf's path.
     new_siblings: [Hash; DEPTH],
-    /// Removal: the removed leaf's link and its position.
+    /// Removal: the removed leaf's link, height and position.
     removed_next_key: Hash,
     removed_next_index: u64,
+    removed_height: u32,
     position: u64,
 }
 
@@ -984,6 +1015,7 @@ impl OpFields {
             new_siblings: [[BabyBear::ZERO; HASH_LEN]; DEPTH],
             removed_next_key: [BabyBear::ZERO; HASH_LEN],
             removed_next_index: 0,
+            removed_height: 0,
             position: 0,
         }
     }
@@ -1014,6 +1046,8 @@ impl OpFields {
             row[RNI_HI] = rhi;
             row[POS_LO] = plo;
             row[POS_HI] = phi;
+            row[LH] = BabyBear::new(self.low.height);
+            row[RH] = BabyBear::new(self.removed_height);
         }
     }
 }
@@ -1064,6 +1098,7 @@ fn leaf_rows(m: &mut RowMajorMatrix, at: usize, leaf: &Leaf) -> Hash {
         row[LEAF_NK..LEAF_NK + HASH_LEN].copy_from_slice(&leaf.next_key);
         row[LEAF_LO] = lo;
         row[LEAF_HI] = hi;
+        row[LEAF_HT] = BabyBear::new(leaf.height);
     }
     let mut input = [BabyBear::ZERO; WIDTH];
     input[..HASH_LEN].copy_from_slice(&leaf.key);
@@ -1072,6 +1107,7 @@ fn leaf_rows(m: &mut RowMajorMatrix, at: usize, leaf: &Leaf) -> Hash {
     let mut state = poseidon2_air::generate(input, m.row_mut(at));
     let mut last = vec![lo, hi];
     last.extend(&nonce[HASH_LEN..]);
+    last.push(BabyBear::new(leaf.height));
     for (offset, block) in [
         (1, &nonce[..HASH_LEN]),
         (2, &leaf.next_key[..]),
@@ -1141,6 +1177,8 @@ mod tests {
     use crate::state::StateTree;
 
     const LAMBDA: BabyBear4 = BabyBear4::new([3, 5, 7, 11]);
+    /// The block the segments belong to.
+    const HEIGHT: u32 = 9;
     const R: BabyBear4 = BabyBear4::new([13, 17, 19, 23]);
 
     fn record(n: u32) -> OutputRecord {
@@ -1171,7 +1209,7 @@ mod tests {
             let tree = StateTree::open(tmp.env()).unwrap();
             let mut txn = tmp.env().write_txn().unwrap();
             for r in sorted(existing.iter().map(|&n| record(n)).collect()) {
-                tree.insert(&mut txn, &r).unwrap();
+                tree.insert(&mut txn, &r, 1).unwrap();
             }
             txn.commit().unwrap();
             Self { tmp, tree }
@@ -1188,7 +1226,7 @@ mod tests {
             let ins = sorted(inserts.iter().map(|&n| record(n)).collect())
                 .into_iter()
                 .map(|record| InsertOp {
-                    proof: self.tree.insert(&mut txn, &record).unwrap(),
+                    proof: self.tree.insert(&mut txn, &record, HEIGHT as u64).unwrap(),
                     record,
                 })
                 .collect();
@@ -1233,7 +1271,7 @@ mod tests {
             inserts: 3,
             spends: 2,
         };
-        let (t, public) = air.trace(&start(before), &ins, &sp, LAMBDA, R);
+        let (t, public) = air.trace(&start(before), &ins, &sp, HEIGHT, LAMBDA, R);
         assert_eq!(check_constraints(&air, &t, &public), Ok(()));
         assert_eq!(
             state_at(&public, public::NEW_ROOT, public::NEW_SIZE),
@@ -1246,8 +1284,15 @@ mod tests {
         );
         let p_sp = product(
             R,
-            sp.iter()
-                .map(|o| input_element(LAMBDA, &o.commitment, o.proof.position()).unwrap()),
+            sp.iter().map(|o| {
+                input_element(
+                    LAMBDA,
+                    &o.commitment,
+                    o.proof.position(),
+                    o.proof.leaf.leaf.height,
+                )
+                .unwrap()
+            }),
         );
         assert_eq!(&public[public::P_INS..public::P_INS + 4], &p_ins.0);
         assert_eq!(&public[public::P_SP..public::P_SP + 4], &p_sp.0);
@@ -1261,7 +1306,7 @@ mod tests {
             inserts: 3,
             spends: 2,
         };
-        let (t, public) = air.trace(&start(before), &ins, &sp, LAMBDA, R);
+        let (t, public) = air.trace(&start(before), &ins, &sp, HEIGHT, LAMBDA, R);
         assert_eq!(check_constraints(&air, &t, &public), Ok(()));
         assert_eq!(
             state_at(&public, public::NEW_ROOT, public::NEW_SIZE),
@@ -1277,7 +1322,7 @@ mod tests {
             inserts: 1,
             spends: 1,
         };
-        let (t, public) = air.trace(&start(before), &[], &[], LAMBDA, R);
+        let (t, public) = air.trace(&start(before), &[], &[], HEIGHT, LAMBDA, R);
         assert_eq!(check_constraints(&air, &t, &public), Ok(()));
         assert_eq!(
             state_at(&public, public::NEW_ROOT, public::NEW_SIZE),
@@ -1294,7 +1339,7 @@ mod tests {
             inserts: 2,
             spends: 1,
         };
-        let (t1, p1) = air.trace(&start(before), &ins[..2], &[], LAMBDA, R);
+        let (t1, p1) = air.trace(&start(before), &ins[..2], &[], HEIGHT, LAMBDA, R);
         assert_eq!(check_constraints(&air, &t1, &p1), Ok(()));
         let mid = SegmentStart {
             state: {
@@ -1304,7 +1349,7 @@ mod tests {
             prev_insert: core::array::from_fn(|j| p1[public::PREV_INS_OUT + j]),
             prev_spend: core::array::from_fn(|j| p1[public::PREV_SP_OUT + j]),
         };
-        let (t2, p2) = air.trace(&mid, &ins[2..], &sp[..1], LAMBDA, R);
+        let (t2, p2) = air.trace(&mid, &ins[2..], &sp[..1], HEIGHT, LAMBDA, R);
         assert_eq!(check_constraints(&air, &t2, &p2), Ok(()));
         let mid2 = SegmentStart {
             state: {
@@ -1314,7 +1359,7 @@ mod tests {
             prev_insert: core::array::from_fn(|j| p2[public::PREV_INS_OUT + j]),
             prev_spend: core::array::from_fn(|j| p2[public::PREV_SP_OUT + j]),
         };
-        let (t3, p3) = air.trace(&mid2, &[], &sp[1..], LAMBDA, R);
+        let (t3, p3) = air.trace(&mid2, &[], &sp[1..], HEIGHT, LAMBDA, R);
         assert_eq!(check_constraints(&air, &t3, &p3), Ok(()));
         assert_eq!(
             state_at(&p3, public::NEW_ROOT, public::NEW_SIZE),
@@ -1330,7 +1375,7 @@ mod tests {
             inserts: 1,
             spends: 1,
         };
-        let (t, public) = air.trace(&start(before), &ins, &sp, LAMBDA, R);
+        let (t, public) = air.trace(&start(before), &ins, &sp, HEIGHT, LAMBDA, R);
         for at in [
             public::OLD_ROOT,
             public::NEW_ROOT + 3,
@@ -1355,7 +1400,7 @@ mod tests {
         let ins: Vec<InsertOp> = records
             .into_iter()
             .map(|record| InsertOp {
-                proof: f.tree.insert(&mut txn, &record).unwrap(),
+                proof: f.tree.insert(&mut txn, &record, HEIGHT as u64).unwrap(),
                 record,
             })
             .collect();
@@ -1363,7 +1408,7 @@ mod tests {
             inserts: 2,
             spends: 0,
         };
-        let (t, public) = air.trace(&start(before), &ins, &[], LAMBDA, R);
+        let (t, public) = air.trace(&start(before), &ins, &[], HEIGHT, LAMBDA, R);
         let err = check_constraints(&air, &t, &public).unwrap_err();
         assert_eq!(err, air.insert_base(1) + ins::ORD);
     }
@@ -1402,7 +1447,7 @@ mod tests {
             inserts: 1,
             spends: 0,
         };
-        let (t, public) = air.trace(&start(before), &ins, &[], LAMBDA, R);
+        let (t, public) = air.trace(&start(before), &ins, &[], HEIGHT, LAMBDA, R);
         assert_eq!(check_constraints(&air, &t, &public), Err(ins::NEXT));
     }
 
@@ -1415,16 +1460,16 @@ mod tests {
             inserts: 1,
             spends: 1,
         };
-        let (t, public) = air.trace(&start(before), &[], &sp, LAMBDA, R);
+        let (t, public) = air.trace(&start(before), &[], &sp, HEIGHT, LAMBDA, R);
         assert_eq!(check_constraints(&air, &t, &public), Ok(()));
         let mut txn = f.tmp.env().write_txn().unwrap();
         f.tree.remove(&mut txn, &record(1).commitment).unwrap();
         assert_eq!(f.tree.state(&txn).unwrap(), after);
         let ins = [InsertOp {
-            proof: f.tree.insert(&mut txn, &record(1)).unwrap(),
+            proof: f.tree.insert(&mut txn, &record(1), HEIGHT as u64).unwrap(),
             record: record(1),
         }];
-        let (t, public) = air.trace(&start(after), &ins, &[], LAMBDA, R);
+        let (t, public) = air.trace(&start(after), &ins, &[], HEIGHT, LAMBDA, R);
         assert_eq!(check_constraints(&air, &t, &public), Ok(()));
         assert_eq!(
             state_at(&public, public::NEW_ROOT, public::NEW_SIZE),
@@ -1446,7 +1491,7 @@ mod tests {
             inserts: 0,
             spends: 1,
         };
-        let (t, public) = air.trace(&start(spent_state), &[], &sp, LAMBDA, R);
+        let (t, public) = air.trace(&start(spent_state), &[], &sp, HEIGHT, LAMBDA, R);
         assert_eq!(check_constraints(&air, &t, &public), Err(sp::H_REMOVED));
     }
 
@@ -1459,7 +1504,7 @@ mod tests {
             inserts: 0,
             spends: 1,
         };
-        let (t, public) = air.trace(&start(before), &[], &sp, LAMBDA, R);
+        let (t, public) = air.trace(&start(before), &[], &sp, HEIGHT, LAMBDA, R);
         // The predecessor hashed as linking to the wrong key doesn't reach
         // the root.
         assert_eq!(check_constraints(&air, &t, &public), Err(sp::H_REMOVED));
@@ -1476,14 +1521,45 @@ mod tests {
         // Claiming another slot: the predecessor's link no longer matches.
         let mut bad = sp.clone();
         bad[0].proof.leaf.index += 1;
-        let (t, public) = air.trace(&start(before), &[], &bad, LAMBDA, R);
+        let (t, public) = air.trace(&start(before), &[], &bad, HEIGHT, LAMBDA, R);
         assert!(check_constraints(&air, &t, &public).is_err());
         // Another nonce: the removed leaf doesn't reach the intermediate
         // root.
         let mut bad = sp.clone();
         bad[0].proof.leaf.leaf.nonce[0] ^= 1;
-        let (t, public) = air.trace(&start(before), &[], &bad, LAMBDA, R);
+        let (t, public) = air.trace(&start(before), &[], &bad, HEIGHT, LAMBDA, R);
         assert_eq!(check_constraints(&air, &t, &public), Err(sp::END));
+    }
+
+    /// Leaves carry their creation height: a removal can't claim another
+    /// one (so a timelock can't count from the wrong height), and inserts
+    /// get the block's.
+    #[test]
+    fn rejects_a_wrong_height() {
+        let f = Fixture::new(&[1, 2, 3]);
+        let (before, _, sp, _) = f.ops(&[], &[2]);
+        let air = StateSegmentAir {
+            inserts: 0,
+            spends: 1,
+        };
+        let mut bad = sp.clone();
+        bad[0].proof.leaf.leaf.height += 1;
+        let (t, public) = air.trace(&start(before), &[], &bad, HEIGHT, LAMBDA, R);
+        assert_eq!(check_constraints(&air, &t, &public), Err(sp::END));
+        // An insert at another height reaches another root (the height is
+        // public, and the chain proof fixes it to the block's).
+        let (before, ins, _, after) = f.ops(&[7], &[]);
+        let air = StateSegmentAir {
+            inserts: 1,
+            spends: 0,
+        };
+        let new_root = |height| {
+            let (t, public) = air.trace(&start(before), &ins, &[], height, LAMBDA, R);
+            assert_eq!(check_constraints(&air, &t, &public), Ok(()));
+            state_at(&public, public::NEW_ROOT, public::NEW_SIZE)
+        };
+        assert_eq!(new_root(HEIGHT), (after.root, after.size));
+        assert_ne!(new_root(HEIGHT + 1).0, after.root);
     }
 
     #[test]
@@ -1499,7 +1575,7 @@ mod tests {
             inserts: 1,
             spends: 1,
         };
-        let (t, public) = air.trace(&start(before), &ins, &sp, LAMBDA, R);
+        let (t, public) = air.trace(&start(before), &ins, &sp, HEIGHT, LAMBDA, R);
         let (pk, vk) = stark::setup(&params, &air);
         let proof = stark::prove(&params, &pk, &air, t, &public);
         assert_eq!(stark::verify(&params, &vk, &air, &public, &proof), Ok(()));

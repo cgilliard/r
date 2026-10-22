@@ -56,12 +56,13 @@ const END: u64 = 0;
 /// 40-bit values are hashed as two limbs: low 30 bits, then high bits.
 const LIMB_BITS: u32 = 30;
 
-/// Elements in a leaf hash: key, nonce limbs, next key, next index lo/hi.
-pub const LEAF_LEN: usize = 2 * HASH_LEN + NONCE_LIMBS + 2;
+/// Elements in a leaf hash: key, nonce limbs, next key, next index lo/hi,
+/// height.
+pub const LEAF_LEN: usize = 2 * HASH_LEN + NONCE_LIMBS + 3;
 /// Nonce limbs after the first block's worth, hashed last (so each part of
 /// a leaf starts a sponge block).
 pub const NONCE_TAIL: usize = NONCE_LIMBS - HASH_LEN;
-const _: () = assert!(NONCE_LIMBS >= HASH_LEN && 2 + NONCE_TAIL <= HASH_LEN);
+const _: () = assert!(NONCE_LIMBS >= HASH_LEN && 3 + NONCE_TAIL <= HASH_LEN);
 
 pub type Siblings = [Hash; DEPTH];
 
@@ -73,6 +74,9 @@ pub struct Leaf {
     pub next_key: Hash,
     /// Slot of the next leaf in sorted order, or [`END`].
     pub next_index: u64,
+    /// Height of the block that created the output (0 for the sentinel):
+    /// what relative timelocks count from.
+    pub height: u32,
 }
 
 impl Leaf {
@@ -81,10 +85,11 @@ impl Leaf {
         nonce: [0; NONCE_LEN],
         next_key: [BabyBear::ZERO; HASH_LEN],
         next_index: END,
+        height: 0,
     };
 
     /// `sponge(STATE_LEAF, [key, nonce limbs 0..8, next key, next index
-    /// lo, hi, nonce limbs 8..])`.
+    /// lo, hi, nonce limbs 8.., height])`.
     pub fn hash(&self) -> Hash {
         let (lo, hi) = split(self.next_index);
         let nonce = output::nonce_limbs(&self.nonce);
@@ -97,6 +102,7 @@ impl Leaf {
                 &self.next_key,
                 &[lo, hi],
                 &nonce[HASH_LEN..],
+                &[BabyBear::new(self.height)],
             ],
         )
     }
@@ -219,12 +225,13 @@ impl fmt::Display for ProofError {
 
 impl std::error::Error for ProofError {}
 
-/// Checks an insert of `key` with `nonce` against `state` and returns the
-/// new state.
+/// Checks an insert of `key` with `nonce`, created at `height`, against
+/// `state` and returns the new state.
 pub fn verify_insert(
     state: &State,
     key: &Hash,
     nonce: &Nonce,
+    height: u32,
     proof: &InsertProof,
 ) -> Result<State, ProofError> {
     let low = &proof.low;
@@ -253,6 +260,7 @@ pub fn verify_insert(
         nonce: *nonce,
         next_key: low.leaf.next_key,
         next_index: low.leaf.next_index,
+        height,
     };
     Ok(State {
         root: root_of(&leaf.hash(), index, &proof.new_siblings),
@@ -380,11 +388,11 @@ impl Undo {
     }
 }
 
-/// Checks a block's state transition from proofs alone: inserts `created`,
-/// then removes `spent`, in order. Inserting first lets a block spend an
-/// output it creates.
+/// Checks the state transition of the block at `height` from proofs alone:
+/// inserts `created`, then removes `spent`, in order.
 pub fn verify_changes(
     state: &State,
+    height: u64,
     created: &[OutputRecord],
     spent: &[Commitment],
     proofs: &ChangeProofs,
@@ -396,7 +404,13 @@ pub fn verify_changes(
     let key = |c: &Commitment| key_of(c).map_err(|_| ProofError::InvalidKey);
     let mut state = *state;
     for (o, proof) in created.iter().zip(inserts) {
-        state = verify_insert(&state, &key(&o.commitment)?, &o.nonce, proof)?;
+        state = verify_insert(
+            &state,
+            &key(&o.commitment)?,
+            &o.nonce,
+            leaf_height(height),
+            proof,
+        )?;
     }
     for (c, proof) in spent.iter().zip(removals) {
         state = verify_remove(&state, &key(c)?, proof)?;
@@ -433,6 +447,8 @@ pub enum Error {
     Corrupt,
     /// [`StateTree::sync_finish`] needs a new tree.
     NotEmpty,
+    /// The database is from an earlier, incompatible version.
+    OldLayout,
     /// The state download still has nodes to fetch.
     Incomplete,
 }
@@ -444,6 +460,9 @@ impl fmt::Display for Error {
             Self::Db(e) => write!(f, "database error: {e}"),
             Self::Corrupt => f.write_str("state database is corrupt"),
             Self::NotEmpty => f.write_str("the state tree isn't empty"),
+            Self::OldLayout => f.write_str(
+                "the database is from an earlier, incompatible version: delete it and sync again",
+            ),
             Self::Incomplete => f.write_str("the state download isn't complete"),
         }
     }
@@ -503,10 +522,11 @@ const HISTORY_KEY: &[u8] = b"history";
 const SYNC_KEY: &[u8] = b"sync";
 const LAYOUT_KEY: &[u8] = b"layout";
 
-/// The on-disk layout: 2 stores every [`STRIDE`]th level and leaves
-/// without their next key; 1 (no `layout` entry) stored every level and
-/// whole leaves, and is migrated on opening ([`StateTree::migrate`]).
-const LAYOUT: u8 = 2;
+/// The on-disk layout: 3 stores every [`STRIDE`]th level and leaves with
+/// their creation height but without their next key. Earlier layouts
+/// (2, and 1 with no `layout` entry) belong to chains whose leaves lacked
+/// heights, which this version can't continue, so they're refused.
+const LAYOUT: u8 = 3;
 
 /// Levels between stored node levels. Hashing a missing level takes at
 /// most `2^STRIDE` stored nodes (or leaves) from the stored level below.
@@ -570,64 +590,11 @@ impl StateTree {
             )?;
             tree.meta.put(&mut txn, SIZE_KEY, &1u64.to_be_bytes())?;
         }
-        match tree.meta.get(&txn, LAYOUT_KEY)? {
-            Some([LAYOUT]) => {}
-            None => tree.migrate(&mut txn)?,
-            Some(_) => return Err(Error::Corrupt),
+        if tree.meta.get(&txn, LAYOUT_KEY)? != Some(&[LAYOUT][..]) {
+            return Err(Error::OldLayout);
         }
         txn.commit()?;
         Ok(tree)
-    }
-
-    /// Converts a layout-1 tree: rewrites its leaves (and their history)
-    /// without the next key and drops the node levels no longer stored,
-    /// with their history.
-    fn migrate(&self, txn: &mut RwTxn) -> Result<(), Error> {
-        let old: Vec<(Vec<u8>, Vec<u8>)> = self
-            .leaves
-            .iter(txn)?
-            .map(|e| e.map(|(k, v)| (k.to_vec(), v.to_vec())))
-            .collect::<Result<_, _>>()?;
-        for (k, v) in old {
-            self.leaves
-                .put(txn, &k, &encode_stored(&decode_leaf(&v)?))?;
-        }
-        let old: Vec<(Vec<u8>, Vec<u8>)> = self
-            .history
-            .iter(txn)?
-            .map(|e| e.map(|(k, v)| (k.to_vec(), v.to_vec())))
-            .collect::<Result<_, _>>()?;
-        for (k, v) in old {
-            match k[0] as usize {
-                0 if !v.is_empty() => {
-                    self.history
-                        .put(txn, &k, &encode_stored(&decode_leaf(&v)?))?
-                }
-                0 => {}
-                d if !is_stored(d) => {
-                    self.history.delete(txn, &k)?;
-                }
-                _ => {}
-            }
-        }
-        for (db, at) in [(self.nodes, 0), (self.changes, 8)] {
-            let dropped: Vec<Vec<u8>> = db
-                .iter(txn)?
-                .filter_map(|e| match e {
-                    Ok((k, _)) if k.len() > at && !is_stored(k[at] as usize) => {
-                        // Leaf history (level 0) stays in `state_changes`.
-                        (at == 0 || k[at] != 0).then(|| Ok(k.to_vec()))
-                    }
-                    Ok(_) => None,
-                    Err(e) => Some(Err(e)),
-                })
-                .collect::<Result<_, _>>()?;
-            for k in dropped {
-                db.delete(txn, &k)?;
-            }
-        }
-        self.meta.put(txn, LAYOUT_KEY, &[LAYOUT])?;
-        Ok(())
     }
 
     pub fn state(&self, txn: &RoTxn) -> Result<State, Error> {
@@ -676,7 +643,7 @@ impl StateTree {
             if index == 0 {
                 continue;
             }
-            let (key, nonce, _) = decode_stored(v)?;
+            let (key, nonce, ..) = decode_stored(v)?;
             out.push((
                 index,
                 OutputRecord {
@@ -688,9 +655,15 @@ impl StateTree {
         Ok(out)
     }
 
-    /// Adds `record` as an unspent output in the next slot.
-    pub fn insert(&self, txn: &mut RwTxn, record: &OutputRecord) -> Result<InsertProof, Error> {
-        self.insert_at(txn, record, None)
+    /// Adds `record`, created by the block at `height`, as an unspent
+    /// output in the next slot.
+    pub fn insert(
+        &self,
+        txn: &mut RwTxn,
+        record: &OutputRecord,
+        height: u64,
+    ) -> Result<InsertProof, Error> {
+        self.insert_at(txn, record, height, None)
     }
 
     /// [`StateTree::insert`], recording history for the block at `at`.
@@ -698,6 +671,7 @@ impl StateTree {
         &self,
         txn: &mut RwTxn,
         record: &OutputRecord,
+        height: u64,
         at: Option<u64>,
     ) -> Result<InsertProof, Error> {
         let key = key_of(&record.commitment)?;
@@ -722,6 +696,7 @@ impl StateTree {
             nonce: record.nonce,
             next_key: low.leaf.next_key,
             next_index: low.leaf.next_index,
+            height: leaf_height(height),
         };
         // A stored leaf's next key is read from the next slot, so the
         // relinked low leaf needs the new one in place. Slot `index`'s
@@ -770,16 +745,18 @@ impl StateTree {
         Ok(RemoveProof { pred, leaf })
     }
 
-    /// Applies a block's changes: inserts `created`, then removes `spent`.
+    /// Applies the changes of the block at `height`: inserts `created`,
+    /// then removes `spent`.
     ///
     /// On error `txn` is left partly updated; the caller should abort it.
     pub fn apply_changes(
         &self,
         txn: &mut RwTxn,
+        height: u64,
         created: &[OutputRecord],
         spent: &[Commitment],
     ) -> Result<ChangeProofs, Error> {
-        self.apply_at(txn, None, created, spent)
+        self.apply_at(txn, height, None, created, spent)
     }
 
     /// The changes of [`StateTree::apply_changes`] for the block at
@@ -802,7 +779,7 @@ impl StateTree {
         let at = Some(height);
         let mut b = Batch::default();
         for o in created {
-            self.insert_staged(txn, o, at, &mut b)?;
+            self.insert_staged(txn, o, height, &mut b)?;
         }
         for c in spent {
             self.remove_staged(txn, c, at, &mut b)?;
@@ -815,14 +792,16 @@ impl StateTree {
         })
     }
 
-    /// [`StateTree::insert_at`] with the leaves staged in `b`.
+    /// [`StateTree::insert_at`] for the block at `height`, recording
+    /// history, with the leaves staged in `b`.
     fn insert_staged(
         &self,
         txn: &mut RwTxn,
         record: &OutputRecord,
-        at: Option<u64>,
+        height: u64,
         b: &mut Batch,
     ) -> Result<(), Error> {
+        let at = Some(height);
         let key = key_of(&record.commitment)?;
         let k = sort_key(&key);
         if self.keys.get(txn, &k)?.is_some() {
@@ -845,6 +824,7 @@ impl StateTree {
             nonce: record.nonce,
             next_key: low.next_key,
             next_index: low.next_index,
+            height: leaf_height(height),
         };
         self.stage(txn, index, Some(&leaf), at, b)?;
         self.keys.put(txn, &k, &index.to_be_bytes())?;
@@ -1005,13 +985,14 @@ impl StateTree {
     fn apply_at(
         &self,
         txn: &mut RwTxn,
+        height: u64,
         at: Option<u64>,
         created: &[OutputRecord],
         spent: &[Commitment],
     ) -> Result<ChangeProofs, Error> {
         let inserts = created
             .iter()
-            .map(|o| self.insert_at(txn, o, at))
+            .map(|o| self.insert_at(txn, o, height, at))
             .collect::<Result<_, _>>()?;
         let removals = spent
             .iter()
@@ -1157,7 +1138,7 @@ impl StateTree {
         let Some(v) = self.stored_at(txn, index, height)? else {
             return Ok(None);
         };
-        let (key, nonce, next_index) = decode_stored(&v)?;
+        let (key, nonce, next_index, created) = decode_stored(&v)?;
         let next = self
             .stored_at(txn, next_index, height)?
             .ok_or(Error::Corrupt)?;
@@ -1166,6 +1147,7 @@ impl StateTree {
             nonce,
             next_key: stored_key(&next)?,
             next_index,
+            height: created,
         }))
     }
 
@@ -1490,13 +1472,14 @@ impl StateTree {
     /// The leaf stored as `bytes`, with its next key: the key in the slot
     /// it links to (the sentinel's, zero, at the end of the list).
     fn with_next_key(&self, txn: &RoTxn, bytes: &[u8]) -> Result<Leaf, Error> {
-        let (key, nonce, next_index) = decode_stored(bytes)?;
+        let (key, nonce, next_index, height) = decode_stored(bytes)?;
         let next = self.leaves.get(txn, &next_index.to_be_bytes())?;
         Ok(Leaf {
             key,
             nonce,
             next_key: stored_key(next.ok_or(Error::Corrupt)?)?,
             next_index,
+            height,
         })
     }
 
@@ -1579,8 +1562,8 @@ impl StateTree {
     }
 }
 
-/// Bytes in an encoded leaf: key, nonce, next key, next index.
-const LEAF_BYTES: usize = 2 * HASH_BYTES + NONCE_LEN + 8;
+/// Bytes in an encoded leaf: key, nonce, next key, next index, height.
+const LEAF_BYTES: usize = 2 * HASH_BYTES + NONCE_LEN + 8 + 4;
 
 fn encode_leaf(leaf: &Leaf) -> [u8; LEAF_BYTES] {
     let mut out = [0u8; LEAF_BYTES];
@@ -1588,7 +1571,8 @@ fn encode_leaf(leaf: &Leaf) -> [u8; LEAF_BYTES] {
     out[HASH_BYTES..HASH_BYTES + NONCE_LEN].copy_from_slice(&leaf.nonce);
     let at = HASH_BYTES + NONCE_LEN;
     out[at..at + HASH_BYTES].copy_from_slice(&hash::to_bytes(&leaf.next_key));
-    out[at + HASH_BYTES..].copy_from_slice(&leaf.next_index.to_be_bytes());
+    out[at + HASH_BYTES..at + HASH_BYTES + 8].copy_from_slice(&leaf.next_index.to_be_bytes());
+    out[at + HASH_BYTES + 8..].copy_from_slice(&leaf.height.to_be_bytes());
     out
 }
 
@@ -1601,23 +1585,26 @@ fn decode_leaf(bytes: &[u8]) -> Result<Leaf, Error> {
         key: decode_hash(&bytes[..HASH_BYTES])?,
         nonce: bytes[HASH_BYTES..at].try_into().expect("nonce bytes"),
         next_key: decode_hash(&bytes[at..at + HASH_BYTES])?,
-        next_index: decode_u64(&bytes[at + HASH_BYTES..])?,
+        next_index: decode_u64(&bytes[at + HASH_BYTES..at + HASH_BYTES + 8])?,
+        height: decode_u32(&bytes[at + HASH_BYTES + 8..])?,
     })
 }
 
-/// Bytes in a stored leaf: key, nonce, next index (no next key).
-const STORED_LEAF_BYTES: usize = HASH_BYTES + NONCE_LEN + 8;
+/// Bytes in a stored leaf: key, nonce, next index, height (no next key).
+const STORED_LEAF_BYTES: usize = HASH_BYTES + NONCE_LEN + 8 + 4;
 
 fn encode_stored(leaf: &Leaf) -> [u8; STORED_LEAF_BYTES] {
     let mut out = [0u8; STORED_LEAF_BYTES];
+    let at = HASH_BYTES + NONCE_LEN;
     out[..HASH_BYTES].copy_from_slice(&hash::to_bytes(&leaf.key));
-    out[HASH_BYTES..HASH_BYTES + NONCE_LEN].copy_from_slice(&leaf.nonce);
-    out[HASH_BYTES + NONCE_LEN..].copy_from_slice(&leaf.next_index.to_be_bytes());
+    out[HASH_BYTES..at].copy_from_slice(&leaf.nonce);
+    out[at..at + 8].copy_from_slice(&leaf.next_index.to_be_bytes());
+    out[at + 8..].copy_from_slice(&leaf.height.to_be_bytes());
     out
 }
 
-/// A stored leaf's key, nonce and next index.
-fn decode_stored(bytes: &[u8]) -> Result<(Hash, Nonce, u64), Error> {
+/// A stored leaf's key, nonce, next index and height.
+fn decode_stored(bytes: &[u8]) -> Result<(Hash, Nonce, u64, u32), Error> {
     if bytes.len() != STORED_LEAF_BYTES {
         return Err(Error::Corrupt);
     }
@@ -1625,7 +1612,8 @@ fn decode_stored(bytes: &[u8]) -> Result<(Hash, Nonce, u64), Error> {
     Ok((
         stored_key(bytes)?,
         bytes[HASH_BYTES..at].try_into().expect("nonce bytes"),
-        decode_u64(&bytes[at..])?,
+        decode_u64(&bytes[at..at + 8])?,
+        decode_u32(&bytes[at + 8..])?,
     ))
 }
 
@@ -1643,6 +1631,18 @@ fn decode_u64(bytes: &[u8]) -> Result<u64, Error> {
     Ok(u64::from_be_bytes(
         bytes.try_into().map_err(|_| Error::Corrupt)?,
     ))
+}
+
+fn decode_u32(bytes: &[u8]) -> Result<u32, Error> {
+    Ok(u32::from_be_bytes(
+        bytes.try_into().map_err(|_| Error::Corrupt)?,
+    ))
+}
+
+/// A block height as a leaf's creation height. Chain heights stay far
+/// below `2^26` ([`crate::header::MAX_HEIGHT_BITS`]).
+fn leaf_height(height: u64) -> u32 {
+    u32::try_from(height).expect("chain heights fit in 32 bits")
 }
 
 /// Hashes a level of `2^k` nodes at level `d` up to their root.
@@ -1763,7 +1763,7 @@ mod tests {
             let spent: Vec<_> = spent.iter().map(|&n| commitment(n)).collect();
             let before = ta.state(&xa).unwrap();
             let undo = ta.apply_block(&mut xa, h, &created, &spent).unwrap();
-            let proofs = tb.apply_changes(&mut xb, &created, &spent).unwrap();
+            let proofs = tb.apply_changes(&mut xb, h, &created, &spent).unwrap();
             assert_eq!(ta.state(&xa).unwrap(), tb.state(&xb).unwrap(), "block {h}");
             assert_eq!(undo, proofs.undo(before.size), "block {h}");
             if h == 4 {
@@ -1797,7 +1797,7 @@ mod tests {
         let more: Vec<_> = (101_000..132_000).map(record).collect();
         let t = std::time::Instant::now();
         let mut txn = env.env().write_txn().unwrap();
-        tree.apply_changes(&mut txn, &more, &[]).unwrap();
+        tree.apply_changes(&mut txn, 3, &more, &[]).unwrap();
         eprintln!("change by change {:.2?}", t.elapsed());
         txn.abort();
     }
@@ -1946,9 +1946,9 @@ mod tests {
             let mut txn = tmp.env().write_txn().unwrap();
             for i in 0..n {
                 let before = tree.state(&txn).unwrap();
-                let proof = tree.insert(&mut txn, &record(i)).unwrap();
+                let proof = tree.insert(&mut txn, &record(i), 1).unwrap();
                 assert_eq!(
-                    verify_insert(&before, &key(i), &nonce(i), &proof),
+                    verify_insert(&before, &key(i), &nonce(i), 1, &proof),
                     Ok(tree.state(&txn).unwrap())
                 );
             }
@@ -2079,7 +2079,7 @@ mod tests {
         let mut txn = f.tmp.env().write_txn().unwrap();
         let t = &f.tree;
         assert_eq!(
-            state_err(t.insert(&mut txn, &record(2))),
+            state_err(t.insert(&mut txn, &record(2), 1)),
             StateError::Duplicate
         );
         let first = t.remove(&mut txn, &commitment(2)).unwrap().position();
@@ -2088,9 +2088,9 @@ mod tests {
             StateError::NotFound
         );
         let before = t.state(&txn).unwrap();
-        let proof = t.insert(&mut txn, &record(2)).unwrap();
+        let proof = t.insert(&mut txn, &record(2), 1).unwrap();
         assert_eq!(
-            verify_insert(&before, &key(2), &nonce(2), &proof),
+            verify_insert(&before, &key(2), &nonce(2), 1, &proof),
             Ok(t.state(&txn).unwrap())
         );
         let second = t.get(&txn, &commitment(2)).unwrap().unwrap().0;
@@ -2107,8 +2107,8 @@ mod tests {
         let f = Fixture::new(3);
         let mut txn = f.tmp.env().write_txn().unwrap();
         let s0 = f.tree.state(&txn).unwrap();
-        let ins = f.tree.insert(&mut txn, &record(100)).unwrap();
-        let s1 = verify_insert(&s0, &key(100), &nonce(100), &ins).unwrap();
+        let ins = f.tree.insert(&mut txn, &record(100), 1).unwrap();
+        let s1 = verify_insert(&s0, &key(100), &nonce(100), 1, &ins).unwrap();
         let rm = f.tree.remove(&mut txn, &commitment(100)).unwrap();
         assert_eq!(
             verify_remove(&s1, &key(100), &rm),
@@ -2126,7 +2126,7 @@ mod tests {
                 nonce: [0; NONCE_LEN],
             };
             assert_eq!(
-                state_err(f.tree.insert(&mut txn, &r)),
+                state_err(f.tree.insert(&mut txn, &r, 1)),
                 StateError::InvalidKey
             );
         }
@@ -2138,7 +2138,7 @@ mod tests {
         let before = f.tree.state(&f.tmp.env().read_txn().unwrap()).unwrap();
         {
             let mut txn = f.tmp.env().write_txn().unwrap();
-            f.tree.insert(&mut txn, &record(50)).unwrap();
+            f.tree.insert(&mut txn, &record(50), 1).unwrap();
             f.tree.remove(&mut txn, &commitment(1)).unwrap();
             // Dropped without commit.
         }
@@ -2162,9 +2162,9 @@ mod tests {
         let mut txn = f.tmp.env().write_txn().unwrap();
         assert_eq!(tree.state(&txn).unwrap(), before);
         // And it keeps working after the restart, without reusing slot 8.
-        let proof = tree.insert(&mut txn, &record(77)).unwrap();
+        let proof = tree.insert(&mut txn, &record(77), 1).unwrap();
         assert_eq!(
-            verify_insert(&before, &key(77), &nonce(77), &proof),
+            verify_insert(&before, &key(77), &nonce(77), 1, &proof),
             Ok(tree.state(&txn).unwrap())
         );
         assert_eq!(tree.get(&txn, &commitment(77)).unwrap().unwrap().0, 9);
@@ -2175,21 +2175,21 @@ mod tests {
         let f = Fixture::new(5);
         let mut txn = f.tmp.env().write_txn().unwrap();
         let state = f.tree.state(&txn).unwrap();
-        let proof = f.tree.insert(&mut txn, &record(50)).unwrap();
+        let proof = f.tree.insert(&mut txn, &record(50), 1).unwrap();
         // An existing key is never strictly inside its own low leaf's range.
         for i in 0..5 {
-            assert!(verify_insert(&state, &key(i), &nonce(i), &proof).is_err());
+            assert!(verify_insert(&state, &key(i), &nonce(i), 1, &proof).is_err());
         }
         let mut bad = proof.clone();
         bad.low.siblings[7][0] += BabyBear::ONE;
         assert_eq!(
-            verify_insert(&state, &key(50), &nonce(50), &bad),
+            verify_insert(&state, &key(50), &nonce(50), 1, &bad),
             Err(ProofError::BadPath)
         );
         let mut bad = proof.clone();
         bad.new_siblings[0][0] += BabyBear::ONE;
         assert_eq!(
-            verify_insert(&state, &key(50), &nonce(50), &bad),
+            verify_insert(&state, &key(50), &nonce(50), 1, &bad),
             Err(ProofError::BadPath)
         );
         let wrong_size = State {
@@ -2197,7 +2197,7 @@ mod tests {
             ..state
         };
         assert_eq!(
-            verify_insert(&wrong_size, &key(50), &nonce(50), &proof),
+            verify_insert(&wrong_size, &key(50), &nonce(50), 1, &proof),
             Err(ProofError::BadPath)
         );
     }
@@ -2242,6 +2242,7 @@ mod tests {
             nonce: nonce(9),
             next_key: key(2),
             next_index: CAPACITY - 1,
+            height: 77,
         };
         assert_eq!(decode_leaf(&encode_leaf(&leaf)).unwrap(), leaf);
         assert!(matches!(
@@ -2257,10 +2258,35 @@ mod tests {
             nonce: nonce(9),
             next_key: key(2),
             next_index: 3,
+            height: 5,
         };
         let mut other = leaf;
         other.nonce[15] ^= 1;
         assert_ne!(leaf.hash(), other.hash());
+        let mut other = leaf;
+        other.height += 1;
+        assert_ne!(leaf.hash(), other.hash());
+    }
+
+    /// Outputs keep the height of the block that created them, through
+    /// storage and a revert.
+    #[test]
+    fn outputs_keep_their_creation_height() {
+        let f = Fixture::new(0);
+        let mut txn = f.tmp.env().write_txn().unwrap();
+        f.tree.apply_block(&mut txn, 4, &[record(1)], &[]).unwrap();
+        let undo = f
+            .tree
+            .apply_block(&mut txn, 9, &[record(2)], &[commitment(1)])
+            .unwrap();
+        let height = |c| f.tree.get(&txn, &c).unwrap().map(|(_, l)| l.height);
+        assert_eq!(height(commitment(2)), Some(9));
+        assert_eq!(height(commitment(1)), None);
+        f.tree.revert(&mut txn, &undo).unwrap();
+        let height = |c| f.tree.get(&txn, &c).unwrap().map(|(_, l)| l.height);
+        assert_eq!(height(commitment(1)), Some(4));
+        let proof = f.tree.remove(&mut txn, &commitment(1)).unwrap();
+        assert_eq!(proof.leaf.leaf.height, 4);
     }
 
     /// Applies a block's changes and checks the proofs reproduce the new state.
@@ -2273,9 +2299,9 @@ mod tests {
         let created: Vec<_> = created.iter().map(|&n| record(n)).collect();
         let spent: Vec<_> = spent.iter().map(|&n| commitment(n)).collect();
         let before = f.tree.state(txn).unwrap();
-        let proofs = f.tree.apply_changes(txn, &created, &spent)?;
+        let proofs = f.tree.apply_changes(txn, 1, &created, &spent)?;
         assert_eq!(
-            verify_changes(&before, &created, &spent, &proofs),
+            verify_changes(&before, 1, &created, &spent, &proofs),
             Ok(f.tree.state(txn).unwrap())
         );
         Ok(proofs)
@@ -2315,94 +2341,25 @@ mod tests {
         (env, copy, state)
     }
 
-    /// A tree in layout 1 (every node level stored, leaves with their
-    /// next key) is migrated when opened: same tree, same history.
+    /// A tree from an earlier layout (no leaf heights) is refused, not
+    /// misread.
     #[test]
-    fn the_old_layout_is_migrated() {
-        let f = Fixture::new(0);
+    fn an_old_layout_is_refused() {
+        let f = Fixture::new(3);
         let mut txn = f.tmp.env().write_txn().unwrap();
-        f.tree.init_history(&mut txn, 0).unwrap();
-        let mut states = vec![f.tree.state(&txn).unwrap()];
-        for (h, (created, spent)) in [
-            ((1..=40).collect(), vec![]),
-            (vec![41, 42], vec![3, 17, 18]),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let created: Vec<_> = created.into_iter().map(record).collect::<Vec<_>>();
-            let spent: Vec<_> = spent.into_iter().map(commitment).collect();
-            f.tree
-                .apply_block(&mut txn, h as u64 + 1, &created, &spent)
-                .unwrap();
-            states.push(f.tree.state(&txn).unwrap());
-        }
-        // Back to layout 1: whole leaves (and leaf history), every level's
-        // nodes, with some history at the levels no longer stored.
-        let size = states.last().unwrap().size;
-        let leaf_history: Vec<(Vec<u8>, Vec<u8>)> = f
-            .tree
-            .history
-            .iter(&txn)
-            .unwrap()
-            .map(|e| e.map(|(k, v)| (k.to_vec(), v.to_vec())).unwrap())
-            .filter(|(k, v)| k[0] == 0 && !v.is_empty())
-            .collect();
-        for (k, _) in leaf_history {
-            let index = decode_u64(&k[1..9]).unwrap();
-            let height = decode_u64(&k[9..]).unwrap();
-            let leaf = f.tree.leaf_at(&txn, index, height - 1).unwrap().unwrap();
-            f.tree
-                .history
-                .put(&mut txn, &k, &encode_leaf(&leaf))
-                .unwrap();
-        }
-        for d in (0..DEPTH).filter(|&d| !is_stored(d)) {
-            for j in 0..=(size - 1) >> d {
-                let h = f.tree.node(&txn, d, j).unwrap();
-                if h != empty_hashes()[d] {
-                    f.tree
-                        .nodes
-                        .put(&mut txn, &node_key(d, j), &hash::to_bytes(&h))
-                        .unwrap();
-                }
-            }
-            if d > 0 {
-                f.tree.journal(&mut txn, d, 0, 2, &[]).unwrap();
-            }
-        }
-        for i in 0..size {
-            if f.tree.leaves.get(&txn, &i.to_be_bytes()).unwrap().is_some() {
-                let leaf = f.tree.leaf(&txn, i).unwrap();
-                f.tree
-                    .leaves
-                    .put(&mut txn, &i.to_be_bytes(), &encode_leaf(&leaf))
-                    .unwrap();
-            }
-        }
+        f.tree.meta.put(&mut txn, LAYOUT_KEY, &[2]).unwrap();
+        txn.commit().unwrap();
+        assert!(matches!(
+            StateTree::open(f.tmp.env()),
+            Err(Error::OldLayout)
+        ));
+        let mut txn = f.tmp.env().write_txn().unwrap();
         f.tree.meta.delete(&mut txn, LAYOUT_KEY).unwrap();
         txn.commit().unwrap();
-
-        let tree = StateTree::open(f.tmp.env()).unwrap();
-        let txn = f.tmp.env().read_txn().unwrap();
-        for e in tree.nodes.iter(&txn).unwrap() {
-            assert!(is_stored(e.unwrap().0[0] as usize));
-        }
-        for e in tree.history.iter(&txn).unwrap() {
-            let (k, v) = e.unwrap();
-            assert!(k[0] == 0 || is_stored(k[0] as usize));
-            assert!(k[0] != 0 || v.is_empty() || v.len() == STORED_LEAF_BYTES);
-        }
-        for e in tree.changes.iter(&txn).unwrap() {
-            let k = e.unwrap().0;
-            assert!(k[8] == 0 || is_stored(k[8] as usize));
-        }
-        assert_eq!(tree.state(&txn).unwrap(), *states.last().unwrap());
-        drop(txn);
-        for (h, state) in states.iter().enumerate() {
-            let (_env, _copy, got) = download(&f, h as u64, &state.root, state.size);
-            assert_eq!(got, *state, "height {h}");
-        }
+        assert!(matches!(
+            StateTree::open(f.tmp.env()),
+            Err(Error::OldLayout)
+        ));
     }
 
     #[test]
@@ -2437,7 +2394,8 @@ mod tests {
             if let Some((created, spent)) = blocks.get(h) {
                 let created: Vec<_> = created.iter().map(|&n| record(n)).collect();
                 let spent: Vec<_> = spent.iter().map(|&n| commitment(n)).collect();
-                copy.apply_changes(&mut txn, &created, &spent).unwrap();
+                copy.apply_changes(&mut txn, h as u64 + 1, &created, &spent)
+                    .unwrap();
                 assert_eq!(copy.state(&txn).unwrap(), states[h + 1]);
             }
         }
@@ -2652,23 +2610,25 @@ mod tests {
         let mut txn = f.tmp.env().write_txn().unwrap();
         let s0 = f.tree.state(&txn).unwrap();
         let (created, spent) = ([record(5), record(6)], [commitment(0)]);
-        let proofs = f.tree.apply_changes(&mut txn, &created, &spent).unwrap();
+        let proofs = f.tree.apply_changes(&mut txn, 1, &created, &spent).unwrap();
 
         let mut short = proofs.clone();
         short.inserts.pop();
         assert_eq!(
-            verify_changes(&s0, &created, &spent, &short),
+            verify_changes(&s0, 1, &created, &spent, &short),
             Err(ProofError::ProofCount)
         );
         let mut swapped = proofs.clone();
         swapped.inserts.swap(0, 1);
-        assert!(verify_changes(&s0, &created, &spent, &swapped).is_err());
-        assert!(verify_changes(&s0, &created, &[commitment(1)], &proofs).is_err());
+        assert!(verify_changes(&s0, 1, &created, &spent, &swapped).is_err());
+        assert!(verify_changes(&s0, 1, &created, &[commitment(1)], &proofs).is_err());
         // The nonce is part of the state.
         let after = f.tree.state(&txn).unwrap();
         let mut other = created;
         other[0].nonce[0] ^= 1;
-        assert_ne!(verify_changes(&s0, &other, &spent, &proofs), Ok(after));
+        assert_ne!(verify_changes(&s0, 1, &other, &spent, &proofs), Ok(after));
+        // So is the height the outputs were created at.
+        assert_ne!(verify_changes(&s0, 2, &created, &spent, &proofs), Ok(after));
     }
 
     #[test]

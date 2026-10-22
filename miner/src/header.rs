@@ -28,6 +28,9 @@ pub const FRAC_BITS: u32 = 16;
 pub const MIN_LOG_TARGET: i64 = 16 << FRAC_BITS;
 /// The largest log-target: [`pow::MAX_TARGET`], which every hash meets.
 pub const MAX_LOG_TARGET: i64 = (VALUE_BITS as i64) << FRAC_BITS;
+/// Bits every block height fits in ([`Consensus::final_height`] is
+/// below `2^26`): timelocks are range-checked to this many bits.
+pub const MAX_HEIGHT_BITS: u32 = 26;
 
 /// Chain-wide difficulty and timing rules.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

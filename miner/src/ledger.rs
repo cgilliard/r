@@ -688,13 +688,18 @@ pub(crate) mod tests {
             let mut txn = self.env.env().write_txn().unwrap();
             // Inserts first, as the tree applies a block, so a spend of a
             // new output finds its slot.
-            self.tree.apply_changes(&mut txn, &outputs, &[]).unwrap();
+            let height = self.tip.height + 1;
+            self.tree
+                .apply_changes(&mut txn, height, &outputs, &[])
+                .unwrap();
             let mut inputs: Vec<u64> = spent
                 .iter()
                 .map(|c| self.tree.get(&txn, c).unwrap().unwrap().0)
                 .collect();
             inputs.sort_unstable();
-            self.tree.apply_changes(&mut txn, &[], &spent).unwrap();
+            self.tree
+                .apply_changes(&mut txn, height, &[], &spent)
+                .unwrap();
             let block = Block {
                 inputs,
                 outputs,
@@ -702,7 +707,7 @@ pub(crate) mod tests {
             };
             txn.commit().unwrap();
             let header = Header {
-                height: self.tip.height + 1,
+                height,
                 prev: self.tip.hash(),
                 timestamp: self.tip.timestamp + 600,
                 state: self.state(),

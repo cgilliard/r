@@ -1,5 +1,5 @@
-//! Aggregation: folds item chunk, signature chunk and state segment proofs
-//! into one proof of a combined [`Statement`].
+//! Aggregation: folds item chunk, signature chunk, condition chunk and
+//! state segment proofs into one proof of a combined [`Statement`].
 //!
 //! Every node of the aggregation tree is a [`RecursionAir`] proof of the
 //! same height whose public values are a statement:
@@ -8,21 +8,27 @@
 //!   fingerprint ratios (as products), net value, transaction hash and the
 //!   item stream's boundary hashes where it starts and stops;
 //! - a signature chunk leaf verifies one [`SigChunkAir`] proof and states
-//!   the inverse of its signature fingerprint and its pair hash;
+//!   the inverse of its signature fingerprint and its triple hash;
+//! - a condition chunk leaf verifies one [`CondChunkAir`] proof and states
+//!   its signers' fingerprint (on the transaction side), the inverse of its
+//!   conditions' and its hash;
 //! - a segment leaf verifies one [`StateSegmentAir`] proof and states the
 //!   inverses of its fingerprints and its state change (as hashes);
 //! - a merge verifies two node proofs and states their combination:
 //!   fingerprint ratios multiply, net values add (offset 16-bit limbs,
 //!   renormalized), transaction hashes merge (`hash::merge(a, b)`), state
 //!   changes and item streams chain (the first child's end must be the
-//!   second child's start), and `lambda`, `r` must agree.
+//!   second child's start), and `lambda`, `r` and the block height must
+//!   agree.
 //!
 //! The ratios are transaction side over the other side, separately for
 //! spent commitments (`Q_IN`, inputs over segment removals), created
-//! commitments (`Q_OUT`, outputs over segment inserts) and signatures
-//! (`Q_SIG`, inputs' `(pkh, digest)` over signature chunks' pairs): all are
-//! 1 exactly when the multisets match (with overwhelming probability over
-//! `lambda, r`). The final transaction hash commits to every chunk's
+//! commitments (`Q_OUT`, outputs over segment inserts), signatures
+//! (`Q_SIG`, key spends' `(pkh, digest, leaf)` and condition signers'
+//! triples over signature chunks'), condition spends (`Q_COND`, item
+//! chunks' claims over condition chunks') and preimages (`Q_PRE`, outputs
+//! publishing one over hashlock spends): all are 1 exactly when the
+//! multisets match (with overwhelming probability over `lambda, r`). The final transaction hash commits to every chunk's
 //! contents and the final state to every key the segments touched, so the
 //! block's challenges are derived from both ([`crate::block`]).
 //!
@@ -42,6 +48,7 @@ use std::fmt;
 use crate::babybear::BabyBear;
 use crate::babybear4::BabyBear4;
 use crate::circuit::{Cell, Circuit, ExtCell};
+use crate::cond_chunk_air::{self, CondChunkAir};
 use crate::fri::FriParams;
 use crate::hash::{self, HASH_LEN, Hash, domain};
 use crate::item_chunk_air::{self, Boundary, ItemChunkAir};
@@ -62,13 +69,18 @@ pub mod statement {
     pub const VK: usize = 0;
     pub const LAMBDA: usize = VK + HASH_LEN;
     pub const R: usize = LAMBDA + 4;
+    /// The block's height (segments insert at it; chunks just carry it).
+    pub const HEIGHT: usize = R + 4;
     /// Fingerprint ratios: spent commitments, created commitments,
-    /// signatures.
-    pub const Q_IN: usize = R + 4;
+    /// signatures, condition spends.
+    pub const Q_IN: usize = HEIGHT + 1;
     pub const Q_OUT: usize = Q_IN + 4;
     pub const Q_SIG: usize = Q_OUT + 4;
+    pub const Q_COND: usize = Q_SIG + 4;
+    /// Published preimages: outputs over hashlock spends.
+    pub const Q_PRE: usize = Q_COND + 4;
     /// `sum(outputs) - sum(inputs)` as [`crate::output::net_limbs`].
-    pub const NET: usize = Q_SIG + 4;
+    pub const NET: usize = Q_PRE + 4;
     /// The leaves' transaction and pair hashes, merged in tree order.
     pub const TX_HASH: usize = NET + crate::output::NET_LIMBS;
     /// 1 if any segment is included; the state hashes are zero otherwise.
@@ -129,12 +141,24 @@ impl Statement {
         self.ext(st::R)
     }
 
+    pub fn height(&self) -> BabyBear {
+        self.0[st::HEIGHT]
+    }
+
     pub fn q_in(&self) -> BabyBear4 {
         self.ext(st::Q_IN)
     }
 
     pub fn q_out(&self) -> BabyBear4 {
         self.ext(st::Q_OUT)
+    }
+
+    pub fn q_cond(&self) -> BabyBear4 {
+        self.ext(st::Q_COND)
+    }
+
+    pub fn q_pre(&self) -> BabyBear4 {
+        self.ext(st::Q_PRE)
     }
 
     pub fn q_sig(&self) -> BabyBear4 {
@@ -182,6 +206,8 @@ pub enum Kind {
     Items(usize),
     /// A signature chunk leaf of the given shape.
     Sigs(usize),
+    /// A condition chunk leaf of the given shape.
+    Conds(usize),
     Segment,
     Merge,
 }
@@ -307,12 +333,14 @@ pub struct Aggregator {
     log_height: u32,
     items: Vec<Leaf<ItemChunkAir>>,
     sigs: Vec<Leaf<SigChunkAir>>,
+    conds: Vec<Leaf<CondChunkAir>>,
     seg: Leaf<StateSegmentAir>,
     /// The constraints shared by every node.
     node_program: Program,
-    /// One leaf circuit per item and signature chunk shape.
+    /// One leaf circuit per item, signature and condition chunk shape.
     leaf_items: Vec<Node>,
     leaf_sigs: Vec<Node>,
+    leaf_conds: Vec<Node>,
     leaf_seg: Node,
     merge: Node,
     /// Bytes in a node proof (every node proof has the same shape).
@@ -396,22 +424,27 @@ fn absent(c: &mut Circuit) -> Vec<Cell> {
 }
 
 impl Aggregator {
-    /// Sets up aggregation of item chunks and signature chunks of the
-    /// shapes in `items` and `sigs` (with their verifying keys) and `seg`
-    /// segments, every node at height `2^log_height`.
+    /// Sets up aggregation of item, signature and condition chunks of the
+    /// shapes in `items`, `sigs` and `conds` (with their verifying keys)
+    /// and `seg` segments, every node at height `2^log_height`.
     ///
     /// # Panics
     /// If a shape list is empty or a node circuit doesn't fit the height.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         params: FriParams,
         items: Vec<(ItemChunkAir, VerifyingKey)>,
         sigs: Vec<(SigChunkAir, VerifyingKey)>,
+        conds: Vec<(CondChunkAir, VerifyingKey)>,
         seg: StateSegmentAir,
         seg_vk: VerifyingKey,
         log_height: u32,
         keys: &KeyCache,
     ) -> Self {
-        assert!(!items.is_empty() && !sigs.is_empty(), "no chunk shapes");
+        assert!(
+            !items.is_empty() && !sigs.is_empty() && !conds.is_empty(),
+            "no chunk shapes"
+        );
         let items: Vec<Leaf<ItemChunkAir>> = items
             .into_iter()
             .map(|(air, vk)| Leaf::new(air, vk, item_chunk_air::public::LEN))
@@ -419,6 +452,10 @@ impl Aggregator {
         let sigs: Vec<Leaf<SigChunkAir>> = sigs
             .into_iter()
             .map(|(air, vk)| Leaf::new(air, vk, sig_chunk_air::public::LEN))
+            .collect();
+        let conds: Vec<Leaf<CondChunkAir>> = conds
+            .into_iter()
+            .map(|(air, vk)| Leaf::new(air, vk, cond_chunk_air::public::LEN))
             .collect();
         let seg = Leaf::new(seg, seg_vk, state_air::public::LEN);
         let zero_vk = [BabyBear::ZERO; HASH_LEN];
@@ -428,7 +465,7 @@ impl Aggregator {
             .map(|leaf| {
                 let p = StarkProof::placeholder(&params, &leaf.air, leaf.log_n);
                 let public = [BabyBear::ZERO; item_chunk_air::public::LEN];
-                let (c, out) = Self::leaf_items_circuit(&params, leaf, zero_vk, &public, &p);
+                let (c, out) = Self::leaf_items_circuit(&params, leaf, zero_vk, &public, &p, 0);
                 Node::new(&params, &c, &out, log_height, keys)
             })
             .collect();
@@ -437,7 +474,16 @@ impl Aggregator {
             .map(|leaf| {
                 let p = StarkProof::placeholder(&params, &leaf.air, leaf.log_n);
                 let public = [BabyBear::ZERO; sig_chunk_air::public::LEN];
-                let (c, out) = Self::leaf_sigs_circuit(&params, leaf, zero_vk, &public, &p);
+                let (c, out) = Self::leaf_sigs_circuit(&params, leaf, zero_vk, &public, &p, 0);
+                Node::new(&params, &c, &out, log_height, keys)
+            })
+            .collect();
+        let leaf_conds: Vec<Node> = conds
+            .iter()
+            .map(|leaf| {
+                let p = StarkProof::placeholder(&params, &leaf.air, leaf.log_n);
+                let public = [BabyBear::ZERO; cond_chunk_air::public::LEN];
+                let (c, out) = Self::leaf_conds_circuit(&params, leaf, zero_vk, &public, &p);
                 Node::new(&params, &c, &out, log_height, keys)
             })
             .collect();
@@ -469,10 +515,12 @@ impl Aggregator {
             log_height,
             items,
             sigs,
+            conds,
             seg,
             node_program,
             leaf_items,
             leaf_sigs,
+            leaf_conds,
             leaf_seg,
             merge,
             proof_size: child.proof.size(),
@@ -522,10 +570,17 @@ impl Aggregator {
         self.sigs.iter().map(|l| l.air).collect()
     }
 
+    /// The condition chunk shapes, as [`Aggregator::prove_conds`] indexes
+    /// them.
+    pub fn cond_shapes(&self) -> Vec<CondChunkAir> {
+        self.conds.iter().map(|l| l.air).collect()
+    }
+
     fn node(&self, kind: Kind) -> &Node {
         match kind {
             Kind::Items(i) => &self.leaf_items[i],
             Kind::Sigs(i) => &self.leaf_sigs[i],
+            Kind::Conds(i) => &self.leaf_conds[i],
             Kind::Segment => &self.leaf_seg,
             Kind::Merge => &self.merge,
         }
@@ -537,6 +592,7 @@ impl Aggregator {
         vk: Hash,
         public: &[BabyBear],
         proof: &StarkProof,
+        height: u32,
     ) -> (Circuit, Vec<Cell>) {
         use item_chunk_air::public as ip;
         let mut c = Circuit::new();
@@ -546,8 +602,12 @@ impl Aggregator {
         verifier_circuit::verify(&mut c, &leaf.inner(params), &pv, &cells);
         let one = c.one();
         let mut s = vk;
-        // lambda, r, Q_in = P_in, Q_out = P_out, Q_sig = P_sig, net, tx hash.
-        s.extend_from_slice(&pv[ip::LAMBDA..ip::ENTRY]);
+        // lambda, r, the height (any: the chunk doesn't depend on it), Q_in
+        // = P_in, Q_out = P_out, Q_sig = P_sig, Q_cond = P_cond, Q_pre =
+        // P_pre, net, tx hash.
+        s.extend_from_slice(&pv[ip::LAMBDA..ip::P_IN]);
+        s.push(c.input(BabyBear::new(height)));
+        s.extend_from_slice(&pv[ip::P_IN..ip::ENTRY]);
         s.extend(absent(&mut c));
         s.push(one); // has_stream
         let entry = stream_hash_cells(&mut c, &pv[ip::ENTRY..ip::EXIT]);
@@ -564,6 +624,7 @@ impl Aggregator {
         vk: Hash,
         public: &[BabyBear],
         proof: &StarkProof,
+        height: u32,
     ) -> (Circuit, Vec<Cell>) {
         use sig_chunk_air::public as gp;
         let mut c = Circuit::new();
@@ -574,13 +635,49 @@ impl Aggregator {
         let (one, zero) = (c.one(), c.zero());
         let mut s = vk;
         s.extend_from_slice(&pv[gp::LAMBDA..gp::P_SIG]);
+        s.push(c.input(BabyBear::new(height)));
         s.extend([one, zero, zero, zero, one, zero, zero, zero]); // Q_in, Q_out
         let q_sig = c.ext_inverse(ext_at(&pv, gp::P_SIG));
         s.extend(q_sig.0);
+        s.extend([one, zero, zero, zero, one, zero, zero, zero]); // Q_cond, Q_pre
         for limb in output::net_limbs(0) {
             s.push(c.constant(limb)); // net
         }
         s.extend_from_slice(&pv[gp::HASH..gp::LEN]); // tx hash: the pair hash
+        s.extend(absent(&mut c));
+        s.extend(absent(&mut c));
+        let public = publish(&mut c, &s);
+        (c, public)
+    }
+
+    fn leaf_conds_circuit(
+        params: &FriParams,
+        leaf: &Leaf<CondChunkAir>,
+        vk: Hash,
+        public: &[BabyBear],
+        proof: &StarkProof,
+    ) -> (Circuit, Vec<Cell>) {
+        use cond_chunk_air::public as cp;
+        let mut c = Circuit::new();
+        let vk = inputs(&mut c, &vk);
+        let pv = inputs(&mut c, public);
+        let cells = ProofCells::load(&mut c, proof);
+        verifier_circuit::verify(&mut c, &leaf.inner(params), &pv, &cells);
+        let (one, zero) = (c.one(), c.zero());
+        let mut s = vk;
+        s.extend_from_slice(&pv[cp::LAMBDA..cp::P_COND]); // lambda, r, height
+        s.extend([one, zero, zero, zero, one, zero, zero, zero]); // Q_in, Q_out
+        // Its signers are on the transaction side; its conditions on the
+        // other.
+        s.extend_from_slice(&pv[cp::P_SIG..cp::P_SIG + 4]);
+        let q_cond = c.ext_inverse(ext_at(&pv, cp::P_COND));
+        s.extend(q_cond.0);
+        let q_pre = c.ext_inverse(ext_at(&pv, cp::P_PRE));
+        s.extend(q_pre.0);
+        for limb in output::net_limbs(0) {
+            s.push(c.constant(limb)); // net
+        }
+        s.extend_from_slice(&pv[cp::HASH..cp::LEN]); // tx hash
         s.extend(absent(&mut c));
         s.extend(absent(&mut c));
         let public = publish(&mut c, &s);
@@ -603,11 +700,13 @@ impl Aggregator {
         let (one, zero) = (c.one(), c.zero());
         let mut s = vk;
         s.extend_from_slice(&pv[sp::LAMBDA..sp::P_INS]);
+        s.push(pv[sp::HEIGHT]);
         let q_in = c.ext_inverse(ext_at(&pv, sp::P_SP));
         let q_out = c.ext_inverse(ext_at(&pv, sp::P_INS));
         s.extend(q_in.0);
         s.extend(q_out.0);
         s.extend([one, zero, zero, zero]); // Q_sig
+        s.extend([one, zero, zero, zero, one, zero, zero, zero]); // Q_cond, Q_pre
         for limb in output::net_limbs(0) {
             s.push(c.constant(limb)); // net
         }
@@ -636,6 +735,7 @@ impl Aggregator {
         let kinds: Vec<Kind> = (0..self.leaf_items.len())
             .map(Kind::Items)
             .chain((0..self.leaf_sigs.len()).map(Kind::Sigs))
+            .chain((0..self.leaf_conds.len()).map(Kind::Conds))
             .chain([Kind::Segment, Kind::Merge])
             .collect();
         let sel: Vec<Cell> = kinds
@@ -656,6 +756,7 @@ impl Aggregator {
             .leaf_items
             .iter()
             .chain(&self.leaf_sigs)
+            .chain(&self.leaf_conds)
             .chain([&self.leaf_seg])
             .map(Node::root)
             .collect();
@@ -726,7 +827,7 @@ impl Aggregator {
         }
         let mut s = vk.clone();
         s.extend_from_slice(&sa[st::LAMBDA..st::Q_IN]);
-        for at in [st::Q_IN, st::Q_OUT, st::Q_SIG] {
+        for at in [st::Q_IN, st::Q_OUT, st::Q_SIG, st::Q_COND, st::Q_PRE] {
             let p = c.ext_mul(ext_at(&sa, at), ext_at(&sb, at));
             s.extend(p.0);
         }
@@ -774,12 +875,13 @@ impl Aggregator {
     }
 
     /// Wraps a proof of item chunk shape `shape` with public values
-    /// `public`.
+    /// `public`, for the block at `height`.
     pub fn prove_items(
         &self,
         shape: usize,
         public: &[BabyBear],
         proof: &StarkProof,
+        height: u32,
     ) -> Result<NodeProof, AggError> {
         let (c, cells) = Self::leaf_items_circuit(
             &self.params,
@@ -787,17 +889,19 @@ impl Aggregator {
             self.merge_key(),
             public,
             proof,
+            height,
         );
         self.prove_node(Kind::Items(shape), &c, &cells)
     }
 
     /// Wraps a proof of signature chunk shape `shape` with public values
-    /// `public`.
+    /// `public`, for the block at `height`.
     pub fn prove_sigs(
         &self,
         shape: usize,
         public: &[BabyBear],
         proof: &StarkProof,
+        height: u32,
     ) -> Result<NodeProof, AggError> {
         let (c, cells) = Self::leaf_sigs_circuit(
             &self.params,
@@ -805,8 +909,27 @@ impl Aggregator {
             self.merge_key(),
             public,
             proof,
+            height,
         );
         self.prove_node(Kind::Sigs(shape), &c, &cells)
+    }
+
+    /// Wraps a proof of condition chunk shape `shape` with public values
+    /// `public`.
+    pub fn prove_conds(
+        &self,
+        shape: usize,
+        public: &[BabyBear],
+        proof: &StarkProof,
+    ) -> Result<NodeProof, AggError> {
+        let (c, cells) = Self::leaf_conds_circuit(
+            &self.params,
+            &self.conds[shape],
+            self.merge_key(),
+            public,
+            proof,
+        );
+        self.prove_node(Kind::Conds(shape), &c, &cells)
     }
 
     /// Wraps a state-segment proof with public values `public`.
@@ -856,6 +979,7 @@ impl Aggregator {
         self.leaf_items
             .iter()
             .chain(&self.leaf_sigs)
+            .chain(&self.leaf_conds)
             .chain([&self.leaf_seg, &self.merge])
             .map(|n| n.air.used_rows())
             .collect()
@@ -876,6 +1000,7 @@ mod tests {
 
     const LAMBDA: BabyBear4 = BabyBear4::new([3, 5, 7, 11]);
     const R: BabyBear4 = BabyBear4::new([13, 17, 19, 23]);
+    const HEIGHT: u32 = 3;
 
     fn out(n: u8, amount: Amount) -> Output {
         Output {
@@ -888,14 +1013,7 @@ mod tests {
     }
 
     fn reward(outputs: Vec<Output>) -> Transaction {
-        Transaction::sign(
-            TxBody {
-                inputs: vec![],
-                outputs,
-            },
-            vec![],
-        )
-        .unwrap()
+        Transaction::sign(TxBody::new(vec![], outputs), vec![]).unwrap()
     }
 
     #[test]
@@ -974,11 +1092,14 @@ mod tests {
             let (items_pk, items_vk) = stark::setup(&params, &items);
             let (sigs_pk, sigs_vk) = stark::setup(&params, &sigs);
             let (seg_pk, seg_vk) = stark::setup(&params, &seg);
+            let conds = CondChunkAir { slots: 1 };
+            let (_, conds_vk) = stark::setup(&params, &conds);
             let t = std::time::Instant::now();
             let agg = Aggregator::new(
                 params,
                 vec![(items, items_vk)],
                 vec![(sigs, sigs_vk)],
+                vec![(conds, conds_vk)],
                 seg,
                 seg_vk,
                 15,
@@ -1006,7 +1127,7 @@ mod tests {
             let (t, public) = self.items.trace(items, entry, &blinding, LAMBDA, R);
             let proof = stark::prove(&self.params, &self.items_pk, &self.items, t, &public);
             let time = std::time::Instant::now();
-            let node = self.agg.prove_items(0, &public, &proof).unwrap();
+            let node = self.agg.prove_items(0, &public, &proof, HEIGHT).unwrap();
             eprintln!("item leaf {:.1} s", time.elapsed().as_secs_f64());
             node
         }
@@ -1017,7 +1138,7 @@ mod tests {
                 .sigs
                 .trace(&[], &blinding, LAMBDA, R, &mut Rng::from_seed(2));
             let proof = stark::prove(&self.params, &self.sigs_pk, &self.sigs, t, &public);
-            self.agg.prove_sigs(0, &public, &proof).unwrap()
+            self.agg.prove_sigs(0, &public, &proof, HEIGHT).unwrap()
         }
 
         /// Inserts `records` (sorted) into `tree` as one segment.
@@ -1039,7 +1160,7 @@ mod tests {
             let ops: Vec<InsertOp> = records
                 .into_iter()
                 .map(|record| InsertOp {
-                    proof: tree.insert(&mut txn, &record).unwrap(),
+                    proof: tree.insert(&mut txn, &record, HEIGHT as u64).unwrap(),
                     record,
                 })
                 .collect();
@@ -1050,7 +1171,7 @@ mod tests {
                 prev_insert: [BabyBear::ZERO; HASH_LEN],
                 prev_spend: [BabyBear::ZERO; HASH_LEN],
             };
-            let (t, public) = self.seg.trace(&start, &ops, &[], LAMBDA, R);
+            let (t, public) = self.seg.trace(&start, &ops, &[], HEIGHT, LAMBDA, R);
             let proof = stark::prove(&self.params, &self.seg_pk, &self.seg, t, &public);
             let node = self.agg.prove_segment(&public, &proof).unwrap();
             (node, before, after, last)
@@ -1077,7 +1198,7 @@ mod tests {
             .iter()
             .flat_map(|t| t.body.outputs.iter().map(|o| o.record().unwrap()))
             .collect();
-        let items = stream(&txs);
+        let items = stream(&txs, |_| 0);
         assert_eq!(items.len(), 7);
 
         let env = TempEnv::new();

@@ -197,20 +197,24 @@ fn witness(agg: &Aggregated) -> Vec<BabyBear> {
 }
 
 /// The checks on a final aggregation statement `s` that its proof can't
-/// make itself, for a transition starting at `old_root`, `old_size` and
-/// creating `net` ([`output::net_limbs`] cells), with witness `w`
-/// ([`WITNESS_LEN`] cells). Returns the new root and size cells.
+/// make itself, for the block at `height`, a transition starting at
+/// `old_root`, `old_size` and creating `net` ([`output::net_limbs`] cells),
+/// with witness `w` ([`WITNESS_LEN`] cells). Returns the new root and size
+/// cells.
+#[allow(clippy::too_many_arguments)]
 fn check_transition(
     c: &mut Circuit,
     merge_key: &Hash,
     s: &[Cell],
     w: &[Cell],
+    height: Cell,
     old_root: &[Cell],
     old_size: &[Cell],
     net: &[Cell],
 ) -> Vec<Cell> {
     let key = consts(c, merge_key);
     assert_eq_all(c, &s[ast::VK..ast::VK + HASH_LEN], &key);
+    c.assert_eq(s[ast::HEIGHT], height);
     let new_state = &w[..HASH_LEN + 2];
 
     // The state goes from the old one, with segments starting from an
@@ -243,7 +247,7 @@ fn check_transition(
     assert_eq_all(c, &s[ast::R..ast::R + 4], &h[4..8]);
 
     let one_ext = consts(c, &crate::babybear4::BabyBear4::ONE.0);
-    for at in [ast::Q_IN, ast::Q_OUT, ast::Q_SIG] {
+    for at in [ast::Q_IN, ast::Q_OUT, ast::Q_SIG, ast::Q_COND, ast::Q_PRE] {
         assert_eq_all(c, &s[at..at + 4], &one_ext);
     }
     assert_eq_all(c, &s[ast::NET..ast::NET + output::NET_LIMBS], net);
@@ -281,7 +285,17 @@ fn first_circuit(
     let old_size = consts(&mut c, &[lo, hi]);
     let subsidy = consensus.subsidy(1).expect("block 1 is valid");
     let net = consts(&mut c, &output::net_limbs(subsidy as i128));
-    let new = check_transition(&mut c, &agg.merge_key(), &s, &w, &old_root, &old_size, &net);
+    let height = c.constant(BabyBear::ONE);
+    let new = check_transition(
+        &mut c,
+        &agg.merge_key(),
+        &s,
+        &w,
+        height,
+        &old_root,
+        &old_size,
+        &net,
+    );
     let mut out = vk;
     out.extend(consts(&mut c, &genesis.hash()));
     out.extend(new);
@@ -354,7 +368,21 @@ fn chain_circuit(
     let s = load_aggregate(&mut c, agg, statement, proof);
     let w = inputs(&mut c, witness);
     let net = subsidy_net(&mut c, consensus, &h.height);
-    let new = check_transition(&mut c, &agg.merge_key(), &s, &w, &h.root, &h.size, &net);
+    // Block N's height: header N - 1's plus one (one field element, as
+    // `subsidy_net` checks).
+    let hi = c.mul_const(h.height[1], BabyBear::new(1 << 16));
+    let parent_height = c.add(h.height[0], hi);
+    let height = c.add_const(parent_height, BabyBear::ONE);
+    let new = check_transition(
+        &mut c,
+        &agg.merge_key(),
+        &s,
+        &w,
+        height,
+        &h.root,
+        &h.size,
+        &net,
+    );
 
     let work = pow_circuit::add_work(&mut c, &ps[st::WORK..st::WORK + WORK_LIMBS], &check.work);
     let mut out = vk;
@@ -633,10 +661,10 @@ pub struct ChainKeys {
 /// (`cargo test --release pinned_keys -- --ignored --nocapture` prints them).
 pub const KEYS: ChainKeys = ChainKeys {
     chain: BabyBear::new_array([
-        780211085, 867189719, 1490953196, 617223248, 485687576, 909532308, 895215005, 647430773,
+        815354821, 275155163, 282100096, 1440213606, 566269452, 1797318189, 1257053930, 318975843,
     ]),
     wrap: BabyBear::new_array([
-        342833832, 1304694754, 961309630, 1987511813, 777483746, 1662147403, 1020515416, 1107749614,
+        1855933442, 922433512, 1637387211, 199855557, 292998025, 976313791, 475644783, 1659441752,
     ]),
 };
 
@@ -777,7 +805,7 @@ mod tests {
     /// A transaction spending `coins` into `outputs`.
     fn spend(wallet: &Wallet, coins: &[Coin], outputs: Vec<Output>) -> Transaction {
         let (keys, inputs) = coins.iter().map(|c| wallet.input(c, 0)).unzip();
-        Transaction::sign(TxBody { inputs, outputs }, keys).unwrap()
+        Transaction::sign(TxBody::new(inputs, outputs), keys).unwrap()
     }
 
     /// The real chain's keys are the pinned ones (a node that doesn't mine
@@ -883,7 +911,7 @@ mod tests {
             let mut txn = env.env().write_txn().unwrap();
             let agg = chain
                 .block_prover()
-                .prove(&tree, &mut txn, txs, subsidy)
+                .prove(&tree, &mut txn, txs, height, subsidy)
                 .unwrap();
             let state = tree.state(&txn).unwrap();
             txn.abort();
@@ -995,6 +1023,7 @@ mod tests {
                 &tree,
                 &mut txn,
                 &[spend(&wallet, &[], vec![pay(6, late)])],
+                4,
                 late,
             )
             .unwrap();

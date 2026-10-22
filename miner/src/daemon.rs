@@ -263,7 +263,7 @@ fn open(
         Some(pow_tree) => {
             log.line(
                 "setting up the provers and verifier (item chunks of 682/2730, signature chunks \
-                 of 7/31/124, 16-op segments, nodes at 2^15)",
+                 of 7/30/120, condition chunks of 48/195, 16-op segments, nodes at 2^15)",
             );
             let keys = KeyCache::open(cache.join("keys"));
             let chain = provers(consensus, genesis, pow_tree, &keys);
@@ -742,14 +742,8 @@ impl Miner<'_> {
                 coins(reward.amount as u128),
             ));
             txs.push(
-                Transaction::sign(
-                    TxBody {
-                        inputs: vec![],
-                        outputs: vec![reward],
-                    },
-                    vec![],
-                )
-                .map_err(|e| format!("{e:?}"))?,
+                Transaction::sign(TxBody::new(vec![], vec![reward]), vec![])
+                    .map_err(|e| format!("{e:?}"))?,
             );
 
             // 1. Prove the transition: apply it in a write transaction (quick),
@@ -758,11 +752,14 @@ impl Miner<'_> {
             let prepared = {
                 let mut txn = env.write_txn()?;
                 let p = match chain {
-                    Some(c) => c.block_prover().prepare(&tree, &mut txn, &txs, subsidy),
+                    Some(c) => c
+                        .block_prover()
+                        .prepare(&tree, &mut txn, &txs, height, subsidy),
                     None => block::prepare(
                         &tree,
                         &mut txn,
                         &txs,
+                        height,
                         subsidy,
                         &block::STANDARD_SEGMENT,
                         proof_size,

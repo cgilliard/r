@@ -7,4 +7,4 @@ pub const BITCOIN_HEIGHT: u64 = 972239;
 /// The genesis time, in seconds since the Unix epoch.
 pub const TIMESTAMP: u64 = 1792461337;
 /// The genesis header's hash (hex of `hash::to_bytes`), as a check.
-pub const HASH: &str = "fd65e7005b83ed3fcabebe43cd14cc025a5e063feca632776ef8fc27e9dceb60";
+pub const HASH: &str = "ea9ca8541b6c62138ea36c4e0d40e5185779d44db68ef01d3509076fbcd1006d";
