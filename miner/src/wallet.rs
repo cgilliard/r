@@ -125,6 +125,9 @@ pub struct Coin {
 pub struct Wallet {
     seed: Hash,
     view: Hash,
+    /// Testing (`--debug-no-proof-validation`): key trees with one real key
+    /// (leaf 0), the other leaves made-up hashes ([`Wallet::with_cheap_trees`]).
+    cheap: bool,
 }
 
 impl Wallet {
@@ -132,7 +135,25 @@ impl Wallet {
         Self {
             seed,
             view: hash::sponge(domain::WALLET_VIEW, &[], &[&seed]),
+            cheap: false,
         }
+    }
+
+    /// Testing only: this wallet's key trees have one real key, at leaf 0,
+    /// and made-up hashes for the other leaves, so making, finding and
+    /// spending an output takes one key generation instead of
+    /// [`KEY_LEAVES`]. That key signs every spend, reusing a one-time key
+    /// when an output is signed again: fine on a test network, never on a
+    /// real one. Other wallets can't tell: the trees are still trees.
+    pub fn with_cheap_trees(self) -> Self {
+        Self {
+            cheap: true,
+            ..self
+        }
+    }
+
+    pub fn cheap_trees(&self) -> bool {
+        self.cheap
     }
 
     /// The one-time key pair at `leaf` of the key tree for `r`.
@@ -146,6 +167,24 @@ impl Wallet {
 
     /// The key tree for `r`: [`KEY_LEAVES`] key generations (in parallel).
     pub fn key_tree(&self, r: &KeySeed) -> KeyTree {
+        if self.cheap {
+            let limbs = seed_limbs(r);
+            return KeyTree(core::array::from_fn(|leaf| {
+                if leaf == 0 {
+                    self.key(r, 0).1.hash()
+                } else {
+                    hash::sponge(
+                        domain::WALLET_KEY,
+                        &[],
+                        &[
+                            &self.seed,
+                            &limbs,
+                            &[BabyBear::new(leaf as u32), BabyBear::ONE],
+                        ],
+                    )
+                }
+            }));
+        }
         let hashes = crate::par::par_map(KEY_LEAVES, 16, |leaf| self.key(r, leaf as u8).1.hash());
         KeyTree(hashes.try_into().expect("a hash per leaf"))
     }
@@ -1001,6 +1040,21 @@ mod tests {
         assert!(store.restoring(&txn).unwrap());
         store.set_restoring(&mut txn, false).unwrap();
         assert!(!store.restoring(&txn).unwrap());
+    }
+
+    #[test]
+    fn cheap_trees_spend_with_leaf_0() {
+        let w = wallet(3);
+        let cheap = w.with_cheap_trees();
+        assert_ne!(cheap.keys_for(&r(2)).hash, w.keys_for(&r(2)).hash);
+        let coin = Coin {
+            r: r(2),
+            position: 9,
+            amount: 4,
+            record: record(&cheap.keys_for(&r(2)).pay(4)),
+        };
+        assert!(cheap.input(&coin, 0).1.opens_commitment());
+        assert_eq!(cheap.identify(&coin.record), Some((r(2), 4)));
     }
 
     #[test]

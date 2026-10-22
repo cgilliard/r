@@ -706,27 +706,7 @@ impl ChainVerifier {
         block: &Block,
         work_before: u128,
     ) -> Result<(), BlockError> {
-        let size = block::encoded_size(block.inputs.len(), block.outputs.len(), block.proof.size());
-        if size > MAX_BLOCK_SIZE {
-            return Err(BlockError::Oversize(size));
-        }
-        if !block::positions_canonical(&block.inputs)
-            || !block::is_canonical(block.outputs.iter().map(|o| &o.commitment))
-        {
-            return Err(BlockError::NotCanonical);
-        }
-        // The slot counter before the block: each output fills one slot.
-        let prev_size = header
-            .state
-            .size
-            .checked_sub(block.outputs.len() as u64)
-            .ok_or(BlockError::StateMismatch)?;
-        if block::spends_new_slot(&block.inputs, prev_size) {
-            return Err(BlockError::SpendsItsOwnOutput);
-        }
-        if block.body_hash() != header.body {
-            return Err(BlockError::Body);
-        }
+        check_body(header, block)?;
         self.verify_proof(header, work_before, &block.proof)
             .map_err(BlockError::Chain)
     }
@@ -746,6 +726,38 @@ impl ChainVerifier {
         block::apply(tree, txn, parent, header, block)
     }
 }
+
+/// The checks on `block` as the body of `header` other than its chain
+/// proof: it fits [`MAX_BLOCK_SIZE`], its lists are canonical, no input is
+/// in a slot the block fills, and the header commits to it.
+pub fn check_body(header: &Header, block: &Block) -> Result<(), BlockError> {
+    let size = block::encoded_size(block.inputs.len(), block.outputs.len(), block.proof.size());
+    if size > MAX_BLOCK_SIZE {
+        return Err(BlockError::Oversize(size));
+    }
+    if !block::positions_canonical(&block.inputs)
+        || !block::is_canonical(block.outputs.iter().map(|o| &o.commitment))
+    {
+        return Err(BlockError::NotCanonical);
+    }
+    // The slot counter before the block: each output fills one slot.
+    let prev_size = header
+        .state
+        .size
+        .checked_sub(block.outputs.len() as u64)
+        .ok_or(BlockError::StateMismatch)?;
+    if block::spends_new_slot(&block.inputs, prev_size) {
+        return Err(BlockError::SpendsItsOwnOutput);
+    }
+    if block.body_hash() != header.body {
+        return Err(BlockError::Body);
+    }
+    Ok(())
+}
+
+/// Checks blocks without their chain proofs ([`check_body`] only): for
+/// nodes run with `--debug-no-proof-validation`, whose blocks have none.
+pub struct NoProofs;
 
 /// The total work in a chain statement.
 pub fn statement_work(statement: &[BabyBear]) -> Option<u128> {

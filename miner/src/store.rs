@@ -18,6 +18,10 @@
 //! - `blk_invalid`: header hash of blocks known to be invalid.
 //! - `blk_meta`: free-form values by name.
 //!
+//! Old blocks are pruned ([`ChainStore::prune_bodies`],
+//! [`ChainStore::prune_undo`]): their headers and work stay, but bodies
+//! and undo data below a height go.
+//!
 //! A node that fast-synced starts at a base block instead of genesis: it
 //! has the base and its parent (header only) on the main chain, nothing
 //! between them and genesis, and can't reorganize below the base
@@ -308,6 +312,59 @@ impl ChainStore {
         Ok(self.invalid.get(txn, &key(hash))?.is_some())
     }
 
+    /// The lowest main-chain height whose block may still be stored:
+    /// those below were pruned, or (below a fast-sync base) never had.
+    pub fn bodies_from(&self, txn: &RoTxn) -> Result<u64, Error> {
+        Ok(self.height_meta(txn, BODIES_KEY)?.max(self.base(txn)?))
+    }
+
+    /// The lowest main-chain height whose undo data may still be stored.
+    pub fn undo_from(&self, txn: &RoTxn) -> Result<u64, Error> {
+        self.height_meta(txn, UNDO_KEY)
+    }
+
+    /// Drops the bodies of main-chain blocks below height `below`; their
+    /// headers and work stay.
+    pub fn prune_bodies(&self, txn: &mut RwTxn, below: u64) -> Result<(), Error> {
+        self.prune(txn, BODIES_KEY, self.bodies, below)
+    }
+
+    /// Drops the undo data of main-chain blocks below height `below`, so
+    /// the chain can't be reverted below it.
+    pub fn prune_undo(&self, txn: &mut RwTxn, below: u64) -> Result<(), Error> {
+        self.prune(txn, UNDO_KEY, self.undo, below)
+    }
+
+    /// Deletes main-chain blocks' entries in `db` from the height in meta
+    /// value `name` up to `below`, and records `below` there.
+    fn prune(
+        &self,
+        txn: &mut RwTxn,
+        name: &str,
+        db: Database<Bytes, Bytes>,
+        below: u64,
+    ) -> Result<(), Error> {
+        let from = self.height_meta(txn, name)?;
+        if below <= from {
+            return Ok(());
+        }
+        for h in from..below {
+            if let Some(hash) = self.hash_at(txn, h)? {
+                db.delete(txn, &key(&hash))?;
+            }
+        }
+        self.set_meta(txn, name, &below.to_be_bytes())
+    }
+
+    fn height_meta(&self, txn: &RoTxn, name: &str) -> Result<u64, Error> {
+        match self.meta(txn, name)? {
+            Some(b) => Ok(u64::from_be_bytes(
+                b.as_slice().try_into().map_err(|_| Error::Corrupt)?,
+            )),
+            None => Ok(0),
+        }
+    }
+
     pub fn meta(&self, txn: &RoTxn, name: &str) -> Result<Option<Vec<u8>>, Error> {
         Ok(self.meta.get(txn, name.as_bytes())?.map(<[u8]>::to_vec))
     }
@@ -318,6 +375,9 @@ impl ChainStore {
 }
 
 const BASE_KEY: &str = "base";
+/// The lowest height whose main-chain body and undo data may be kept.
+const BODIES_KEY: &str = "bodies_from";
+const UNDO_KEY: &str = "undo_from";
 
 fn decode_hash(bytes: &[u8]) -> Result<Hash, Error> {
     hash::from_bytes(bytes.try_into().map_err(|_| Error::Corrupt)?).ok_or(Error::Corrupt)

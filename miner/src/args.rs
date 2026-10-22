@@ -30,7 +30,15 @@ Options:
       --snap-sync-limit <BLOCKS>
                              Keep the state tree's history for the last
                              BLOCKS blocks, to serve fast-syncing nodes the
-                             state at any of them [default: 1000]
+                             state at any of them; also the deepest reorg
+                             followed [default: 200]
+      --keep-blocks <BLOCKS> Keep the last BLOCKS blocks (at least
+                             --snap-sync-limit), for peers catching up;
+                             older ones are deleted. 0 keeps every block
+                             [default: 1000]
+      --compact-db           Rewrite the database compactly before starting
+                             (takes a while on a large one): reclaims the
+                             space freed by pruning and spent outputs
       --max-peers <NUM>      Most peers connected at once, inbound and
                              outbound [default: 64]
       --no-mine              Don't mine (saves CPU): only follow and serve
@@ -41,6 +49,13 @@ Options:
                              can be spent [default: 6]
       --restore              Restore the wallet from its 24 recovery words
                              (asked for at the start; needs a new --data-dir)
+      --debug-no-proof-validation
+                             Testing only: make and check no chain proofs
+                             (blocks carry an empty one), so large blocks
+                             can be built quickly; every other check stays.
+                             Such nodes form their own network (they can't
+                             reach nodes without it), and the data directory
+                             is marked for it. Enables the debug-fill command
       --status               Print the stored chain's status and exit
   -h, --help                 Print help
   -V, --version              Print version";
@@ -62,6 +77,7 @@ pub const DEFAULT_SYNC_DEPTH: u64 = 100;
 pub const DEFAULT_MAX_PEERS: usize = 64;
 pub const DEFAULT_COIN_MATURITY: u64 = crate::cli::DEFAULT_MATURITY;
 pub const DEFAULT_SNAP_SYNC_LIMIT: u64 = crate::ledger::DEFAULT_SNAP_SYNC_LIMIT;
+pub const DEFAULT_KEEP_BLOCKS: u64 = crate::ledger::DEFAULT_KEEP_BLOCKS;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Args {
@@ -80,10 +96,16 @@ pub struct Args {
     pub max_peers: usize,
     /// Blocks of state history kept for fast-syncing peers.
     pub snap_sync_limit: u64,
+    /// Blocks whose bodies are kept (0: all).
+    pub keep_blocks: u64,
+    /// Compact the database before starting.
+    pub compact_db: bool,
     /// Confirmations before our mining rewards can be spent.
     pub coin_maturity: u64,
     /// Restore the wallet from recovery words.
     pub restore: bool,
+    /// Testing: make and check no chain proofs.
+    pub debug_no_proofs: bool,
 }
 
 /// What the command line asked for.
@@ -149,8 +171,11 @@ impl Args {
         let mut sync_depth: Option<u64> = None;
         let mut max_peers: Option<usize> = None;
         let mut snap_sync_limit: Option<u64> = None;
+        let mut keep_blocks: Option<u64> = None;
+        let mut compact_db = false;
         let mut coin_maturity: Option<u64> = None;
         let mut restore = false;
+        let mut debug_no_proofs = false;
         let mut args = args.into_iter().map(Into::into);
 
         while let Some(arg) = args.next() {
@@ -177,12 +202,19 @@ impl Args {
                     }
                     data_dir = Some(value.into());
                 }
-                "--no-mine" | "--no-listen" | "--status" | "--restore" => {
+                "--no-mine"
+                | "--no-listen"
+                | "--status"
+                | "--restore"
+                | "--compact-db"
+                | "--debug-no-proof-validation" => {
                     let (opt, set) = match name {
                         "--no-mine" => ("--no-mine", &mut no_mine),
                         "--no-listen" => ("--no-listen", &mut no_listen),
                         "--status" => ("--status", &mut status),
-                        _ => ("--restore", &mut restore),
+                        "--restore" => ("--restore", &mut restore),
+                        "--compact-db" => ("--compact-db", &mut compact_db),
+                        _ => ("--debug-no-proof-validation", &mut debug_no_proofs),
                     };
                     if inline.is_some() {
                         return Err(ArgsError::UnexpectedValue(opt));
@@ -192,10 +224,11 @@ impl Args {
                     }
                     *set = true;
                 }
-                "--sync-depth" | "--snap-sync-limit" | "--coin-maturity" => {
+                "--sync-depth" | "--snap-sync-limit" | "--keep-blocks" | "--coin-maturity" => {
                     let (opt, slot) = match name {
                         "--sync-depth" => ("--sync-depth", &mut sync_depth),
                         "--snap-sync-limit" => ("--snap-sync-limit", &mut snap_sync_limit),
+                        "--keep-blocks" => ("--keep-blocks", &mut keep_blocks),
                         _ => ("--coin-maturity", &mut coin_maturity),
                     };
                     if slot.is_some() {
@@ -265,8 +298,11 @@ impl Args {
             sync_depth: sync_depth.unwrap_or(DEFAULT_SYNC_DEPTH),
             max_peers: max_peers.unwrap_or(DEFAULT_MAX_PEERS),
             snap_sync_limit: snap_sync_limit.unwrap_or(DEFAULT_SNAP_SYNC_LIMIT),
+            keep_blocks: keep_blocks.unwrap_or(DEFAULT_KEEP_BLOCKS),
+            compact_db,
             coin_maturity: coin_maturity.unwrap_or(DEFAULT_COIN_MATURITY),
             restore,
+            debug_no_proofs,
         }))
     }
 }
@@ -297,8 +333,11 @@ mod tests {
             sync_depth: DEFAULT_SYNC_DEPTH,
             max_peers: DEFAULT_MAX_PEERS,
             snap_sync_limit: DEFAULT_SNAP_SYNC_LIMIT,
+            keep_blocks: DEFAULT_KEEP_BLOCKS,
+            compact_db: false,
             coin_maturity: DEFAULT_COIN_MATURITY,
             restore: false,
+            debug_no_proofs: false,
         }))
     }
 
@@ -329,8 +368,11 @@ mod tests {
                 sync_depth: DEFAULT_SYNC_DEPTH,
                 max_peers: DEFAULT_MAX_PEERS,
                 snap_sync_limit: DEFAULT_SNAP_SYNC_LIMIT,
+                keep_blocks: DEFAULT_KEEP_BLOCKS,
+                compact_db: false,
                 coin_maturity: DEFAULT_COIN_MATURITY,
                 restore: false,
+                debug_no_proofs: false,
             }))
         };
         assert_eq!(parse(&["--no-mine"]), want(true, false));
@@ -364,13 +406,34 @@ mod tests {
     }
 
     #[test]
+    fn keep_blocks_and_compaction() {
+        let got = |args: &[&str]| match parse(args) {
+            Ok(Command::Run(a)) => Ok((a.keep_blocks, a.compact_db)),
+            Ok(c) => panic!("{c:?}"),
+            Err(e) => Err(e),
+        };
+        assert_eq!(got(&[]), Ok((1000, false)));
+        assert_eq!(got(&["--keep-blocks", "0", "--compact-db"]), Ok((0, true)));
+        assert_eq!(got(&["--keep-blocks=5000"]), Ok((5000, false)));
+        use ArgsError::*;
+        assert_eq!(
+            got(&["--keep-blocks", "x"]),
+            Err(InvalidValue("--keep-blocks"))
+        );
+        assert_eq!(
+            got(&["--compact-db", "--compact-db"]),
+            Err(Duplicate("--compact-db"))
+        );
+    }
+
+    #[test]
     fn snap_sync_limit() {
         let limit = |args: &[&str]| match parse(args) {
             Ok(Command::Run(a)) => Ok(a.snap_sync_limit),
             Ok(c) => panic!("{c:?}"),
             Err(e) => Err(e),
         };
-        assert_eq!(limit(&[]), Ok(1000));
+        assert_eq!(limit(&[]), Ok(200));
         assert_eq!(limit(&["--snap-sync-limit", "50"]), Ok(50));
         assert_eq!(limit(&["--snap-sync-limit=0"]), Ok(0));
         use ArgsError::*;
@@ -408,6 +471,11 @@ mod tests {
             Err(Duplicate("--restore"))
         );
         assert_eq!(get(&["--restore=1"]), Err(UnexpectedValue("--restore")));
+        let debug = |args: &[&str]| match parse(args) {
+            Ok(Command::Run(a)) => a.debug_no_proofs,
+            c => panic!("{c:?}"),
+        };
+        assert!(!debug(&[]) && debug(&["--debug-no-proof-validation"]));
     }
 
     #[test]
@@ -443,8 +511,11 @@ mod tests {
             sync_depth: DEFAULT_SYNC_DEPTH,
             max_peers: DEFAULT_MAX_PEERS,
             snap_sync_limit: DEFAULT_SNAP_SYNC_LIMIT,
+            keep_blocks: DEFAULT_KEEP_BLOCKS,
+            compact_db: false,
             coin_maturity: DEFAULT_COIN_MATURITY,
             restore: false,
+            debug_no_proofs: false,
         }));
         assert_eq!(
             parse(&[
@@ -530,8 +601,11 @@ mod tests {
                 sync_depth: DEFAULT_SYNC_DEPTH,
                 max_peers: DEFAULT_MAX_PEERS,
                 snap_sync_limit: DEFAULT_SNAP_SYNC_LIMIT,
+                keep_blocks: DEFAULT_KEEP_BLOCKS,
+                compact_db: false,
                 coin_maturity: DEFAULT_COIN_MATURITY,
                 restore: false,
+                debug_no_proofs: false,
             }))
         );
     }

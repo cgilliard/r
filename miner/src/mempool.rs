@@ -31,8 +31,10 @@ use crate::output::{Amount, Commitment};
 use crate::state::key_of;
 use crate::transaction::{MAX_TX_BYTES, Transaction};
 
-/// The pool's size, in encoded bytes, at most.
-pub const MAX_POOL_BYTES: usize = 20_000_000;
+/// The pool's size, in encoded bytes, at most: about two full blocks of
+/// typical transactions (a 2 MB block holds ~10,600 of 2.5 inputs and 2.5
+/// outputs, ~65 MB with their signatures).
+pub const MAX_POOL_BYTES: usize = 150_000_000;
 /// Transactions a miner puts in one block, at most (proving time grows with
 /// each one).
 pub const MAX_BLOCK_TXS: usize = 100;
@@ -239,6 +241,16 @@ impl Mempool {
     /// ids and fees: at most [`MAX_BLOCK_TXS`], whose published lists take
     /// at most `room` bytes.
     pub fn select(&self, chain: &impl Chainstate, room: usize) -> Vec<(Hash, Transaction, Amount)> {
+        self.select_up_to(chain, room, MAX_BLOCK_TXS)
+    }
+
+    /// [`Mempool::select`] with at most `max_txs` transactions.
+    pub fn select_up_to(
+        &self,
+        chain: &impl Chainstate,
+        room: usize,
+        max_txs: usize,
+    ) -> Vec<(Hash, Transaction, Amount)> {
         let p = self.lock(chain);
         let mut entries: Vec<(&Hash, &Entry)> = p.txs.iter().collect();
         entries.sort_by(|(ia, a), (ib, b)| {
@@ -252,7 +264,7 @@ impl Mempool {
         let mut used = 0;
         let mut out = Vec::new();
         for (id, e) in entries {
-            if out.len() == MAX_BLOCK_TXS {
+            if out.len() == max_txs {
                 break;
             }
             let lists = e.tx.body.inputs.len() * block::INPUT_BYTES

@@ -89,7 +89,7 @@ use crate::rng::Rng;
 use crate::state::SyncPut;
 
 /// What a node needs from the chain it serves and follows.
-pub trait Backend {
+pub trait Backend: Sync {
     /// The main chain's tip.
     fn tip(&self) -> Tip;
     /// The main chain's header at `height`.
@@ -320,10 +320,19 @@ const MAX_SERVE: usize = 256;
 const MAX_PENDING: usize = 4096;
 /// Bodies kept ready to serve.
 const SERVED_CACHE: usize = 4;
-/// Transactions kept ready to serve.
-const SERVED_TX_CACHE: usize = 64;
+/// Transactions kept ready to serve (a peer may fetch `MAX_TX_FETCHES` at
+/// once).
+const SERVED_TX_CACHE: usize = 512;
 /// Transactions fetched at once, at most.
-const MAX_TX_FETCHES: usize = 64;
+const MAX_TX_FETCHES: usize = 256;
+/// Announced transactions waiting for a fetch slot, at most (each costs an
+/// id and its announcers).
+const MAX_TX_QUEUE: usize = 100_000;
+/// Bytes of transactions being fetched at once, at most (well under the
+/// socket buffer, so replies aren't lost in bursts); a fetch whose size
+/// isn't known yet counts as `TX_SIZE_GUESS`.
+const TX_BYTES_IN_FLIGHT: usize = 1 << 20;
+const TX_SIZE_GUESS: usize = 8 << 10;
 /// Times to ask for a transaction before trying another peer that has it.
 const TX_TRIES: u32 = 3;
 /// Packets handled between timer runs, at most, so a flood can't starve
@@ -480,6 +489,16 @@ pub struct Node<B: Backend> {
     served: VecDeque<(Hash, Served)>,
     served_txs: VecDeque<(Hash, Served)>,
     tx_fetches: HashMap<Hash, TxFetch>,
+    /// Announced transactions waiting for a fetch slot, oldest first, and
+    /// the peers that announced each.
+    tx_queue: VecDeque<Hash>,
+    tx_queued: HashMap<Hash, Vec<u32>>,
+    /// Fetched transactions waiting to be checked, with the peer each came
+    /// from: checked together, in parallel, at the tick.
+    tx_done: Vec<(Hash, u32, Vec<u8>)>,
+    /// Transactions added here, to announce at the next tick (together),
+    /// with the peer each came from (not told).
+    tx_to_announce: Vec<(Hash, Option<u32>)>,
     pending: VecDeque<Header>,
     download: Option<Download>,
     header_request: Option<(u32, Instant)>,
@@ -511,6 +530,44 @@ fn short(h: &Hash) -> String {
 }
 
 /// Whether `addr` can be dialed at all.
+/// Asks for 4 MiB socket buffers (the kernel caps them at its limit, such
+/// as Linux's `net.core.rmem_max`): a burst of replies (a block's chunks,
+/// or many transactions') mustn't overflow the default (~200 KB on Linux)
+/// between two reads, or it's lost.
+fn widen_buffers(socket: &UdpSocket) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        unsafe extern "C" {
+            fn setsockopt(
+                fd: i32,
+                level: i32,
+                name: i32,
+                value: *const std::ffi::c_void,
+                len: u32,
+            ) -> i32;
+        }
+        #[cfg(target_os = "linux")]
+        const OPTS: (i32, [i32; 2]) = (1, [7, 8]);
+        #[cfg(not(target_os = "linux"))]
+        const OPTS: (i32, [i32; 2]) = (0xffff, [0x1001, 0x1002]);
+        let size: i32 = 4 << 20;
+        for name in OPTS.1 {
+            // SAFETY: an open socket, and a pointer to an i32 of the length
+            // given. A failure only leaves the default size.
+            unsafe {
+                setsockopt(
+                    socket.as_raw_fd(),
+                    OPTS.0,
+                    name,
+                    (&size as *const i32).cast(),
+                    4,
+                );
+            }
+        }
+    }
+}
+
 fn dialable(addr: &SocketAddr) -> bool {
     addr.port() != 0 && !addr.ip().is_unspecified() && !addr.ip().is_multicast()
 }
@@ -532,6 +589,7 @@ impl<B: Backend> Node<B> {
         socket
             .set_read_timeout(Some(Duration::from_millis(10)))
             .expect("socket timeout");
+        widen_buffers(&socket);
         let now = Instant::now();
         let mut book = HashMap::new();
         if let Some(path) = &cfg.peer_file
@@ -576,6 +634,10 @@ impl<B: Backend> Node<B> {
             served: VecDeque::new(),
             served_txs: VecDeque::new(),
             tx_fetches: HashMap::new(),
+            tx_queue: VecDeque::new(),
+            tx_queued: HashMap::new(),
+            tx_to_announce: Vec::new(),
+            tx_done: Vec::new(),
             pending: VecDeque::new(),
             download: None,
             header_request: None,
@@ -625,7 +687,8 @@ impl<B: Backend> Node<B> {
             while let Ok(event) = events.try_recv() {
                 match event {
                     Event::NewTip => self.announce_tip(None),
-                    Event::NewTx(id) => self.announce_txs(&[id], None),
+                    // Announced together at the tick.
+                    Event::NewTx(id) => self.tx_to_announce.push((id, None)),
                     Event::Peers(reply) => {
                         let _ = reply.send(self.peer_report());
                     }
@@ -2110,26 +2173,8 @@ impl<B: Backend> Node<B> {
 
     // Transactions.
 
-    /// Tells every peer (but `except`) about transactions `ids`.
-    fn announce_txs(&mut self, ids: &[Hash], except: Option<u32>) {
-        let sessions: Vec<u32> = self
-            .peers
-            .keys()
-            .copied()
-            .filter(|&s| Some(s) != except)
-            .collect();
-        for batch in ids.chunks(MAX_TX_IDS) {
-            for &s in &sessions {
-                self.send_peer(
-                    s,
-                    &Message::TxInv {
-                        ids: batch.to_vec(),
-                    },
-                );
-            }
-        }
-    }
-
+    /// Notes who has transactions `ids`, queueing the new ones for
+    /// fetching.
     fn on_tx_inv(&mut self, session: u32, ids: &[Hash]) {
         for id in ids {
             if let Some(f) = self.tx_fetches.get_mut(id) {
@@ -2138,20 +2183,56 @@ impl<B: Backend> Node<B> {
                 }
                 continue;
             }
-            if self.tx_fetches.len() >= MAX_TX_FETCHES || self.backend.knows_tx(id) {
+            if let Some(from) = self.tx_queued.get_mut(id) {
+                if !from.contains(&session) {
+                    from.push(session);
+                }
                 continue;
             }
+            if self.tx_queue.len() >= MAX_TX_QUEUE || self.backend.knows_tx(id) {
+                continue;
+            }
+            self.tx_queue.push_back(*id);
+            self.tx_queued.insert(*id, vec![session]);
+        }
+        self.start_tx_fetches();
+    }
+
+    /// Fetches queued transactions while there are free slots, each from
+    /// the first peer still connected that announced it, unless the chain
+    /// is being synced.
+    fn start_tx_fetches(&mut self) {
+        if self.chain_busy() {
+            return;
+        }
+        let mut in_flight: usize = self
+            .tx_fetches
+            .values()
+            .map(|f| f.asm.as_ref().map_or(TX_SIZE_GUESS, Assembly::size))
+            .sum();
+        while self.tx_fetches.len() < MAX_TX_FETCHES && in_flight < TX_BYTES_IN_FLIGHT {
+            in_flight += TX_SIZE_GUESS;
+            let Some(id) = self.tx_queue.pop_front() else {
+                return;
+            };
+            let mut from = self.tx_queued.remove(&id).unwrap_or_default();
+            from.retain(|s| self.peers.contains_key(s));
+            if from.is_empty() || self.backend.knows_tx(&id) {
+                continue;
+            }
+            let session = from.remove(0);
+            from.reverse();
             self.tx_fetches.insert(
-                *id,
+                id,
                 TxFetch {
                     session,
-                    others: Vec::new(),
+                    others: from,
                     asm: None,
                     asked: Instant::now(),
                     tries: 1,
                 },
             );
-            self.send_peer(session, &Message::GetTx { id: *id });
+            self.send_peer(session, &Message::GetTx { id });
         }
     }
 
@@ -2211,34 +2292,52 @@ impl<B: Backend> Node<B> {
         if f.session != session {
             return;
         }
+        let had_leaves = asm.has_leaves();
         match asm.add(index as usize, data) {
             Ok(_) if asm.is_complete() => {
                 let f = self.tx_fetches.remove(&id).expect("fetching");
                 let bytes = f.asm.and_then(Assembly::finish).expect("complete");
-                match self.backend.add_tx(&bytes) {
-                    Ok(true) => {
-                        let from = self
-                            .peers
-                            .get(&session)
-                            .map_or("?".into(), |p| p.addr.to_string());
-                        (self.log)(format!(
-                            "transaction {} ({} bytes) from {from} added to the mempool",
-                            short(&id),
-                            bytes.len()
-                        ));
-                        self.announce_txs(&[id], Some(session));
-                    }
-                    Ok(false) => {}
-                    Err(Rejected::Invalid(e)) => {
-                        self.drop_peer(session, &format!("invalid transaction {}: {e}", short(&id)))
-                    }
-                    Err(Rejected::Failed(e)) => {
-                        (self.log)(format!("transaction {} not added: {e}", short(&id)))
-                    }
-                }
+                self.tx_done.push((id, session, bytes));
             }
+            // The leaf hashes are in: ask for the data now, not at the
+            // retry timer.
+            Ok(_) if !had_leaves && asm.has_leaves() => self.request_tx_chunks(id),
             Ok(_) | Err(ChunkError::Shape) => {}
             Err(e) => self.drop_peer(session, &format!("bad transaction chunk ({e:?})")),
+        }
+    }
+
+    /// Checks the fetched transactions (signatures and all, in parallel) and
+    /// adds them to the mempool.
+    fn add_fetched_txs(&mut self) {
+        if self.tx_done.is_empty() {
+            return;
+        }
+        let done = std::mem::take(&mut self.tx_done);
+        let backend = &self.backend;
+        let results = crate::par::par_map(done.len(), 4, |i| backend.add_tx(&done[i].2));
+        for ((id, session, bytes), result) in done.into_iter().zip(results) {
+            match result {
+                Ok(true) => {
+                    let from = self
+                        .peers
+                        .get(&session)
+                        .map_or("?".into(), |p| p.addr.to_string());
+                    (self.log)(format!(
+                        "transaction {} ({} bytes) from {from} added to the mempool",
+                        short(&id),
+                        bytes.len()
+                    ));
+                    self.tx_to_announce.push((id, Some(session)));
+                }
+                Ok(false) => {}
+                Err(Rejected::Invalid(e)) => {
+                    self.drop_peer(session, &format!("invalid transaction {}: {e}", short(&id)))
+                }
+                Err(Rejected::Failed(e)) => {
+                    (self.log)(format!("transaction {} not added: {e}", short(&id)))
+                }
+            }
         }
     }
 
@@ -2376,7 +2475,29 @@ impl<B: Backend> Node<B> {
                 self.request_chunks();
             }
         }
-        // Transactions: ask again, or try another peer.
+        // Transactions: check the fetched ones, announce the new ones, ask
+        // again for late ones (or try another peer), and start queued
+        // fetches.
+        self.add_fetched_txs();
+        if !self.tx_to_announce.is_empty() {
+            let new = std::mem::take(&mut self.tx_to_announce);
+            let sessions: Vec<u32> = self.peers.keys().copied().collect();
+            for s in sessions {
+                let ids: Vec<Hash> = new
+                    .iter()
+                    .filter(|(_, from)| *from != Some(s))
+                    .map(|(id, _)| *id)
+                    .collect();
+                for batch in ids.chunks(MAX_TX_IDS) {
+                    self.send_peer(
+                        s,
+                        &Message::TxInv {
+                            ids: batch.to_vec(),
+                        },
+                    );
+                }
+            }
+        }
         let late: Vec<Hash> = self
             .tx_fetches
             .iter()
@@ -2398,9 +2519,20 @@ impl<B: Backend> Node<B> {
                 self.send_peer(s, &Message::GetTx { id });
             }
         }
+        self.start_tx_fetches();
         self.maybe_download();
         self.maybe_sync();
         self.check_synced(now);
+    }
+
+    /// Whether the chain is being synced or a block fetched: transactions
+    /// wait (they're checked against our state, which isn't the peers' yet).
+    fn chain_busy(&self) -> bool {
+        self.fast.is_some()
+            || self.download.is_some()
+            || !self.pending.is_empty()
+            || self.header_request.is_some()
+            || self.best_peer(&self.unhelpful()).is_some()
     }
 
     /// Sets the synced flag once nothing is left to fetch from any peer (or
@@ -2409,11 +2541,11 @@ impl<B: Backend> Node<B> {
         if self.synced.load(Ordering::Relaxed) {
             return;
         }
-        let busy = self.fast.is_some()
-            || self.download.is_some()
-            || !self.pending.is_empty()
-            || self.header_request.is_some()
-            || self.best_peer(&self.unhelpful()).is_some();
+        let busy = self.chain_busy()
+            // Peers' pending transactions too, so a miner starts with them.
+            || !self.tx_queue.is_empty()
+            || !self.tx_fetches.is_empty()
+            || !self.tx_done.is_empty();
         let alone = self.peers.is_empty() && now - self.started >= ALONE_AFTER;
         if (!self.peers.is_empty() && !busy) || alone {
             let tip = self.backend.tip();

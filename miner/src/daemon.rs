@@ -76,6 +76,8 @@ pub struct Net {
     /// Blocks below the tip whose state is kept, to serve fast-syncing
     /// nodes.
     pub snap_sync_limit: u64,
+    /// Blocks below the tip whose bodies are kept (0: all).
+    pub keep_blocks: u64,
 }
 
 /// An amount in coins.
@@ -164,8 +166,10 @@ struct Opened {
     genesis: Header,
     consensus: Consensus,
     ledger: Arc<Ledger>,
-    /// The provers, if mining.
+    /// The provers, if mining (with proofs).
     chain: Option<Arc<Chain>>,
+    /// `--debug-no-proof-validation`.
+    debug_no_proofs: bool,
 }
 
 /// Opens (creating if needed) the chain in `data_dir/chain`, with the
@@ -175,7 +179,9 @@ fn open(
     log: &Log,
     data_dir: &Path,
     snap_sync_limit: u64,
+    keep_blocks: u64,
     mine: bool,
+    debug_no_proofs: bool,
 ) -> Result<Opened, Box<dyn Error>> {
     let dir = data_dir.join("chain");
     let cache = data_dir.join("cache");
@@ -189,7 +195,11 @@ fn open(
         } else {
             "PoW dataset (64 MiB) built and cached"
         });
-        (Some(data), Some(DatasetTree::Full(tree)))
+        // Without proofs, nothing needs the tree.
+        (
+            Some(data),
+            (!debug_no_proofs).then_some(DatasetTree::Full(tree)),
+        )
     } else {
         (None, None)
     };
@@ -198,6 +208,29 @@ fn open(
     let store = ChainStore::open(&env)?;
     let genesis = crate::genesis::header();
     let stored = store.genesis(&env.read_txn()?)?;
+    // A chain made without proofs is marked, so it's never taken for a real
+    // one (or the other way round).
+    let marker = dir.join(DEBUG_MARKER);
+    match (stored.is_some(), marker.exists(), debug_no_proofs) {
+        (true, false, true) => {
+            return Err(format!(
+                "{} holds a chain with proofs; use another --data-dir for \
+                 --debug-no-proof-validation",
+                dir.display()
+            )
+            .into());
+        }
+        (_, true, false) => {
+            return Err(format!(
+                "{} holds a chain made with --debug-no-proof-validation (its blocks have no \
+                 proofs); use another --data-dir",
+                dir.display()
+            )
+            .into());
+        }
+        (false, false, true) => std::fs::write(&marker, "blocks here have no proofs\n")?,
+        _ => {}
+    }
     match stored {
         Some(stored) if stored != genesis => {
             return Err(format!(
@@ -220,6 +253,13 @@ fn open(
     // Only a miner needs the provers; others check chain proofs with the
     // pinned keys.
     let (chain, verifier): (Option<Arc<Chain>>, Arc<dyn Verifier>) = match pow_tree {
+        _ if debug_no_proofs => {
+            log.line(
+                "--debug-no-proof-validation: blocks are made and checked without chain proofs \
+                 (testing only; a separate network)",
+            );
+            (None, Arc::new(chain::NoProofs))
+        }
         Some(pow_tree) => {
             log.line(
                 "setting up the provers and verifier (item chunks of 682/2730, signature chunks \
@@ -258,6 +298,7 @@ fn open(
         consensus,
         verifier,
         snap_sync_limit,
+        keep_blocks,
     });
     ledger.start_history()?;
     Ok(Opened {
@@ -269,8 +310,12 @@ fn open(
         consensus,
         ledger,
         chain,
+        debug_no_proofs,
     })
 }
+
+/// The file marking a chain directory made with `--debug-no-proof-validation`.
+const DEBUG_MARKER: &str = "debug-no-proofs";
 
 /// The seed nodes a node dials when it has no one else to: a new node with
 /// no `--peer`, or one whose saved peers are all gone.
@@ -295,6 +340,11 @@ fn node(
              address, or --no-listen)"
         )
     })?;
+    // Nodes without proofs get their own network: the real magic, inverted.
+    let mut magic = node::magic(&o.genesis.hash());
+    if o.debug_no_proofs {
+        magic = magic.map(|b| !b);
+    }
     let cfg = Config {
         capabilities: if net.listen.is_some() {
             cap::LISTENING
@@ -302,11 +352,16 @@ fn node(
             0
         },
         peers: net.peers.clone(),
-        seeds: SEEDS.map(String::from).to_vec(),
+        // The seeds are on the real network.
+        seeds: if o.debug_no_proofs {
+            vec![]
+        } else {
+            SEEDS.map(String::from).to_vec()
+        },
         peer_file: Some(data_dir.join("peers")),
         sync_depth: Some(net.sync_depth),
         max_peers: net.max_peers,
-        ..Config::new(node::magic(&o.genesis.hash()))
+        ..Config::new(magic)
     };
     let backend = LedgerBackend {
         ledger: o.ledger.clone(),
@@ -315,7 +370,7 @@ fn node(
     let node = Node::new(socket, cfg, backend, net_log(log));
     log.line(format!(
         "{} on {} (UDP); peers: {}; at most {} peers; a new node fast-syncs from {} blocks below the best tip; \
-         serving the state at the last {} blocks",
+         serving the state at the last {} blocks; keeping {}",
         if net.listen.is_some() { "listening" } else { "not accepting peers; sending" },
         node.local_addr(),
         if net.peers.is_empty() {
@@ -329,6 +384,10 @@ fn node(
         net.max_peers,
         net.sync_depth,
         net.snap_sync_limit,
+        match net.keep_blocks {
+            0 => "every block".to_string(),
+            n => format!("the last {} blocks", n.max(net.snap_sync_limit)),
+        },
     ));
     Ok(node)
 }
@@ -352,6 +411,8 @@ pub struct Options {
     pub coin_maturity: u64,
     /// Restore the wallet from recovery words read from the terminal.
     pub restore: bool,
+    /// Testing: make and check no chain proofs (`--debug-no-proof-validation`).
+    pub debug_no_proofs: bool,
 }
 
 /// Runs the node on the chain in `data_dir/chain` (creating it if there's
@@ -396,10 +457,20 @@ pub fn run(data_dir: &Path, net: &Net, opts: &Options) -> Result<(), Box<dyn Err
             String::new()
         },
     ));
-    let o = Arc::new(open(&log, data_dir, net.snap_sync_limit, mine)?);
+    let o = Arc::new(open(
+        &log,
+        data_dir,
+        net.snap_sync_limit,
+        net.keep_blocks,
+        mine,
+        opts.debug_no_proofs,
+    )?);
     let mempool = Arc::new(Mempool::new());
     let wallet_store = WalletStore::open(&o.env)?;
-    let wallet = open_wallet(&o.env, &wallet_store, opts.restore, &log)?;
+    let mut wallet = open_wallet(&o.env, &wallet_store, opts.restore, &log)?;
+    if opts.debug_no_proofs {
+        wallet = wallet.with_cheap_trees();
+    }
     let stop = Arc::new(AtomicBool::new(false));
 
     let mut n = node(&log, &o, data_dir, net, mempool.clone())?;
@@ -442,6 +513,7 @@ pub fn run(data_dir: &Path, net: &Net, opts: &Options) -> Result<(), Box<dyn Err
         wallet,
         synced,
         maturity: opts.coin_maturity,
+        debug: opts.debug_no_proofs,
         log: {
             let log = log.clone();
             Box::new(move |line| log.line(line))
@@ -562,7 +634,8 @@ impl Miner<'_> {
         let (env, store, tree, consensus) = (&o.env, o.store, o.tree, o.consensus);
         let data = o.data.expect("a miner has the dataset");
         let ledger = &o.ledger;
-        let chain = o.chain.as_ref().expect("a miner has the provers");
+        // No provers with --debug-no-proof-validation.
+        let chain = o.chain.as_deref();
         log.line("catching up with peers before mining");
         while !synced.load(Ordering::Relaxed) {
             if stop.load(Ordering::Relaxed) {
@@ -593,11 +666,10 @@ impl Miner<'_> {
             coins(consensus.total_supply()),
         ));
         // Room for the transactions' lists, beside the reward and the proof.
-        let room = block::MAX_BLOCK_SIZE.saturating_sub(block::encoded_size(
-            0,
-            1,
-            chain.block_prover().aggregator().proof_size(),
-        ));
+        let proof_size = chain.map_or(block::no_proof().size(), |c| {
+            c.block_prover().aggregator().proof_size()
+        });
+        let room = block::MAX_BLOCK_SIZE.saturating_sub(block::encoded_size(0, 1, proof_size));
         let moved = |parent: &Header| -> Result<Option<Header>, Box<dyn Error>> {
             let (tip, _) = ledger.tip()?;
             Ok((tip.hash() != parent.hash()).then_some(tip))
@@ -640,7 +712,11 @@ impl Miner<'_> {
 
             // Transactions from the mempool, the best-paying first, and the
             // reward (subsidy and fees) to a fresh key of the wallet.
-            let picked = mempool.select(&**ledger, room);
+            // Without proving (--debug-no-proof-validation), as many as fit.
+            let picked = match chain {
+                Some(_) => mempool.select(&**ledger, room),
+                None => mempool.select_up_to(&**ledger, room, usize::MAX),
+            };
             let fees: Amount = picked.iter().map(|(_, _, fee)| fee).sum();
             let mut txs: Vec<Transaction> = picked.iter().map(|(_, tx, _)| tx.clone()).collect();
             // The same keys for the reward until a block of ours is
@@ -681,7 +757,17 @@ impl Miner<'_> {
             let t = Instant::now();
             let prepared = {
                 let mut txn = env.write_txn()?;
-                let p = chain.block_prover().prepare(&tree, &mut txn, &txs, subsidy);
+                let p = match chain {
+                    Some(c) => c.block_prover().prepare(&tree, &mut txn, &txs, subsidy),
+                    None => block::prepare(
+                        &tree,
+                        &mut txn,
+                        &txs,
+                        subsidy,
+                        &block::STANDARD_SEGMENT,
+                        proof_size,
+                    ),
+                };
                 txn.abort();
                 match p {
                     Ok(p) => p,
@@ -699,62 +785,78 @@ impl Miner<'_> {
                 }
             };
             let new_state = prepared.new;
-            let agg = chain.block_prover().prove_prepared(&prepared)?;
-            log.line(format!(
-                "transition proved in {:.1} s: {} inputs, {} outputs",
-                t.elapsed().as_secs_f64(),
-                agg.inputs.len(),
-                agg.outputs.len(),
-            ));
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            if let Some(tip) = moved(&parent)? {
-                lost(&ours, &tip, "while proving");
-                continue;
-            }
+            let block = match chain {
+                None => {
+                    log.line(format!(
+                        "no proof (--debug-no-proof-validation): {} inputs, {} outputs",
+                        prepared.inputs.len(),
+                        prepared.outputs.len(),
+                    ));
+                    Block {
+                        inputs: prepared.inputs,
+                        outputs: prepared.outputs,
+                        proof: block::no_proof(),
+                    }
+                }
+                Some(chain) => {
+                    let agg = chain.block_prover().prove_prepared(&prepared)?;
+                    log.line(format!(
+                        "transition proved in {:.1} s: {} inputs, {} outputs",
+                        t.elapsed().as_secs_f64(),
+                        agg.inputs.len(),
+                        agg.outputs.len(),
+                    ));
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Some(tip) = moved(&parent)? {
+                        lost(&ours, &tip, "while proving");
+                        continue;
+                    }
 
-            // 2. The chain proof: block 1 from genesis, later blocks extend the
-            // parent's proof and prove the parent header's PoW.
-            let t = Instant::now();
-            let proof = if parent.height == 0 {
-                chain.prove_first(&agg)?
-            } else {
-                let txn = env.read_txn()?;
-                let grandparent = store
-                    .header_by_hash(&txn, &parent.prev)?
-                    .ok_or("missing header")?;
-                let work_gp = store
-                    .work_of(&txn, &grandparent.hash())?
-                    .ok_or("missing work")?;
-                let prev = ChainProof {
-                    statement: chain.statement(&parent, work_gp),
-                    proof: store
-                        .block_by_hash(&txn, &parent.hash())?
-                        .ok_or("missing block")?
-                        .proof,
-                };
-                drop(txn);
-                chain.prove_next(&prev, &grandparent, &parent, &agg)?
-            };
-            let secs = t.elapsed().as_secs_f64();
-            let size = proof.proof.size() / 1024;
-            if height == 1 {
-                log.line(format!(
-                    "chain proof in {secs:.1} s (first block from genesis, wrapped): {size} KB"
-                ));
-            } else {
-                log.line(format!(
-                    "chain proof in {secs:.1} s (chain node, wrapped): {size} KB, covers \
-                     headers 1..={} with ~2^{:.2} hashes of work",
-                    height - 1,
-                    hashes_log2(work_before),
-                ));
-            }
-            let block = Block {
-                inputs: agg.inputs,
-                outputs: agg.outputs,
-                proof: proof.proof,
+                    // 2. The chain proof: block 1 from genesis, later blocks extend the
+                    // parent's proof and prove the parent header's PoW.
+                    let t = Instant::now();
+                    let proof = if parent.height == 0 {
+                        chain.prove_first(&agg)?
+                    } else {
+                        let txn = env.read_txn()?;
+                        let grandparent = store
+                            .header_by_hash(&txn, &parent.prev)?
+                            .ok_or("missing header")?;
+                        let work_gp = store
+                            .work_of(&txn, &grandparent.hash())?
+                            .ok_or("missing work")?;
+                        let prev = ChainProof {
+                            statement: chain.statement(&parent, work_gp),
+                            proof: store
+                                .block_by_hash(&txn, &parent.hash())?
+                                .ok_or("missing block")?
+                                .proof,
+                        };
+                        drop(txn);
+                        chain.prove_next(&prev, &grandparent, &parent, &agg)?
+                    };
+                    let secs = t.elapsed().as_secs_f64();
+                    let size = proof.proof.size() / 1024;
+                    if height == 1 {
+                        log.line(format!(
+                            "chain proof in {secs:.1} s (first block from genesis, wrapped): {size} KB"
+                        ));
+                    } else {
+                        log.line(format!(
+                            "chain proof in {secs:.1} s (chain node, wrapped): {size} KB, covers \
+                             headers 1..={} with ~2^{:.2} hashes of work",
+                            height - 1,
+                            hashes_log2(work_before),
+                        ));
+                    }
+                    Block {
+                        inputs: agg.inputs,
+                        outputs: agg.outputs,
+                        proof: proof.proof,
+                    }
+                }
             };
             // Proving's buffers aren't needed while mining.
             crate::alloc::release();
@@ -887,7 +989,7 @@ impl Miner<'_> {
         // the tip's proof (plus the state tree, checked against the tip's root).
         let txn = env.read_txn()?;
         let tip = store.tip(&txn)?.ok_or("empty store")?;
-        if tip.height >= 1 {
+        if let (Some(chain), true) = (chain, tip.height >= 1) {
             let tip_parent = store
                 .header(&txn, tip.height - 1)?
                 .ok_or("missing header")?;

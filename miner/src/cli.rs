@@ -41,6 +41,9 @@ use crate::wallet::{
 const MAX_INPUTS: usize = 32;
 /// Blocks a spent output is remembered for, in case a reorg unspends it.
 const KEEP_GONE: u64 = 100;
+/// New outputs of ours in each `debug-fill` transaction: the coins it
+/// spends multiply for the next round.
+const FILL_OURS: usize = 4;
 /// Mining rewards' maturity by default, in confirmations.
 pub const DEFAULT_MATURITY: u64 = 6;
 
@@ -89,6 +92,14 @@ commands:
   status                       the node: tip, sync, mempool
   peers [all]                  connected peers, dials, and the address book
                                (all: every address in it)
+  debug-fill <txs> <fee>       testing (--debug-no-proof-validation only):
+                               fill blocks with up to <txs> transactions of
+                               ~100 KB, each spending one coin to 4 new
+                               outputs of ours and ~1300 empty ones
+  debug-split <txs> <fee>      testing: split up to <txs> coins into
+                               ~1350 coins of ours each
+  debug-spend <txs> <fee>      testing: up to <txs> typical transactions to
+                               ourselves, 2 or 3 inputs and as many outputs
   help                         this list
   quit                         stop the node";
 
@@ -111,6 +122,8 @@ pub struct Cli {
     pub maturity: u64,
     /// Logs to the node's log.
     pub log: Box<dyn Fn(String) + Send + Sync>,
+    /// `--debug-no-proof-validation`: allows `debug-fill`.
+    pub debug: bool,
 }
 
 fn now() -> u64 {
@@ -195,6 +208,20 @@ impl Cli {
                 let fee = parse_coins(fee).ok_or("bad fee")?;
                 self.cancel(id, Some(fee))?
             }
+            ["debug-split" | "debug-spend", txs, fee] => {
+                let txs = txs.parse().map_err(|_| "bad transaction count")?;
+                let fee = parse_coins(fee).ok_or("bad fee")?;
+                if words[0] == "debug-split" {
+                    self.debug_split(txs, fee)?
+                } else {
+                    self.debug_spend(txs, fee)?
+                }
+            }
+            ["debug-fill", txs, fee] => {
+                let txs = txs.parse().map_err(|_| "bad transaction count")?;
+                let fee = parse_coins(fee).ok_or("bad fee")?;
+                self.debug_fill(txs, fee)?
+            }
             ["bump", id, fee] => {
                 let fee = parse_coins(fee).ok_or("bad fee")?;
                 self.bump(id, fee)?
@@ -207,8 +234,8 @@ impl Cli {
     /// Brings the wallet's outputs up to the tip. After a reorg it first
     /// drops what came from blocks no longer on the main chain. Then it
     /// checks each new main-chain block's outputs for its tag (one hash
-    /// each), or, when blocks are missing (below a fast-sync base), the
-    /// whole state. Outputs gone from the state (spent) are kept for
+    /// each), or, when blocks are missing (pruned, or below a fast-sync
+    /// base), the whole state. Outputs gone from the state (spent) are kept for
     /// [`KEEP_GONE`] blocks, in case a reorg brings them back.
     fn sync(&self) -> Result<(), String> {
         let l = &self.ledger;
@@ -228,7 +255,8 @@ impl Cli {
                 _ => fork = Some(h - 1),
             }
         }
-        let base = l.store.base(&txn).map_err(err)?;
+        // The lowest block still stored.
+        let base = l.store.bodies_from(&txn).map_err(err)?;
         // A restored wallet looks from the start. Outputs it finds may be
         // mining rewards: they mature.
         let start = if restoring {
@@ -250,7 +278,7 @@ impl Cli {
             })
         };
         // The blocks there are: from the start, or (when older ones are
-        // missing, below a fast-sync base) from the base.
+        // missing) from the lowest stored.
         let first = if whole_state { base.max(1) } else { start };
         for h in first..=tip.height {
             let block = l
@@ -794,12 +822,226 @@ impl Cli {
     /// transaction. The leaves and the transaction are stored before the
     /// signatures go anywhere, so no key ever signs twice.
     fn sign(&self, sent: &mut Sent, outputs: Vec<Output>) -> Result<Vec<u8>, String> {
-        let mut rng = crate::rng::Rng::from_os().map_err(err)?;
         let mut txn = self.ledger.env.write_txn().map_err(err)?;
-        let mut leaves = Vec::with_capacity(sent.coins.len());
-        for c in &sent.coins {
+        let tx = self.sign_in(&mut txn, &sent.coins, outputs)?;
+        let bytes = tx.to_bytes();
+        sent.tx = Some(bytes.clone());
+        self.store.put_sent(&mut txn, sent).map_err(err)?;
+        txn.commit().map_err(err)?;
+        Ok(bytes)
+    }
+
+    /// Testing only (`--debug-no-proof-validation`): fills blocks. Spends up
+    /// to `txs` spendable coins (the largest first), each in its own
+    /// transaction paying `fee`: [`FILL_OURS`] new outputs of ours, sharing
+    /// the rest, and as many zero-amount outputs to random keys (which no
+    /// one can spend) as fit in [`MAX_TX_BYTES`]. Those are cheap to make;
+    /// ours each take a key tree.
+    fn debug_fill(&self, txs: usize, fee: Amount) -> Result<String, String> {
+        use crate::transaction::{INPUT_BYTES, MAX_TX_BYTES, OUTPUT_BYTES, SIGNATURE_BYTES};
+        if !self.debug {
+            return Err("debug-fill needs --debug-no-proof-validation".into());
+        }
+        let mut picked: Vec<Coin> = self
+            .holdings()?
+            .into_iter()
+            .filter(|h| h.state == Use::Spendable && h.coin.amount > fee)
+            .map(|h| h.coin)
+            .collect();
+        picked.sort_by_key(|c| std::cmp::Reverse(c.amount));
+        picked.truncate(txs);
+        if picked.is_empty() {
+            return Err(format!(
+                "no spendable coin is worth more than the fee {}",
+                coins(fee)
+            ));
+        }
+        let outputs_per_tx = (MAX_TX_BYTES - 4 - INPUT_BYTES - SIGNATURE_BYTES) / OUTPUT_BYTES;
+        let mut rng = crate::rng::Rng::from_os().map_err(err)?;
+        let (mut sent, mut outputs, mut bytes, mut refused) = (0, 0, 0, Vec::new());
+        for coin in &picked {
+            let value = coin.amount - fee;
+            let ours = FILL_OURS.min(value as usize);
+            let mut outs = Vec::with_capacity(outputs_per_tx);
+            for k in 0..ours {
+                let share = value / ours as u64 + u64::from(k == 0) * (value % ours as u64);
+                outs.push(self.wallet.new_keys().map_err(err)?.pay(share));
+            }
+            while outs.len() < outputs_per_tx {
+                let mut key = [crate::babybear::BabyBear::ZERO; crate::hash::HASH_LEN];
+                rng.fill(&mut key);
+                let mut nonce = [0u8; crate::output::NONCE_LEN];
+                for chunk in nonce.chunks_exact_mut(4) {
+                    chunk.copy_from_slice(&rng.next_element().as_u32().to_le_bytes());
+                }
+                outs.push(Output {
+                    hash: crate::hash::to_bytes(&key),
+                    amount: 0,
+                    nonce,
+                });
+            }
+            let n = outs.len();
+            let mut txn = self.ledger.env.write_txn().map_err(err)?;
+            let tx = self.sign_in(&mut txn, std::slice::from_ref(coin), outs)?;
+            txn.commit().map_err(err)?;
+            let tx = tx.to_bytes();
+            match self.submit(&tx) {
+                Ok(_) => {
+                    sent += 1;
+                    outputs += n;
+                    bytes += tx.len();
+                }
+                Err(e) => refused.push(e.to_string()),
+            }
+        }
+        let mut out = format!(
+            "submitted {sent} transaction{}: {outputs} outputs ({} ours), {} KB",
+            if sent == 1 { "" } else { "s" },
+            sent * FILL_OURS,
+            bytes / 1000
+        );
+        if !refused.is_empty() {
+            out += &format!("; {} refused: {}", refused.len(), refused.join("; "));
+        }
+        Ok(out)
+    }
+
+    /// Testing: the spendable coins worth more than `min`, the largest
+    /// first.
+    fn debug_coins(&self, min: Amount) -> Result<Vec<Coin>, String> {
+        if !self.debug {
+            return Err("debug commands need --debug-no-proof-validation".into());
+        }
+        let mut coins: Vec<Coin> = self
+            .holdings()?
+            .into_iter()
+            .filter(|h| h.state == Use::Spendable && h.coin.amount > min)
+            .map(|h| h.coin)
+            .collect();
+        coins.sort_by_key(|c| std::cmp::Reverse(c.amount));
+        Ok(coins)
+    }
+
+    /// Testing: signs one transaction per group of coins (leaves recorded
+    /// first, then built in parallel), paying `fee` and the rest to `n(group)`
+    /// new outputs of ours, and submits them. Says how long each part took.
+    fn debug_send(
+        &self,
+        groups: Vec<Vec<Coin>>,
+        fee: Amount,
+        n: impl Fn(&[Coin]) -> usize + Sync,
+    ) -> Result<String, String> {
+        let t = std::time::Instant::now();
+        let mut txn = self.ledger.env.write_txn().map_err(err)?;
+        let mut leaves = Vec::with_capacity(groups.len());
+        for g in &groups {
+            leaves.push(self.take_leaves(&mut txn, g)?);
+        }
+        txn.commit().map_err(err)?;
+        let built = crate::par::par_map(groups.len(), 1, |i| {
+            let g = &groups[i];
+            let value: Amount = g.iter().map(|c| c.amount).sum::<Amount>() - fee;
+            let k = n(g).min(value as usize).max(1);
+            let mut outputs = Vec::with_capacity(k);
+            for j in 0..k {
+                let share = value / k as u64 + u64::from(j == 0) * (value % k as u64);
+                outputs.push(self.wallet.new_keys().map_err(err)?.pay(share));
+            }
+            Ok::<_, String>(self.signed(g, &leaves[i], outputs)?.to_bytes())
+        });
+        let built: Vec<Vec<u8>> = built.into_iter().collect::<Result<_, _>>()?;
+        let build_secs = t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let (mut ok, mut refused) = (0, Vec::new());
+        for tx in &built {
+            match self.submit(tx) {
+                Ok(_) => ok += 1,
+                Err(e) => refused.push(e.to_string()),
+            }
+        }
+        let inputs: usize = groups.iter().map(Vec::len).sum();
+        let bytes: usize = built.iter().map(Vec::len).sum();
+        let outputs: usize = built
+            .iter()
+            .filter_map(|b| Transaction::from_bytes(b))
+            .map(|t| t.body.outputs.len())
+            .sum();
+        let mut out = format!(
+            "built {} transactions ({inputs} inputs, {outputs} outputs, {:.1} MB) in {build_secs:.1} s; \
+             the mempool took {ok} in {:.1} s",
+            built.len(),
+            bytes as f64 / 1e6,
+            t.elapsed().as_secs_f64()
+        );
+        if let Some(e) = refused.first() {
+            out += &format!(" ({} refused, as: {e})", refused.len());
+        }
+        Ok(out)
+    }
+
+    /// Testing: spends up to `txs` coins, each to as many new coins of ours
+    /// as fit in a transaction (~1350), paying `fee`.
+    fn debug_split(&self, txs: usize, fee: Amount) -> Result<String, String> {
+        use crate::transaction::{INPUT_BYTES, MAX_TX_BYTES, OUTPUT_BYTES, SIGNATURE_BYTES};
+        let mut picked = self.debug_coins(fee)?;
+        picked.truncate(txs);
+        if picked.is_empty() {
+            return Err(format!(
+                "no spendable coin is worth more than the fee {}",
+                coins(fee)
+            ));
+        }
+        let per_tx = (MAX_TX_BYTES - 4 - INPUT_BYTES - SIGNATURE_BYTES) / OUTPUT_BYTES;
+        let groups = picked.into_iter().map(|c| vec![c]).collect();
+        self.debug_send(groups, fee, |_| per_tx)
+    }
+
+    /// Testing: up to `txs` typical transactions to ourselves, alternately
+    /// spending 2 and 3 coins to as many new coins, each paying `fee`.
+    fn debug_spend(&self, txs: usize, fee: Amount) -> Result<String, String> {
+        let mut coins = self.debug_coins(0)?.into_iter();
+        let mut groups = Vec::new();
+        while groups.len() < txs {
+            let k = 2 + groups.len() % 2;
+            let g: Vec<Coin> = coins.by_ref().take(k).collect();
+            if g.len() < k || g.iter().map(|c| c.amount).sum::<Amount>() <= fee + k as u64 {
+                break;
+            }
+            groups.push(g);
+        }
+        if groups.is_empty() {
+            return Err("not enough spendable coins".into());
+        }
+        self.debug_send(groups, fee, |g| g.len())
+    }
+
+    /// Signs a transaction spending `coins` to `outputs`, each coin with a
+    /// leaf of its key tree that hasn't signed (as far as we know: we record
+    /// ours, and look in the mempool for others), recording the leaves in
+    /// `txn`, which the caller commits before the signatures go anywhere.
+    fn sign_in(
+        &self,
+        txn: &mut heed::RwTxn,
+        coins: &[Coin],
+        outputs: Vec<Output>,
+    ) -> Result<Transaction, String> {
+        let leaves = self.take_leaves(txn, coins)?;
+        self.signed(coins, &leaves, outputs)
+    }
+
+    /// Picks and records (in `txn`) the leaf each of `coins` signs with
+    /// next, for [`Cli::sign_in`].
+    fn take_leaves(&self, txn: &mut heed::RwTxn, coins: &[Coin]) -> Result<Vec<u8>, String> {
+        // Testing wallets' trees have one real key, which signs every time
+        // (reusing a one-time key: fine on a test network).
+        if self.wallet.cheap_trees() {
+            return Ok(vec![0; coins.len()]);
+        }
+        let mut rng = crate::rng::Rng::from_os().map_err(err)?;
+        let mut leaves = Vec::with_capacity(coins.len());
+        for c in coins {
             let commitment = &c.record.commitment;
-            let mut known = self.store.leaves(&txn, commitment).map_err(err)?;
+            let mut known = self.store.leaves(txn, commitment).map_err(err)?;
             if let Some(tx) = self.mempool.spender(commitment) {
                 for i in tx
                     .body
@@ -815,22 +1057,27 @@ impl Cli {
                 &hex(&commitment.0)[..8]
             ))?;
             self.store
-                .set_leaves(&mut txn, commitment, known.with(leaf))
+                .set_leaves(txn, commitment, known.with(leaf))
                 .map_err(err)?;
             leaves.push(leaf);
         }
-        let (keys, inputs) = sent
-            .coins
+        Ok(leaves)
+    }
+
+    /// The transaction spending `coins`, with `leaves` (recorded already),
+    /// to `outputs`.
+    fn signed(
+        &self,
+        coins: &[Coin],
+        leaves: &[u8],
+        outputs: Vec<Output>,
+    ) -> Result<Transaction, String> {
+        let (keys, inputs) = coins
             .iter()
             .zip(leaves)
-            .map(|(c, leaf)| self.wallet.input(c, leaf))
+            .map(|(c, &leaf)| self.wallet.input(c, leaf))
             .unzip();
-        let tx = Transaction::sign(TxBody { inputs, outputs }, keys).map_err(err)?;
-        let bytes = tx.to_bytes();
-        sent.tx = Some(bytes.clone());
-        self.store.put_sent(&mut txn, sent).map_err(err)?;
-        txn.commit().map_err(err)?;
-        Ok(bytes)
+        Transaction::sign(TxBody { inputs, outputs }, keys).map_err(err)
     }
 
     /// Submits `sent`'s transaction `bytes`, saying what happened.
@@ -1156,6 +1403,7 @@ mod tests {
             synced: Arc::new(AtomicBool::new(true)),
             maturity: 3,
             log: Box::new(|_| {}),
+            debug: true,
         };
         Node {
             _env: env,
@@ -1545,6 +1793,84 @@ mod tests {
     }
 
     #[test]
+    fn debug_fill_makes_full_transactions_whose_coins_multiply() {
+        use crate::transaction::{MAX_TX_BYTES, OUTPUT_BYTES};
+        let g = genesis();
+        let mut alice = node(&g);
+        block(
+            &[&alice],
+            &[pay(&alice, 5 * COIN), pay(&alice, 3 * COIN)],
+            &[],
+        );
+        alice.cli.debug = false;
+        assert!(
+            run(&alice, "debug-fill 5 0.01")
+                .unwrap_err()
+                .contains("--debug-no-proof")
+        );
+        alice.cli.debug = true;
+
+        let out = run(&alice, "debug-fill 5 0.01").unwrap();
+        assert!(out.starts_with("submitted 2 transactions"), "{out}");
+        let picked = alice.cli.mempool.select(&*alice.cli.ledger, usize::MAX);
+        assert_eq!(picked.len(), 2);
+        for (_, tx, _) in &picked {
+            // As full as a transaction gets, with 4 outputs of ours.
+            let size = tx.to_bytes().len();
+            assert!(
+                size <= MAX_TX_BYTES && size > MAX_TX_BYTES - OUTPUT_BYTES,
+                "{size}"
+            );
+            assert_eq!(
+                tx.body.outputs.iter().filter(|o| o.amount > 0).count(),
+                FILL_OURS
+            );
+        }
+        mine(&[&alice]);
+        // Two coins became eight, less the fees.
+        assert_eq!(spendable(&alice), "7.98");
+        let spendable_coins = alice
+            .cli
+            .holdings()
+            .unwrap()
+            .iter()
+            .filter(|h| h.state == Use::Spendable)
+            .count();
+        assert_eq!(spendable_coins, 2 * FILL_OURS);
+    }
+
+    #[test]
+    fn debug_split_and_spend_make_typical_transactions() {
+        let g = genesis();
+        let mut alice = node(&g);
+        alice.cli.wallet = alice.cli.wallet.with_cheap_trees();
+        block(&[&alice], &[pay(&alice, 5 * COIN)], &[]);
+        let out = run(&alice, "debug-split 3 0.01").unwrap();
+        assert!(
+            out.starts_with("built 1 transactions (1 inputs, 1354 outputs"),
+            "{out}"
+        );
+        mine(&[&alice]);
+        let out = run(&alice, "debug-spend 10 0.001").unwrap();
+        assert!(
+            out.starts_with("built 10 transactions (25 inputs, 25 outputs"),
+            "{out}"
+        );
+        assert!(out.contains("the mempool took 10"), "{out}");
+        let mut shapes: Vec<_> = alice
+            .cli
+            .mempool
+            .select_up_to(&*alice.cli.ledger, usize::MAX, usize::MAX)
+            .iter()
+            .map(|(_, tx, _)| (tx.body.inputs.len(), tx.body.outputs.len()))
+            .collect();
+        shapes.sort();
+        assert_eq!(shapes, [[(2, 2); 5], [(3, 3); 5]].concat());
+        mine(&[&alice]);
+        assert_eq!(spendable(&alice), "4.98");
+    }
+
+    #[test]
     fn a_signed_payment_can_be_bumped_or_cancelled() {
         let g = genesis();
         let (alice, bob) = (node(&g), node(&g));
@@ -1626,6 +1952,31 @@ mod tests {
                 .contains("cancelled: its coins came back")
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A wallet last synced before blocks its node has since pruned finds
+    /// what they paid it in the state.
+    #[test]
+    fn a_wallet_behind_pruned_blocks_scans_the_state() {
+        let g = genesis();
+        let mut alice = node_with(&g, [78; 32], false);
+        let l = Arc::get_mut(&mut alice.cli.ledger).unwrap();
+        (l.snap_sync_limit, l.keep_blocks) = (2, 2);
+        assert_eq!(run(&alice, "outputs").unwrap(), "no outputs");
+        block(&[&alice], &[pay_to(&alice, 0, COIN)], &[]);
+        for _ in 0..4 {
+            block(&[&alice], &[], &[]);
+        }
+        block(&[&alice], &[pay_to(&alice, 1, 2 * COIN)], &[]);
+        let txn = alice.cli.ledger.env.read_txn().unwrap();
+        assert_eq!(alice.cli.ledger.store.bodies_from(&txn).unwrap(), 4);
+        drop(txn);
+        // Block 1's output is found in the state (taking the lowest stored
+        // block's height), block 6's in its block.
+        assert_eq!(
+            outputs(&alice),
+            ["1 4 3 spendable", "2 6 1 spendable", "2 outputs, 3 coins"]
+        );
     }
 
     #[test]

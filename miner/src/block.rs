@@ -389,13 +389,13 @@ pub fn apply(
                 .ok_or(BlockError::NotAnOutput(p))?,
         );
     }
-    let proofs = tree
+    let undo = tree
         .apply_block(txn, header.height, &block.outputs, &spent)
         .map_err(BlockError::State)?;
     if tree.state(txn).map_err(BlockError::State)? != header.state {
         return Err(BlockError::StateMismatch);
     }
-    Ok(proofs.undo(parent.state.size))
+    Ok(undo)
 }
 
 /// A block's transition, proved: its lists and the final aggregation
@@ -430,6 +430,156 @@ pub struct Prepared {
     /// Where the last segment left off.
     last: SegmentStart,
 }
+
+/// The quick, stateful part of proving a block of `txs` on top of
+/// `tree`'s state in `txn`: checks the transactions (they must create
+/// exactly `subsidy` in total, and the block must fit
+/// [`MAX_BLOCK_SIZE`] with a proof of `proof_size` bytes) and applies the changes in `txn`, recording the
+/// witnesses of segments shaped `seg`. The transaction can then be aborted and the
+/// proving done without it.
+pub fn prepare(
+    tree: &StateTree,
+    txn: &mut heed::RwTxn,
+    txs: &[Transaction],
+    subsidy: Amount,
+    seg: &StateSegmentAir,
+    proof_size: usize,
+) -> Result<Prepared, BlockError> {
+    let mut net: i128 = 0;
+    for (i, tx) in txs.iter().enumerate() {
+        let totals = tx.validate().map_err(|e| BlockError::Tx(i, e))?;
+        net -= totals.fee();
+    }
+    if net != subsidy as i128 {
+        return Err(BlockError::Net(net));
+    }
+    let n_in: usize = txs.iter().map(|t| t.body.inputs.len()).sum();
+    let n_out: usize = txs.iter().map(|t| t.body.outputs.len()).sum();
+    let size = encoded_size(n_in, n_out, proof_size);
+    if size > MAX_BLOCK_SIZE {
+        return Err(BlockError::Oversize(size));
+    }
+    let mut inputs: Vec<Commitment> = txs
+        .iter()
+        .flat_map(|t| t.body.inputs.iter().map(|i| i.commitment))
+        .collect();
+    let mut outputs: Vec<OutputRecord> = txs
+        .iter()
+        .flat_map(|t| t.body.outputs.iter().map(|o| o.record()))
+        .collect::<Option<_>>()
+        .ok_or(BlockError::NotCanonical)?;
+    sort_canonical(&mut inputs, |c| c)?;
+    sort_canonical(&mut outputs, |o| &o.commitment)?;
+    if spends_own_output(&inputs, &outputs) {
+        return Err(BlockError::SpendsItsOwnOutput);
+    }
+    let prev = tree.state(txn).map_err(BlockError::State)?;
+
+    // Apply the state changes natively, in segments: all inserts, then
+    // all spends.
+    let mut segments = Vec::new();
+    let mut start = SegmentStart {
+        state: prev,
+        prev_insert: [BabyBear::ZERO; HASH_LEN],
+        prev_spend: [BabyBear::ZERO; HASH_LEN],
+    };
+    let (mut ins, mut sps) = (&outputs[..], &inputs[..]);
+    while !ins.is_empty() || !sps.is_empty() || segments.is_empty() {
+        let (take_ins, rest_ins) = ins.split_at(ins.len().min(seg.inserts));
+        ins = rest_ins;
+        let take_sp = if ins.is_empty() {
+            let (t, rest) = sps.split_at(sps.len().min(seg.spends));
+            sps = rest;
+            t
+        } else {
+            &[]
+        };
+        let inserts: Vec<InsertOp> = take_ins
+            .iter()
+            .map(|record| {
+                Ok(InsertOp {
+                    proof: tree.insert(txn, record)?,
+                    record: *record,
+                })
+            })
+            .collect::<Result<_, state::Error>>()
+            .map_err(BlockError::State)?;
+        let spends: Vec<SpendOp> = take_sp
+            .iter()
+            .map(|c| {
+                Ok(SpendOp {
+                    proof: tree.remove(txn, c)?,
+                    commitment: *c,
+                })
+            })
+            .collect::<Result<_, state::Error>>()
+            .map_err(BlockError::State)?;
+        let next = SegmentStart {
+            state: tree.state(txn).map_err(BlockError::State)?,
+            prev_insert: take_ins.last().map_or(start.prev_insert, |o| {
+                key_of(&o.commitment).expect("checked")
+            }),
+            prev_spend: take_sp
+                .last()
+                .map_or(start.prev_spend, |c| key_of(c).expect("checked")),
+        };
+        segments.push((start, inserts, spends));
+        start = next;
+    }
+    let new = start.state;
+
+    // Each input must sign the position the tree removed it from.
+    let positions: std::collections::HashMap<Commitment, u64> = segments
+        .iter()
+        .flat_map(|(_, _, spends)| spends.iter().map(|s| (s.commitment, s.proof.position())))
+        .collect();
+    for (i, tx) in txs.iter().enumerate() {
+        if tx
+            .body
+            .inputs
+            .iter()
+            .any(|input| positions.get(&input.commitment) != Some(&input.position))
+        {
+            return Err(BlockError::Position(i));
+        }
+    }
+    // Published by position.
+    let mut spent: Vec<u64> = positions.into_values().collect();
+    spent.sort_unstable();
+    Ok(Prepared {
+        txs: txs.to_vec(),
+        inputs: spent,
+        outputs,
+        prev,
+        new,
+        segments,
+        last: start,
+    })
+}
+
+/// The smallest well-formed proof: what blocks carry when nodes run with
+/// `--debug-no-proof-validation` (they neither make nor check proofs).
+pub fn no_proof() -> StarkProof {
+    let mut e = vec![BabyBear::new(3)];
+    e.extend([BabyBear::ONE; HASH_LEN]);
+    e.push(BabyBear::ZERO);
+    e.extend([BabyBear::ONE; HASH_LEN]);
+    e.extend([BabyBear::ZERO; 7]);
+    e.extend([
+        BabyBear::ZERO,
+        BabyBear::ZERO,
+        BabyBear::ONE,
+        BabyBear::ZERO,
+        BabyBear::ZERO,
+    ]);
+    StarkProof::from_elements(&e).expect("well formed")
+}
+
+/// The state segments [`BlockProver::standard`] proves.
+pub const STANDARD_SEGMENT: StateSegmentAir = StateSegmentAir {
+    inserts: 16,
+    spends: 16,
+};
 
 /// Item chunk shapes, smallest first: each fills a power-of-two trace
 /// (`2^12`, `2^14` rows).
@@ -530,10 +680,7 @@ impl BlockProver {
             params,
             &ITEM_SHAPES,
             &SIG_SHAPES,
-            StateSegmentAir {
-                inserts: 16,
-                spends: 16,
-            },
+            STANDARD_SEGMENT,
             15,
             keys,
         )
@@ -559,11 +706,8 @@ impl BlockProver {
     }
 
     /// The quick, stateful part of proving a block of `txs` on top of
-    /// `tree`'s state in `txn`: checks the transactions (they must create
-    /// exactly `subsidy` in total, and the block must fit
-    /// [`MAX_BLOCK_SIZE`]) and applies the changes in `txn`, recording the
-    /// segments' witnesses. The transaction can then be aborted and the
-    /// proving done without it.
+    /// `tree`'s state in `txn`: [`prepare`], with this prover's segments and
+    /// proof size.
     pub fn prepare(
         &self,
         tree: &StateTree,
@@ -571,116 +715,7 @@ impl BlockProver {
         txs: &[Transaction],
         subsidy: Amount,
     ) -> Result<Prepared, BlockError> {
-        let mut net: i128 = 0;
-        for (i, tx) in txs.iter().enumerate() {
-            let totals = tx.validate().map_err(|e| BlockError::Tx(i, e))?;
-            net -= totals.fee();
-        }
-        if net != subsidy as i128 {
-            return Err(BlockError::Net(net));
-        }
-        let n_in: usize = txs.iter().map(|t| t.body.inputs.len()).sum();
-        let n_out: usize = txs.iter().map(|t| t.body.outputs.len()).sum();
-        let size = encoded_size(n_in, n_out, self.agg.proof_size());
-        if size > MAX_BLOCK_SIZE {
-            return Err(BlockError::Oversize(size));
-        }
-        let mut inputs: Vec<Commitment> = txs
-            .iter()
-            .flat_map(|t| t.body.inputs.iter().map(|i| i.commitment))
-            .collect();
-        let mut outputs: Vec<OutputRecord> = txs
-            .iter()
-            .flat_map(|t| t.body.outputs.iter().map(|o| o.record()))
-            .collect::<Option<_>>()
-            .ok_or(BlockError::NotCanonical)?;
-        sort_canonical(&mut inputs, |c| c)?;
-        sort_canonical(&mut outputs, |o| &o.commitment)?;
-        if spends_own_output(&inputs, &outputs) {
-            return Err(BlockError::SpendsItsOwnOutput);
-        }
-        let prev = tree.state(txn).map_err(BlockError::State)?;
-
-        // Apply the state changes natively, in segments: all inserts, then
-        // all spends.
-        let mut segments = Vec::new();
-        let mut start = SegmentStart {
-            state: prev,
-            prev_insert: [BabyBear::ZERO; HASH_LEN],
-            prev_spend: [BabyBear::ZERO; HASH_LEN],
-        };
-        let (mut ins, mut sps) = (&outputs[..], &inputs[..]);
-        while !ins.is_empty() || !sps.is_empty() || segments.is_empty() {
-            let (take_ins, rest_ins) = ins.split_at(ins.len().min(self.seg.inserts));
-            ins = rest_ins;
-            let take_sp = if ins.is_empty() {
-                let (t, rest) = sps.split_at(sps.len().min(self.seg.spends));
-                sps = rest;
-                t
-            } else {
-                &[]
-            };
-            let inserts: Vec<InsertOp> = take_ins
-                .iter()
-                .map(|record| {
-                    Ok(InsertOp {
-                        proof: tree.insert(txn, record)?,
-                        record: *record,
-                    })
-                })
-                .collect::<Result<_, state::Error>>()
-                .map_err(BlockError::State)?;
-            let spends: Vec<SpendOp> = take_sp
-                .iter()
-                .map(|c| {
-                    Ok(SpendOp {
-                        proof: tree.remove(txn, c)?,
-                        commitment: *c,
-                    })
-                })
-                .collect::<Result<_, state::Error>>()
-                .map_err(BlockError::State)?;
-            let next = SegmentStart {
-                state: tree.state(txn).map_err(BlockError::State)?,
-                prev_insert: take_ins.last().map_or(start.prev_insert, |o| {
-                    key_of(&o.commitment).expect("checked")
-                }),
-                prev_spend: take_sp
-                    .last()
-                    .map_or(start.prev_spend, |c| key_of(c).expect("checked")),
-            };
-            segments.push((start, inserts, spends));
-            start = next;
-        }
-        let new = start.state;
-
-        // Each input must sign the position the tree removed it from.
-        let positions: std::collections::HashMap<Commitment, u64> = segments
-            .iter()
-            .flat_map(|(_, _, spends)| spends.iter().map(|s| (s.commitment, s.proof.position())))
-            .collect();
-        for (i, tx) in txs.iter().enumerate() {
-            if tx
-                .body
-                .inputs
-                .iter()
-                .any(|input| positions.get(&input.commitment) != Some(&input.position))
-            {
-                return Err(BlockError::Position(i));
-            }
-        }
-        // Published by position.
-        let mut spent: Vec<u64> = positions.into_values().collect();
-        spent.sort_unstable();
-        Ok(Prepared {
-            txs: txs.to_vec(),
-            inputs: spent,
-            outputs,
-            prev,
-            new,
-            segments,
-            last: start,
-        })
+        prepare(tree, txn, txs, subsidy, &self.seg, self.agg.proof_size())
     }
 
     /// The slow part: proves a [`BlockProver::prepare`]d block.

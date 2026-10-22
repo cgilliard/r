@@ -173,6 +173,11 @@ pub struct Assembly {
 }
 
 impl Assembly {
+    /// The object's size in bytes.
+    pub fn size(&self) -> usize {
+        self.layout.size
+    }
+
     /// Expects an object of `size` bytes with leaf root `root`; the caller
     /// has checked these against the object hash.
     pub fn new(size: usize, root: Hash) -> Self {
@@ -194,6 +199,12 @@ impl Assembly {
 
     pub fn is_complete(&self) -> bool {
         self.missing == 0
+    }
+
+    /// Whether the leaf hashes are in (and checked), so data chunks can be
+    /// taken.
+    pub fn has_leaves(&self) -> bool {
+        self.leaves.is_some()
     }
 
     /// Chunks received so far.

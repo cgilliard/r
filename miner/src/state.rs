@@ -319,6 +319,14 @@ impl ChangeProofs {
     }
 }
 
+/// Leaf changes staged for one [`StateTree::flush`].
+#[derive(Default)]
+struct Batch {
+    /// Each touched slot's leaf before its first change, in order.
+    undo: Vec<(u64, Option<Leaf>)>,
+    seen: HashSet<u64>,
+}
+
 /// How to undo one block's changes to the tree ([`StateTree::revert`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Undo {
@@ -459,17 +467,20 @@ impl From<heed::Error> for Error {
 /// transaction, so a block's inserts and removals commit or abort together.
 ///
 /// Databases, all integers big-endian so LMDB's byte order matches:
-/// - `state_leaves`: slot (`u64`) to encoded [`Leaf`], for occupied slots.
-/// - `state_nodes`: level (`u8`) and index (`u64`) to node hash. Level 0
-///   holds leaf hashes and level `DEPTH` the root; nodes of empty subtrees
-///   aren't stored.
+/// - `state_leaves`: slot (`u64`) to stored leaf, for occupied slots: key,
+///   nonce and next index. The next key is the next slot's key, so it isn't
+///   stored ([`StateTree::leaf`]).
+/// - `state_nodes`: level (`u8`) and index (`u64`) to node hash, for every
+///   [`STRIDE`]th level (up to the root, at `DEPTH`); the levels between
+///   are hashed from the stored level below when needed. Nodes of empty
+///   subtrees aren't stored.
 /// - `state_keys`: key as big-endian limbs (sorts in key order) to slot.
 /// - `state_meta`: `size` to the slot counter; `history` to the lowest
 ///   height the tree can be served at; `sync` to the tag of a state
-///   download in progress.
+///   download in progress; `layout` to [`LAYOUT`].
 /// - `state_history`: level (`u8`), index and height (`u64`s) to the node's
 ///   value before the block at that height changed it: at level 0 the
-///   encoded leaf, above it the hash; empty if it was empty.
+///   stored leaf, at stored levels the hash; empty if it was empty.
 /// - `state_changes`: height, level and index (no value): the same entries
 ///   by height, for pruning and reverting.
 /// - `sync_todo`: level and index to hash: nodes of a state download still
@@ -490,6 +501,26 @@ pub struct StateTree {
 const SIZE_KEY: &[u8] = b"size";
 const HISTORY_KEY: &[u8] = b"history";
 const SYNC_KEY: &[u8] = b"sync";
+const LAYOUT_KEY: &[u8] = b"layout";
+
+/// The on-disk layout: 2 stores every [`STRIDE`]th level and leaves
+/// without their next key; 1 (no `layout` entry) stored every level and
+/// whole leaves, and is migrated on opening ([`StateTree::migrate`]).
+const LAYOUT: u8 = 2;
+
+/// Levels between stored node levels. Hashing a missing level takes at
+/// most `2^STRIDE` stored nodes (or leaves) from the stored level below.
+pub const STRIDE: usize = 4;
+const _: () = assert!(DEPTH.is_multiple_of(STRIDE));
+
+/// Whether node level `level` is stored (the leaves' hashes aren't).
+fn is_stored(level: usize) -> bool {
+    level > 0 && level.is_multiple_of(STRIDE)
+}
+
+/// Slots (or nodes) under one node at a stored level, one stored level
+/// down.
+const GROUP: usize = 1 << STRIDE;
 
 /// Levels below an interior node whose hashes a state-sync reply carries
 /// (`2^5 = 32` hashes).
@@ -530,6 +561,7 @@ impl StateTree {
             sync_leaves: env.create_database(&mut txn, Some("sync_leaves"))?,
         };
         if tree.meta.get(&txn, SIZE_KEY)?.is_none() {
+            tree.meta.put(&mut txn, LAYOUT_KEY, &[LAYOUT])?;
             tree.set_leaf(&mut txn, 0, &Leaf::SENTINEL, None)?;
             tree.keys.put(
                 &mut txn,
@@ -538,8 +570,64 @@ impl StateTree {
             )?;
             tree.meta.put(&mut txn, SIZE_KEY, &1u64.to_be_bytes())?;
         }
+        match tree.meta.get(&txn, LAYOUT_KEY)? {
+            Some([LAYOUT]) => {}
+            None => tree.migrate(&mut txn)?,
+            Some(_) => return Err(Error::Corrupt),
+        }
         txn.commit()?;
         Ok(tree)
+    }
+
+    /// Converts a layout-1 tree: rewrites its leaves (and their history)
+    /// without the next key and drops the node levels no longer stored,
+    /// with their history.
+    fn migrate(&self, txn: &mut RwTxn) -> Result<(), Error> {
+        let old: Vec<(Vec<u8>, Vec<u8>)> = self
+            .leaves
+            .iter(txn)?
+            .map(|e| e.map(|(k, v)| (k.to_vec(), v.to_vec())))
+            .collect::<Result<_, _>>()?;
+        for (k, v) in old {
+            self.leaves
+                .put(txn, &k, &encode_stored(&decode_leaf(&v)?))?;
+        }
+        let old: Vec<(Vec<u8>, Vec<u8>)> = self
+            .history
+            .iter(txn)?
+            .map(|e| e.map(|(k, v)| (k.to_vec(), v.to_vec())))
+            .collect::<Result<_, _>>()?;
+        for (k, v) in old {
+            match k[0] as usize {
+                0 if !v.is_empty() => {
+                    self.history
+                        .put(txn, &k, &encode_stored(&decode_leaf(&v)?))?
+                }
+                0 => {}
+                d if !is_stored(d) => {
+                    self.history.delete(txn, &k)?;
+                }
+                _ => {}
+            }
+        }
+        for (db, at) in [(self.nodes, 0), (self.changes, 8)] {
+            let dropped: Vec<Vec<u8>> = db
+                .iter(txn)?
+                .filter_map(|e| match e {
+                    Ok((k, _)) if k.len() > at && !is_stored(k[at] as usize) => {
+                        // Leaf history (level 0) stays in `state_changes`.
+                        (at == 0 || k[at] != 0).then(|| Ok(k.to_vec()))
+                    }
+                    Ok(_) => None,
+                    Err(e) => Some(Err(e)),
+                })
+                .collect::<Result<_, _>>()?;
+            for k in dropped {
+                db.delete(txn, &k)?;
+            }
+        }
+        self.meta.put(txn, LAYOUT_KEY, &[LAYOUT])?;
+        Ok(())
     }
 
     pub fn state(&self, txn: &RoTxn) -> Result<State, Error> {
@@ -573,7 +661,7 @@ impl StateTree {
             return Ok(None);
         }
         match self.leaves.get(txn, &index.to_be_bytes())? {
-            Some(bytes) => Ok(Some(Commitment(hash::to_bytes(&decode_leaf(bytes)?.key)))),
+            Some(bytes) => Ok(Some(Commitment(hash::to_bytes(&stored_key(bytes)?)))),
             None => Ok(None),
         }
     }
@@ -588,12 +676,12 @@ impl StateTree {
             if index == 0 {
                 continue;
             }
-            let leaf = decode_leaf(v)?;
+            let (key, nonce, _) = decode_stored(v)?;
             out.push((
                 index,
                 OutputRecord {
-                    commitment: Commitment(hash::to_bytes(&leaf.key)),
-                    nonce: leaf.nonce,
+                    commitment: Commitment(hash::to_bytes(&key)),
+                    nonce,
                 },
             ));
         }
@@ -629,15 +717,20 @@ impl StateTree {
             next_index: index,
             ..low.leaf
         };
-        self.set_leaf(txn, low_index, &relinked, at)?;
-        let new_siblings = self.siblings(txn, index)?;
         let leaf = Leaf {
             key,
             nonce: record.nonce,
             next_key: low.leaf.next_key,
             next_index: low.leaf.next_index,
         };
-        self.set_leaf(txn, index, &leaf, at)?;
+        // A stored leaf's next key is read from the next slot, so the
+        // relinked low leaf needs the new one in place. Slot `index`'s
+        // siblings don't depend on what it holds: they're as they were
+        // between the two changes.
+        self.put_leaf(txn, index, Some(&leaf), at)?;
+        self.put_leaf(txn, low_index, Some(&relinked), at)?;
+        self.flush(txn, &[low_index, index], at)?;
+        let new_siblings = self.siblings(txn, index)?;
         self.keys.put(txn, &k, &index.to_be_bytes())?;
         self.meta.put(txn, SIZE_KEY, &(index + 1).to_be_bytes())?;
         Ok(InsertProof { low, new_siblings })
@@ -671,7 +764,8 @@ impl StateTree {
         };
         self.set_leaf(txn, pred_index, &relinked, at)?;
         let leaf = self.witness(txn, index)?;
-        self.clear_leaf(txn, index, at)?;
+        self.put_leaf(txn, index, None, at)?;
+        self.flush(txn, &[index], at)?;
         self.keys.delete(txn, &k)?;
         Ok(RemoveProof { pred, leaf })
     }
@@ -688,17 +782,224 @@ impl StateTree {
         self.apply_at(txn, None, created, spent)
     }
 
-    /// [`StateTree::apply_changes`] for the block at `height`, recording
-    /// each changed node's value before it, so the tree as it was before
-    /// the block can still be served.
+    /// The changes of [`StateTree::apply_changes`] for the block at
+    /// `height`, recording each changed node's value before it, so the tree
+    /// as it was before the block can still be served. Returns what undoes
+    /// them.
+    ///
+    /// Checking a block needs only the result, not each step's witnesses,
+    /// so the leaves change first and the nodes above them are rehashed
+    /// once each at the end ([`StateTree::flush`]), not once per change:
+    /// a block's new outputs sit side by side and share their paths.
     pub fn apply_block(
         &self,
         txn: &mut RwTxn,
         height: u64,
         created: &[OutputRecord],
         spent: &[Commitment],
-    ) -> Result<ChangeProofs, Error> {
-        self.apply_at(txn, Some(height), created, spent)
+    ) -> Result<Undo, Error> {
+        let size = self.size(txn)?;
+        let at = Some(height);
+        let mut b = Batch::default();
+        for o in created {
+            self.insert_staged(txn, o, at, &mut b)?;
+        }
+        for c in spent {
+            self.remove_staged(txn, c, at, &mut b)?;
+        }
+        let slots: Vec<u64> = b.undo.iter().map(|&(i, _)| i).collect();
+        self.flush(txn, &slots, at)?;
+        Ok(Undo {
+            size,
+            slots: b.undo,
+        })
+    }
+
+    /// [`StateTree::insert_at`] with the leaves staged in `b`.
+    fn insert_staged(
+        &self,
+        txn: &mut RwTxn,
+        record: &OutputRecord,
+        at: Option<u64>,
+        b: &mut Batch,
+    ) -> Result<(), Error> {
+        let key = key_of(&record.commitment)?;
+        let k = sort_key(&key);
+        if self.keys.get(txn, &k)?.is_some() {
+            return Err(StateError::Duplicate.into());
+        }
+        let index = self.size(txn)?;
+        if index >= CAPACITY {
+            return Err(StateError::Full.into());
+        }
+        let low_index = self.predecessor(txn, &k)?;
+        let low = self.leaf(txn, low_index)?;
+        let relinked = Leaf {
+            next_key: key,
+            next_index: index,
+            ..low
+        };
+        self.stage(txn, low_index, Some(&relinked), at, b)?;
+        let leaf = Leaf {
+            key,
+            nonce: record.nonce,
+            next_key: low.next_key,
+            next_index: low.next_index,
+        };
+        self.stage(txn, index, Some(&leaf), at, b)?;
+        self.keys.put(txn, &k, &index.to_be_bytes())?;
+        self.meta.put(txn, SIZE_KEY, &(index + 1).to_be_bytes())?;
+        Ok(())
+    }
+
+    /// [`StateTree::remove_at`] with the leaves staged in `b`.
+    fn remove_staged(
+        &self,
+        txn: &mut RwTxn,
+        commitment: &Commitment,
+        at: Option<u64>,
+        b: &mut Batch,
+    ) -> Result<(), Error> {
+        let key = key_of(commitment)?;
+        let k = sort_key(&key);
+        let index = match self.keys.get(txn, &k)? {
+            Some(bytes) => decode_u64(bytes)?,
+            None => return Err(StateError::NotFound.into()),
+        };
+        let pred_index = self.predecessor(txn, &k)?;
+        let pred = self.leaf(txn, pred_index)?;
+        let removed = self.leaf(txn, index)?;
+        let relinked = Leaf {
+            next_key: removed.next_key,
+            next_index: removed.next_index,
+            ..pred
+        };
+        self.stage(txn, pred_index, Some(&relinked), at, b)?;
+        self.stage(txn, index, None, at, b)?;
+        self.keys.delete(txn, &k)?;
+        Ok(())
+    }
+
+    /// Writes (or empties) slot `index`'s leaf without rehashing above it,
+    /// noting in `b` what it held first and recording history for the block
+    /// at `at`, if given.
+    fn stage(
+        &self,
+        txn: &mut RwTxn,
+        index: u64,
+        leaf: Option<&Leaf>,
+        at: Option<u64>,
+        b: &mut Batch,
+    ) -> Result<(), Error> {
+        if b.seen.insert(index) {
+            let old = match self.leaves.get(txn, &index.to_be_bytes())? {
+                Some(_) => Some(self.leaf(txn, index)?),
+                None => None,
+            };
+            b.undo.push((index, old));
+        }
+        self.put_leaf(txn, index, leaf, at)
+    }
+
+    /// Writes (or empties) slot `index`'s leaf alone, recording history
+    /// for the block at `at`, if given; [`StateTree::flush`] rehashes.
+    fn put_leaf(
+        &self,
+        txn: &mut RwTxn,
+        index: u64,
+        leaf: Option<&Leaf>,
+        at: Option<u64>,
+    ) -> Result<(), Error> {
+        self.journal_leaf(txn, index, at)?;
+        match leaf {
+            Some(leaf) => self
+                .leaves
+                .put(txn, &index.to_be_bytes(), &encode_stored(leaf))?,
+            None => {
+                self.leaves.delete(txn, &index.to_be_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rehashes the stored nodes above `slots` (whose leaves changed),
+    /// a stored level at a time, each node once (hashing in parallel),
+    /// recording history for the block at `at`, if given. Each comes from
+    /// the [`GROUP`] nodes (or leaves) under it one stored level down.
+    fn flush(&self, txn: &mut RwTxn, slots: &[u64], at: Option<u64>) -> Result<(), Error> {
+        let mut level = slots.to_vec();
+        level.sort_unstable();
+        level.dedup();
+        for top in (STRIDE..=DEPTH).step_by(STRIDE) {
+            let base = top - STRIDE;
+            level = level.iter().map(|j| j >> STRIDE).collect();
+            level.dedup();
+            let hashes = if base == 0 {
+                let leaves = level
+                    .iter()
+                    .map(|&t| self.group_leaves(txn, t))
+                    .collect::<Result<Vec<_>, Error>>()?;
+                crate::par::par_map(level.len(), 16, |n| {
+                    fold(&leaves[n].map(|l| l.map_or(EMPTY_LEAF, |l| l.hash())), 0)
+                })
+            } else {
+                let nodes = level
+                    .iter()
+                    .map(|&t| self.group_nodes(txn, base, t))
+                    .collect::<Result<Vec<_>, Error>>()?;
+                crate::par::par_map(level.len(), 64, |n| fold(&nodes[n], base))
+            };
+            for (&j, hash) in level.iter().zip(&hashes) {
+                let key = node_key(top, j);
+                if let Some(height) = at {
+                    let old = self
+                        .nodes
+                        .get(txn, &key)?
+                        .map(<[u8]>::to_vec)
+                        .unwrap_or_default();
+                    self.journal(txn, top, j, height, &old)?;
+                }
+                if *hash == empty_hashes()[top] {
+                    self.nodes.delete(txn, &key)?;
+                } else {
+                    self.nodes.put(txn, &key, &hash::to_bytes(hash))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The leaves in the [`GROUP`] slots under stored node (`STRIDE`, `t`).
+    fn group_leaves(&self, txn: &RoTxn, t: u64) -> Result<[Option<Leaf>; GROUP], Error> {
+        let mut out = [None; GROUP];
+        let (lo, hi) = (
+            (t << STRIDE).to_be_bytes(),
+            ((t + 1) << STRIDE).to_be_bytes(),
+        );
+        let range = (Bound::Included(&lo[..]), Bound::Excluded(&hi[..]));
+        for entry in self.leaves.range(txn, &range)? {
+            let (k, v) = entry?;
+            let index = decode_u64(k)?;
+            out[(index - (t << STRIDE)) as usize] = Some(self.with_next_key(txn, v)?);
+        }
+        Ok(out)
+    }
+
+    /// The hashes of the [`GROUP`] stored nodes at level `base` under node
+    /// (`base + STRIDE`, `t`).
+    fn group_nodes(&self, txn: &RoTxn, base: usize, t: u64) -> Result<[Hash; GROUP], Error> {
+        let mut out = [empty_hashes()[base]; GROUP];
+        let (lo, hi) = (
+            node_key(base, t << STRIDE),
+            node_key(base, (t + 1) << STRIDE),
+        );
+        let range = (Bound::Included(&lo[..]), Bound::Excluded(&hi[..]));
+        for entry in self.nodes.range(txn, &range)? {
+            let (k, v) = entry?;
+            let index = decode_u64(&k[1..])?;
+            out[(index - (t << STRIDE)) as usize] = decode_hash(v)?;
+        }
+        Ok(out)
     }
 
     fn apply_at(
@@ -725,20 +1026,19 @@ impl StateTree {
     pub fn revert(&self, txn: &mut RwTxn, undo: &Undo) -> Result<(), Error> {
         for &(index, _) in &undo.slots {
             if let Some(bytes) = self.leaves.get(txn, &index.to_be_bytes())? {
-                let current = decode_leaf(bytes)?;
-                self.keys.delete(txn, &sort_key(&current.key))?;
+                let current = stored_key(bytes)?;
+                self.keys.delete(txn, &sort_key(&current))?;
             }
         }
         for (index, old) in &undo.slots {
-            match old {
-                Some(leaf) => {
-                    self.set_leaf(txn, *index, leaf, None)?;
-                    self.keys
-                        .put(txn, &sort_key(&leaf.key), &index.to_be_bytes())?;
-                }
-                None => self.clear_leaf(txn, *index, None)?,
+            self.put_leaf(txn, *index, old.as_ref(), None)?;
+            if let Some(leaf) = old {
+                self.keys
+                    .put(txn, &sort_key(&leaf.key), &index.to_be_bytes())?;
             }
         }
+        let slots: Vec<u64> = undo.slots.iter().map(|&(i, _)| i).collect();
+        self.flush(txn, &slots, None)?;
         self.meta.put(txn, SIZE_KEY, &undo.size.to_be_bytes())?;
         Ok(())
     }
@@ -839,17 +1139,34 @@ impl StateTree {
             .map(|(_, v)| v.to_vec()))
     }
 
-    /// Slot `index`'s leaf as of height `height` (within the history).
-    fn leaf_at(&self, txn: &RoTxn, index: u64, height: u64) -> Result<Option<Leaf>, Error> {
-        match self.past(txn, 0, index, height)? {
-            Some(v) if v.is_empty() => Ok(None),
-            Some(v) => decode_leaf(&v).map(Some),
+    /// Slot `index`'s stored leaf as of height `height` (within the
+    /// history).
+    fn stored_at(&self, txn: &RoTxn, index: u64, height: u64) -> Result<Option<Vec<u8>>, Error> {
+        Ok(match self.past(txn, 0, index, height)? {
+            Some(v) if v.is_empty() => None,
+            Some(v) => Some(v),
             None => self
                 .leaves
                 .get(txn, &index.to_be_bytes())?
-                .map(decode_leaf)
-                .transpose(),
-        }
+                .map(<[u8]>::to_vec),
+        })
+    }
+
+    /// Slot `index`'s leaf as of height `height` (within the history).
+    fn leaf_at(&self, txn: &RoTxn, index: u64, height: u64) -> Result<Option<Leaf>, Error> {
+        let Some(v) = self.stored_at(txn, index, height)? else {
+            return Ok(None);
+        };
+        let (key, nonce, next_index) = decode_stored(&v)?;
+        let next = self
+            .stored_at(txn, next_index, height)?
+            .ok_or(Error::Corrupt)?;
+        Ok(Some(Leaf {
+            key,
+            nonce,
+            next_key: stored_key(&next)?,
+            next_index,
+        }))
     }
 
     /// Node (`level`, `index`)'s hash as of height `height` (within the
@@ -859,6 +1176,12 @@ impl StateTree {
             return Ok(self
                 .leaf_at(txn, index, height)?
                 .map_or(EMPTY_LEAF, |l| l.hash()));
+        }
+        if !is_stored(level) {
+            return Ok(merge(
+                &self.node_at(txn, level - 1, 2 * index, height)?,
+                &self.node_at(txn, level - 1, 2 * index + 1, height)?,
+            ));
         }
         match self.past(txn, level, index, height)? {
             Some(v) if v.is_empty() => Ok(empty_hashes()[level]),
@@ -1093,7 +1416,7 @@ impl StateTree {
                     return Err(Error::Corrupt);
                 }
                 let leaf = decode_leaf(v)?;
-                self.leaves.put(txn, k, v)?;
+                self.leaves.put(txn, k, &encode_stored(&leaf))?;
                 self.keys.put(txn, &sort_key(&leaf.key), k)?;
                 self.build(txn, &mut pending, 0, index, leaf.hash())?;
             }
@@ -1127,7 +1450,7 @@ impl StateTree {
         j: u64,
         h: Hash,
     ) -> Result<(), Error> {
-        if h != empty_hashes()[d] {
+        if is_stored(d) && h != empty_hashes()[d] {
             self.nodes.put(txn, &node_key(d, j), &hash::to_bytes(&h))?;
         }
         if d == DEPTH {
@@ -1158,9 +1481,23 @@ impl StateTree {
         }
     }
 
+    /// Slot `index`'s leaf, which must be occupied.
     fn leaf(&self, txn: &RoTxn, index: u64) -> Result<Leaf, Error> {
         let bytes = self.leaves.get(txn, &index.to_be_bytes())?;
-        decode_leaf(bytes.ok_or(Error::Corrupt)?)
+        self.with_next_key(txn, bytes.ok_or(Error::Corrupt)?)
+    }
+
+    /// The leaf stored as `bytes`, with its next key: the key in the slot
+    /// it links to (the sentinel's, zero, at the end of the list).
+    fn with_next_key(&self, txn: &RoTxn, bytes: &[u8]) -> Result<Leaf, Error> {
+        let (key, nonce, next_index) = decode_stored(bytes)?;
+        let next = self.leaves.get(txn, &next_index.to_be_bytes())?;
+        Ok(Leaf {
+            key,
+            nonce,
+            next_key: stored_key(next.ok_or(Error::Corrupt)?)?,
+            next_index,
+        })
     }
 
     pub(crate) fn witness(&self, txn: &RoTxn, index: u64) -> Result<LeafWitness, Error> {
@@ -1171,15 +1508,45 @@ impl StateTree {
         })
     }
 
+    /// Slot `index`'s Merkle path: a stored level at a time, from the
+    /// [`GROUP`] nodes (or leaves) under the stored node above.
     fn siblings(&self, txn: &RoTxn, index: u64) -> Result<Box<Siblings>, Error> {
         let mut siblings = Box::new([EMPTY_LEAF; DEPTH]);
-        for (d, s) in siblings.iter_mut().enumerate() {
-            *s = self.node(txn, d, (index >> d) ^ 1)?;
+        for top in (STRIDE..=DEPTH).step_by(STRIDE) {
+            let base = top - STRIDE;
+            let t = index >> top;
+            let mut level = if base == 0 {
+                self.group_leaves(txn, t)?
+                    .map(|l| l.map_or(EMPTY_LEAF, |l| l.hash()))
+            } else {
+                self.group_nodes(txn, base, t)?
+            }
+            .to_vec();
+            let mut at = (index >> base) as usize % GROUP;
+            for s in &mut siblings[base..top] {
+                *s = level[at ^ 1];
+                level = level.chunks_exact(2).map(|p| merge(&p[0], &p[1])).collect();
+                at >>= 1;
+            }
         }
         Ok(siblings)
     }
 
+    /// Node (`level`, `index`)'s hash: stored, or hashed from the stored
+    /// level below.
     fn node(&self, txn: &RoTxn, level: usize, index: u64) -> Result<Hash, Error> {
+        if level == 0 {
+            return Ok(match self.leaves.get(txn, &index.to_be_bytes())? {
+                Some(bytes) => self.with_next_key(txn, bytes)?.hash(),
+                None => EMPTY_LEAF,
+            });
+        }
+        if !is_stored(level) {
+            return Ok(merge(
+                &self.node(txn, level - 1, 2 * index)?,
+                &self.node(txn, level - 1, 2 * index + 1)?,
+            ));
+        }
         match self.nodes.get(txn, &node_key(level, index))? {
             Some(bytes) => decode_hash(bytes),
             None => Ok(empty_hashes()[level]),
@@ -1195,17 +1562,8 @@ impl StateTree {
         leaf: &Leaf,
         at: Option<u64>,
     ) -> Result<(), Error> {
-        self.journal_leaf(txn, index, at)?;
-        self.leaves
-            .put(txn, &index.to_be_bytes(), &encode_leaf(leaf))?;
-        self.set_path(txn, index, leaf.hash(), at)
-    }
-
-    /// Empties slot `index` and rehashes its path (as [`Self::set_leaf`]).
-    fn clear_leaf(&self, txn: &mut RwTxn, index: u64, at: Option<u64>) -> Result<(), Error> {
-        self.journal_leaf(txn, index, at)?;
-        self.leaves.delete(txn, &index.to_be_bytes())?;
-        self.set_path(txn, index, EMPTY_LEAF, at)
+        self.put_leaf(txn, index, Some(leaf), at)?;
+        self.flush(txn, &[index], at)
     }
 
     fn journal_leaf(&self, txn: &mut RwTxn, index: u64, at: Option<u64>) -> Result<(), Error> {
@@ -1216,42 +1574,6 @@ impl StateTree {
                 .map(<[u8]>::to_vec)
                 .unwrap_or_default();
             self.journal(txn, 0, index, height, &old)?;
-        }
-        Ok(())
-    }
-
-    /// Sets the leaf hash at `index` and recomputes the nodes above it,
-    /// storing only nodes of non-empty subtrees (and recording history for
-    /// the block at `at`; level 0's is the leaf's).
-    fn set_path(
-        &self,
-        txn: &mut RwTxn,
-        index: u64,
-        leaf_hash: Hash,
-        at: Option<u64>,
-    ) -> Result<(), Error> {
-        let mut hash = leaf_hash;
-        for d in 0..=DEPTH {
-            let j = index >> d;
-            let key = node_key(d, j);
-            if let Some(height) = at
-                && d > 0
-            {
-                let old = self
-                    .nodes
-                    .get(txn, &key)?
-                    .map(<[u8]>::to_vec)
-                    .unwrap_or_default();
-                self.journal(txn, d, j, height, &old)?;
-            }
-            if hash == empty_hashes()[d] {
-                self.nodes.delete(txn, &key)?;
-            } else {
-                self.nodes.put(txn, &key, &hash::to_bytes(&hash))?;
-            }
-            if d < DEPTH {
-                hash = merge(&self.node(txn, d, j & !1)?, &self.node(txn, d, j | 1)?);
-            }
         }
         Ok(())
     }
@@ -1281,6 +1603,35 @@ fn decode_leaf(bytes: &[u8]) -> Result<Leaf, Error> {
         next_key: decode_hash(&bytes[at..at + HASH_BYTES])?,
         next_index: decode_u64(&bytes[at + HASH_BYTES..])?,
     })
+}
+
+/// Bytes in a stored leaf: key, nonce, next index (no next key).
+const STORED_LEAF_BYTES: usize = HASH_BYTES + NONCE_LEN + 8;
+
+fn encode_stored(leaf: &Leaf) -> [u8; STORED_LEAF_BYTES] {
+    let mut out = [0u8; STORED_LEAF_BYTES];
+    out[..HASH_BYTES].copy_from_slice(&hash::to_bytes(&leaf.key));
+    out[HASH_BYTES..HASH_BYTES + NONCE_LEN].copy_from_slice(&leaf.nonce);
+    out[HASH_BYTES + NONCE_LEN..].copy_from_slice(&leaf.next_index.to_be_bytes());
+    out
+}
+
+/// A stored leaf's key, nonce and next index.
+fn decode_stored(bytes: &[u8]) -> Result<(Hash, Nonce, u64), Error> {
+    if bytes.len() != STORED_LEAF_BYTES {
+        return Err(Error::Corrupt);
+    }
+    let at = HASH_BYTES + NONCE_LEN;
+    Ok((
+        stored_key(bytes)?,
+        bytes[HASH_BYTES..at].try_into().expect("nonce bytes"),
+        decode_u64(&bytes[at..])?,
+    ))
+}
+
+/// A stored leaf's key.
+fn stored_key(bytes: &[u8]) -> Result<Hash, Error> {
+    decode_hash(bytes.get(..HASH_BYTES).ok_or(Error::Corrupt)?)
 }
 
 fn decode_hash(bytes: &[u8]) -> Result<Hash, Error> {
@@ -1386,6 +1737,172 @@ mod tests {
     use super::*;
     use crate::db::test::TempEnv;
 
+    /// A block applied in one batch gives the same tree, and the same undo,
+    /// as applied change by change; and reverting it gives back the tree.
+    #[test]
+    fn batched_blocks_match_change_by_change() {
+        let (a, b) = (TempEnv::new(), TempEnv::new());
+        let (ta, tb) = (
+            StateTree::open(a.env()).unwrap(),
+            StateTree::open(b.env()).unwrap(),
+        );
+        let (mut xa, mut xb) = (a.env().write_txn().unwrap(), b.env().write_txn().unwrap());
+        // Outputs land in order and are spent out of order, so the chain
+        // links run back and forth across the tree.
+        let blocks: [(Vec<u32>, Vec<u32>); 4] = [
+            ((0..300).map(|n| n * 7919 % 1000).collect(), vec![]),
+            (
+                (1000..1200).collect(),
+                (0..300).step_by(3).map(|n| n * 7919 % 1000).collect(),
+            ),
+            (vec![5000], vec![1000, 1199, 1100]),
+            ((2000..2600).collect(), (1001..1099).collect()),
+        ];
+        for (h, (created, spent)) in (1..).zip(&blocks) {
+            let created: Vec<_> = created.iter().map(|&n| record(n)).collect();
+            let spent: Vec<_> = spent.iter().map(|&n| commitment(n)).collect();
+            let before = ta.state(&xa).unwrap();
+            let undo = ta.apply_block(&mut xa, h, &created, &spent).unwrap();
+            let proofs = tb.apply_changes(&mut xb, &created, &spent).unwrap();
+            assert_eq!(ta.state(&xa).unwrap(), tb.state(&xb).unwrap(), "block {h}");
+            assert_eq!(undo, proofs.undo(before.size), "block {h}");
+            if h == 4 {
+                ta.revert_block(&mut xa, h, &undo).unwrap();
+                assert_eq!(ta.state(&xa).unwrap(), before);
+                ta.apply_block(&mut xa, h, &created, &spent).unwrap();
+                assert_eq!(ta.state(&xa).unwrap(), tb.state(&xb).unwrap());
+            }
+        }
+    }
+
+    /// A full block's worth of outputs (31,000) into a tree of 70,000,
+    /// with history, as a node applies a 2 MB block. Prints the time.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_full_block_apply() {
+        let env = TempEnv::new();
+        let tree = StateTree::open(env.env()).unwrap();
+        let mut txn = env.env().write_txn().unwrap();
+        let old: Vec<_> = (0..70_000).map(record).collect();
+        tree.apply_block(&mut txn, 1, &old, &[]).unwrap();
+        txn.commit().unwrap();
+        let new: Vec<_> = (70_000..101_000).map(record).collect();
+        let t = std::time::Instant::now();
+        let mut txn = env.env().write_txn().unwrap();
+        tree.apply_block(&mut txn, 2, &new, &[]).unwrap();
+        let applied = t.elapsed();
+        txn.commit().unwrap();
+        eprintln!("apply {applied:.2?}, with commit {:.2?}", t.elapsed());
+        // Change by change, as the prover applies them for its witnesses.
+        let more: Vec<_> = (101_000..132_000).map(record).collect();
+        let t = std::time::Instant::now();
+        let mut txn = env.env().write_txn().unwrap();
+        tree.apply_changes(&mut txn, &more, &[]).unwrap();
+        eprintln!("change by change {:.2?}", t.elapsed());
+        txn.abort();
+    }
+
+    /// Bytes on disk per live output, dense (nothing spent) and after
+    /// churn (most outputs spent, the live ones scattered). Prints them.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_storage_per_output() {
+        fn bytes(tree: &StateTree, txn: &RoTxn) -> [(&'static str, usize); 5] {
+            let size = |db: &Database<Bytes, Bytes>| {
+                let s = db.stat(txn).unwrap();
+                (s.branch_pages + s.leaf_pages + s.overflow_pages) * s.page_size as usize
+            };
+            [
+                ("leaves", size(&tree.leaves)),
+                ("nodes", size(&tree.nodes)),
+                ("keys", size(&tree.keys)),
+                ("history", size(&tree.history)),
+                ("changes", size(&tree.changes)),
+            ]
+        }
+        fn report(label: &str, live: usize, b: &[(&str, usize)]) {
+            let parts: Vec<String> = b
+                .iter()
+                .map(|(n, v)| format!("{n} {:.1}", *v as f64 / live as f64))
+                .collect();
+            let tree: usize = b[..3].iter().map(|x| x.1).sum();
+            eprintln!(
+                "{label}: live {live}, tree {:.1} B/output ({}), {}",
+                tree as f64 / live as f64,
+                tree,
+                parts.join(", ")
+            );
+        }
+        const BLOCK: u32 = 27_500;
+        const BLOCKS: u32 = 100;
+        let mut env = TempEnv::new();
+        let tree = StateTree::open(env.env()).unwrap();
+        let mut live: Vec<u32> = Vec::new();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for h in 0..BLOCKS {
+            let created: Vec<_> = (h * BLOCK..(h + 1) * BLOCK).map(record).collect();
+            // Spend about as much as is created, once there's a backlog, so
+            // the live set stays near 3 blocks' worth and spreads out.
+            let spend = if live.len() > 3 * BLOCK as usize {
+                BLOCK as usize
+            } else {
+                0
+            };
+            let spent: Vec<_> = (0..spend)
+                .map(|_| commitment(live.swap_remove(rand(live.len()))))
+                .collect();
+            let mut txn = env.env().write_txn().unwrap();
+            tree.apply_block(&mut txn, h as u64 + 1, &created, &spent)
+                .unwrap();
+            if h == 0 {
+                let b = bytes(&tree, &txn);
+                report("one full block", BLOCK as usize, &b);
+            }
+            txn.commit().unwrap();
+            live.extend(h * BLOCK..(h + 1) * BLOCK);
+            if h + 1 == 4 {
+                let txn = env.env().read_txn().unwrap();
+                report(
+                    "dense, 4 blocks, history kept",
+                    live.len(),
+                    &bytes(&tree, &txn),
+                );
+            }
+        }
+        let txn = env.env().read_txn().unwrap();
+        let b = bytes(&tree, &txn);
+        report("churned, history of all blocks", live.len(), &b);
+        eprintln!(
+            "  history per block {:.1} MB, slots {}",
+            (b[3].1 + b[4].1) as f64 / BLOCKS as f64 / 1e6,
+            BLOCK * BLOCKS
+        );
+        drop(txn);
+        let mut txn = env.env().write_txn().unwrap();
+        tree.prune_history(&mut txn, BLOCKS as u64).unwrap();
+        txn.commit().unwrap();
+        let txn = env.env().read_txn().unwrap();
+        report("churned, pruned", live.len(), &bytes(&tree, &txn));
+        let state = tree.state(&txn).unwrap();
+        drop(txn);
+        env.env.take().unwrap().prepare_for_closing().wait();
+        let (before, after) = crate::db::compact(&env.path).unwrap();
+        eprintln!(
+            "churned, pruned, compacted: file {:.1} -> {:.1} B/output",
+            before as f64 / live.len() as f64,
+            after as f64 / live.len() as f64
+        );
+        env.reopen();
+        let tree = StateTree::open(env.env()).unwrap();
+        assert_eq!(tree.state(&env.env().read_txn().unwrap()).unwrap(), state);
+    }
+
     fn nonce(n: u32) -> Nonce {
         let mut nonce = [0u8; NONCE_LEN];
         nonce[..4].copy_from_slice(&n.to_le_bytes());
@@ -1448,7 +1965,7 @@ mod tests {
                         .leaves
                         .get(txn, &i.to_be_bytes())
                         .unwrap()
-                        .map(|b| decode_leaf(b).unwrap())
+                        .map(|_| self.tree.leaf(txn, i).unwrap())
                 })
                 .collect()
         }
@@ -1798,6 +2315,96 @@ mod tests {
         (env, copy, state)
     }
 
+    /// A tree in layout 1 (every node level stored, leaves with their
+    /// next key) is migrated when opened: same tree, same history.
+    #[test]
+    fn the_old_layout_is_migrated() {
+        let f = Fixture::new(0);
+        let mut txn = f.tmp.env().write_txn().unwrap();
+        f.tree.init_history(&mut txn, 0).unwrap();
+        let mut states = vec![f.tree.state(&txn).unwrap()];
+        for (h, (created, spent)) in [
+            ((1..=40).collect(), vec![]),
+            (vec![41, 42], vec![3, 17, 18]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let created: Vec<_> = created.into_iter().map(record).collect::<Vec<_>>();
+            let spent: Vec<_> = spent.into_iter().map(commitment).collect();
+            f.tree
+                .apply_block(&mut txn, h as u64 + 1, &created, &spent)
+                .unwrap();
+            states.push(f.tree.state(&txn).unwrap());
+        }
+        // Back to layout 1: whole leaves (and leaf history), every level's
+        // nodes, with some history at the levels no longer stored.
+        let size = states.last().unwrap().size;
+        let leaf_history: Vec<(Vec<u8>, Vec<u8>)> = f
+            .tree
+            .history
+            .iter(&txn)
+            .unwrap()
+            .map(|e| e.map(|(k, v)| (k.to_vec(), v.to_vec())).unwrap())
+            .filter(|(k, v)| k[0] == 0 && !v.is_empty())
+            .collect();
+        for (k, _) in leaf_history {
+            let index = decode_u64(&k[1..9]).unwrap();
+            let height = decode_u64(&k[9..]).unwrap();
+            let leaf = f.tree.leaf_at(&txn, index, height - 1).unwrap().unwrap();
+            f.tree
+                .history
+                .put(&mut txn, &k, &encode_leaf(&leaf))
+                .unwrap();
+        }
+        for d in (0..DEPTH).filter(|&d| !is_stored(d)) {
+            for j in 0..=(size - 1) >> d {
+                let h = f.tree.node(&txn, d, j).unwrap();
+                if h != empty_hashes()[d] {
+                    f.tree
+                        .nodes
+                        .put(&mut txn, &node_key(d, j), &hash::to_bytes(&h))
+                        .unwrap();
+                }
+            }
+            if d > 0 {
+                f.tree.journal(&mut txn, d, 0, 2, &[]).unwrap();
+            }
+        }
+        for i in 0..size {
+            if f.tree.leaves.get(&txn, &i.to_be_bytes()).unwrap().is_some() {
+                let leaf = f.tree.leaf(&txn, i).unwrap();
+                f.tree
+                    .leaves
+                    .put(&mut txn, &i.to_be_bytes(), &encode_leaf(&leaf))
+                    .unwrap();
+            }
+        }
+        f.tree.meta.delete(&mut txn, LAYOUT_KEY).unwrap();
+        txn.commit().unwrap();
+
+        let tree = StateTree::open(f.tmp.env()).unwrap();
+        let txn = f.tmp.env().read_txn().unwrap();
+        for e in tree.nodes.iter(&txn).unwrap() {
+            assert!(is_stored(e.unwrap().0[0] as usize));
+        }
+        for e in tree.history.iter(&txn).unwrap() {
+            let (k, v) = e.unwrap();
+            assert!(k[0] == 0 || is_stored(k[0] as usize));
+            assert!(k[0] != 0 || v.is_empty() || v.len() == STORED_LEAF_BYTES);
+        }
+        for e in tree.changes.iter(&txn).unwrap() {
+            let k = e.unwrap().0;
+            assert!(k[8] == 0 || is_stored(k[8] as usize));
+        }
+        assert_eq!(tree.state(&txn).unwrap(), *states.last().unwrap());
+        drop(txn);
+        for (h, state) in states.iter().enumerate() {
+            let (_env, _copy, got) = download(&f, h as u64, &state.root, state.size);
+            assert_eq!(got, *state, "height {h}");
+        }
+    }
+
     #[test]
     fn past_trees_are_served_and_download_into_copies() {
         let f = Fixture::new(0);
@@ -1814,9 +2421,8 @@ mod tests {
         for (h, (created, spent)) in (1..).zip(&blocks) {
             let created: Vec<_> = created.iter().map(|&n| record(n)).collect();
             let spent: Vec<_> = spent.iter().map(|&n| commitment(n)).collect();
-            let size = f.tree.state(&txn).unwrap().size;
-            let proofs = f.tree.apply_block(&mut txn, h, &created, &spent).unwrap();
-            undos.push(proofs.undo(size));
+            let undo = f.tree.apply_block(&mut txn, h, &created, &spent).unwrap();
+            undos.push(undo);
             states.push(f.tree.state(&txn).unwrap());
         }
         txn.commit().unwrap();

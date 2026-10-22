@@ -151,6 +151,12 @@ impl Verifier for Chain {
     }
 }
 
+impl Verifier for crate::chain::NoProofs {
+    fn verify_block(&self, header: &Header, block: &Block, _: u128) -> Result<(), BlockError> {
+        crate::chain::check_body(header, block)
+    }
+}
+
 impl Verifier for ChainVerifier {
     fn verify_block(
         &self,
@@ -179,12 +185,22 @@ pub struct Ledger {
     pub consensus: Consensus,
     pub verifier: Arc<dyn Verifier>,
     /// Blocks below the tip whose state is kept to serve fast-syncing
-    /// nodes.
+    /// nodes, and the deepest reorg followed (undo data is kept for them).
     pub snap_sync_limit: u64,
+    /// Blocks below the tip whose bodies are kept (at least
+    /// `snap_sync_limit`), for peers catching up and the wallet; 0 keeps
+    /// every block.
+    pub keep_blocks: u64,
 }
 
-/// Blocks of state history kept by default.
-pub const DEFAULT_SNAP_SYNC_LIMIT: u64 = 1000;
+/// Blocks of state history kept by default: a fast-syncing node downloads
+/// the state [`crate::args::DEFAULT_SYNC_DEPTH`] (100) blocks down, and
+/// the rest is its time to finish while the chain moves on (about 16 hours).
+pub const DEFAULT_SNAP_SYNC_LIMIT: u64 = 200;
+
+/// Blocks kept by default: about a week, so a node offline that long
+/// catches up from peers' blocks.
+pub const DEFAULT_KEEP_BLOCKS: u64 = 1000;
 
 /// The tag of a state download: the base's height and hash.
 fn sync_tag(base: &Header) -> Vec<u8> {
@@ -238,7 +254,13 @@ impl Ledger {
     pub fn check_fork(&self, txn: &heed::RoTxn, parent: &Header) -> Result<(), LedgerError> {
         let tip = self.store.tip(txn)?.ok_or(store::Error::Corrupt)?;
         let base = self.store.base(txn)?;
-        let floor = tip.height.saturating_sub(self.snap_sync_limit).max(base);
+        // Undo data below `undo_from` is gone (the tip may have come down
+        // since it was pruned).
+        let floor = tip
+            .height
+            .saturating_sub(self.snap_sync_limit)
+            .max(base)
+            .max(self.store.undo_from(txn)?);
         let mut h = *parent;
         loop {
             if self.store.height_of(txn, &h.hash())?.is_some() {
@@ -573,6 +595,15 @@ impl Ledger {
             self.tree
                 .prune_history(txn, h.height.saturating_sub(self.snap_sync_limit))
                 .map_err(|e| fail(e.into()))?;
+            self.store
+                .prune_undo(txn, h.height.saturating_sub(self.snap_sync_limit))
+                .map_err(|e| fail(e.into()))?;
+            if self.keep_blocks != 0 {
+                let keep = self.keep_blocks.max(self.snap_sync_limit);
+                self.store
+                    .prune_bodies(txn, h.height.saturating_sub(keep))
+                    .map_err(|e| fail(e.into()))?;
+            }
         }
         Ok(if reverted == 0 && branch.len() == 1 {
             Added::Extended
@@ -612,19 +643,7 @@ pub(crate) mod tests {
 
     /// The smallest well-formed proof encoding.
     pub(crate) fn tiny_proof() -> StarkProof {
-        let mut e = vec![BabyBear::new(3)];
-        e.extend([BabyBear::ONE; HASH_LEN]);
-        e.push(BabyBear::ZERO);
-        e.extend([BabyBear::ONE; HASH_LEN]);
-        e.extend([BabyBear::ZERO; 7]);
-        e.extend([
-            BabyBear::ZERO,
-            BabyBear::ZERO,
-            BabyBear::ONE,
-            BabyBear::ZERO,
-            BabyBear::ZERO,
-        ]);
-        StarkProof::from_elements(&e).unwrap()
+        crate::block::no_proof()
     }
 
     fn record(n: u32) -> OutputRecord {
@@ -717,6 +736,7 @@ pub(crate) mod tests {
             },
             verifier: Arc::new(BodyOnly),
             snap_sync_limit,
+            keep_blocks: snap_sync_limit,
         };
         l.start_history().unwrap();
         l
@@ -842,6 +862,61 @@ pub(crate) mod tests {
         l.add(&h, &b).unwrap();
         let o3 = ok.next(&[32], &[]);
         assert!(matches!(l.add(&o3.0, &o3.1), Err(LedgerError::TooDeep)));
+    }
+
+    /// Bodies older than `keep_blocks` and undo data older than the
+    /// reorg limit are deleted as the chain grows; headers stay, and
+    /// reorgs within the limit still work.
+    #[test]
+    fn old_blocks_and_undo_data_are_pruned() {
+        let genesis = Header {
+            timestamp: now() - 1_000_000,
+            state: crate::state::empty_state(),
+            ..Header::default()
+        };
+        let env = TempEnv::new();
+        let mut l = ledger_keeping(&env, &genesis, 2);
+        l.keep_blocks = 4;
+        let mut a = Branch::new(genesis);
+        for n in 1..=8 {
+            let (h, b) = a.next(&[n], &[]);
+            l.add(&h, &b).unwrap();
+        }
+        let mut txn = l.env.write_txn().unwrap();
+        for h in 1..=8u64 {
+            let hash = l.store.hash_at(&txn, h).unwrap().unwrap();
+            assert!(l.store.header(&txn, h).unwrap().is_some());
+            assert_eq!(
+                l.store.block(&txn, h).unwrap().is_some(),
+                h >= 4,
+                "body {h}"
+            );
+            assert_eq!(
+                l.store.take_undo(&mut txn, &hash).is_ok(),
+                h >= 6,
+                "undo {h}"
+            );
+        }
+        assert_eq!(l.store.bodies_from(&txn).unwrap(), 4);
+        assert_eq!(l.store.undo_from(&txn).unwrap(), 6);
+        txn.abort();
+        // A heavier branch from block 6 reverts 7 and 8 with their undo data.
+        let mut b = Branch::new(genesis);
+        for n in 1..=6 {
+            b.next(&[n], &[]);
+        }
+        let mut last = None;
+        for n in 60..63 {
+            let (h, blk) = b.next(&[n], &[]);
+            last = Some(l.add(&h, &blk).unwrap());
+        }
+        assert_eq!(
+            last,
+            Some(Added::Reorg {
+                reverted: 2,
+                applied: 3
+            })
+        );
     }
 
     #[test]
