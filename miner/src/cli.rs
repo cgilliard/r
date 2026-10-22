@@ -33,13 +33,13 @@ use crate::mempool::{Chainstate, Mempool, Refused};
 use crate::net::node::Event;
 use crate::output::{Amount, Output, format_coins, parse_coins};
 use crate::transaction::{
-    Input, MAX_KEY_DEPTH, PREIMAGE_LEN, SigMode, Signer, Spend, Transaction, TxBody, hashlock,
+    Condition, Input, MAX_KEY_DEPTH, PREIMAGE_LEN, SigMode, Signer, Spend, Transaction, TxBody,
+    hashlock,
 };
 use crate::wallet::{
     Coin, KEY_SEED_LEN, Leaves, Locked, Owned, Received, Response, Sent, SignerRecord, Slate,
-    SlateId, Wallet, WalletStore, conditions_from_text, hex, new_preimage, unhex,
+    SlateId, Wallet, WalletStore, conditions_from_text, hex, new_preimage, output_to_hex, unhex,
 };
-use crate::wots::{PublicKey, Signature};
 
 /// Inputs in one payment, at most (each adds about 2.3 KB).
 const MAX_INPUTS: usize = 32;
@@ -101,21 +101,29 @@ commands:
                                its key, for a condition's \"key\" line
   preimage                     a new hashlock preimage: prints its hash, for
                                a condition's \"hashlock\" line
+  payout <amount>              a new output of ours for <amount>: prints it,
+                               for a \"payout\" line after our key in a
+                               protected branch (one per state signed)
   lock <amount> <fee> <file>   pay <amount> to an output with the conditions
                                in <file> (one \"branch\" line each, then
-                               key, state, mode, after-height,
-                               after-blocks, hashlock lines); writes
-                               <file>.locked for the others involved
+                               key (up to 16, each optionally followed by
+                               a payout line: given for all, they protect
+                               the branch), threshold, state, mode,
+                               after-height, after-blocks, hashlock lines);
+                               writes <file>.locked for the others
   import <file>                watch an output locked by someone else
                                (a .locked file)
   locked                       the locked outputs we watch: their branches,
                                which keys are ours, their timelocks, and
                                preimages others' spends revealed
-  unlock <id> <branch> <fee> [<file>]
+  unlock <id> <branch> <fee> [<file>] [without=<m>,..]
                                spend a locked output (<id>: its first hex
                                digits) by its branch (from 1) to a new
                                output of ours; if others must sign, writes
-                               the transaction to <file> for them
+                               the transaction to <file> for them; in a
+                               protected branch, members (from 1) given
+                               with without= don't sign and get their
+                               payouts
   cosign <file>                sign a transaction from unlock where our
                                keys are needed; submits it once complete,
                                else writes <file>.cosigned
@@ -183,29 +191,49 @@ fn write_new(path: &str, text: &str) -> Result<(), String> {
         .map_err(|e| format!("couldn't write {path}: {e}"))
 }
 
-/// The signer standing in for one that hasn't signed yet: a zero key.
-fn placeholder_signer() -> Signer {
-    Signer {
-        pubkey: PublicKey {
-            param: [crate::babybear::BabyBear::ZERO; crate::wots::PARAM_LEN],
-            root: [crate::babybear::BabyBear::ZERO; crate::hash::HASH_LEN],
-        },
-        index: 0,
-        path: vec![],
-    }
+/// How many more signatures `tx`'s condition inputs need.
+fn missing_signatures(tx: &Transaction) -> usize {
+    tx.body
+        .inputs
+        .iter()
+        .filter_map(|i| match &i.spend {
+            Spend::Condition {
+                condition, signers, ..
+            } => Some(signing_members(condition, tx).saturating_sub(signers.len())),
+            Spend::Key { .. } => None,
+        })
+        .sum()
 }
 
-/// The signature standing in for a missing one: all zero.
-fn placeholder_signature() -> Signature {
-    Signature {
-        rand: [crate::babybear::BabyBear::ZERO; crate::wots::RAND_LEN],
-        chains: [[crate::babybear::BabyBear::ZERO; crate::hash::HASH_LEN]; crate::wots::NUM_CHAINS],
+/// How many of `condition`'s members are to sign in `tx`: its threshold,
+/// or if it's protected, every member whose payout `tx` doesn't pay.
+fn signing_members(condition: &Condition, tx: &Transaction) -> usize {
+    (0..condition.keys.len())
+        .filter(|&m| is_signing(condition, tx, m))
+        .count()
+        .min(if condition.payouts.is_some() {
+            usize::MAX
+        } else {
+            condition.threshold
+        })
+}
+
+/// Whether member `m` of `condition` is to sign in `tx`: unless it's
+/// protected and `tx` pays `m`'s payout.
+fn is_signing(condition: &Condition, tx: &Transaction, m: usize) -> bool {
+    if condition.payouts.is_none() {
+        return true;
     }
+    let payout = condition.payout(m);
+    !tx.body
+        .outputs
+        .iter()
+        .any(|o| o.commitment().and_then(|c| c.to_field()) == Some(payout))
 }
 
 const PARTIAL_HEADER: &str = "r partial transaction 1";
 
-/// A transaction still missing signatures, as a file.
+/// A transaction still missing signers, as a file.
 fn partial_text(tx: &Transaction) -> String {
     format!("{PARTIAL_HEADER}\ntx {}\n", hex(&tx.to_bytes()))
 }
@@ -300,6 +328,10 @@ impl Cli {
                 self.new_signer(depth)?
             }
             ["preimage"] => self.new_preimage()?,
+            ["payout", amount] => {
+                let amount = parse_coins(amount).filter(|&a| a > 0).ok_or("bad amount")?;
+                self.new_payout(amount)?
+            }
             ["lock", amount, fee, file] => {
                 let amount = parse_coins(amount).ok_or("bad amount")?;
                 let fee = parse_coins(fee).ok_or("bad fee")?;
@@ -307,10 +339,23 @@ impl Cli {
             }
             ["import", file] => self.import(file)?,
             ["locked"] => self.locked()?,
-            ["unlock", id, branch, fee, rest @ ..] if rest.len() <= 1 => {
+            ["unlock", id, branch, fee, rest @ ..] if rest.len() <= 2 => {
                 let branch: usize = branch.parse().map_err(|_| "bad branch")?;
                 let fee = parse_coins(fee).ok_or("bad fee")?;
-                self.unlock(id, branch, fee, rest.first().copied())?
+                let (without, files): (Vec<&str>, Vec<&str>) =
+                    rest.iter().partition(|a| a.starts_with("without="));
+                if without.len() > 1 || files.len() > 1 {
+                    return Err("unlock <id> <branch> <fee> [<file>] [without=<m>,..]".into());
+                }
+                let without = match without.first() {
+                    Some(w) => w["without=".len()..]
+                        .split(',')
+                        .map(|m| m.parse::<usize>().ok().filter(|&m| m >= 1).map(|m| m - 1))
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or("bad members (without=1,3: members from 1)")?,
+                    None => vec![],
+                };
+                self.unlock(id, branch, fee, files.first().copied(), &without)?
             }
             ["cosign", file] => self.cosign(file)?,
             [cmd, ..] => return Err(format!("unknown or incomplete command \"{cmd}\"; try help")),
@@ -1469,11 +1514,24 @@ impl Cli {
         ))
     }
 
+    /// Makes an output of ours for `amount`, to name as our payout in a
+    /// protected branch, and prints it. Nothing is kept: if a quorum pays
+    /// it, the wallet finds it like any output of ours.
+    fn new_payout(&self, amount: Amount) -> Result<String, String> {
+        let o = self.wallet.new_keys().map_err(err)?.pay(amount);
+        Ok(format!(
+            "payout {}\n(an output of ours for {} coins: put it after our key in a protected \
+             branch; make a new one for each state)",
+            output_to_hex(&o),
+            coins(amount)
+        ))
+    }
+
     /// Pays `amount` (plus `fee`) from our coins to an output with the
     /// conditions in `file`, as a payment of ours (see txs), and writes
     /// the output's description to `<file>.locked`.
     fn lock(&self, amount: Amount, fee: Amount, file: &str) -> Result<String, String> {
-        let conditions = conditions_from_text(&read(file)?)?;
+        let (conditions, payouts) = conditions_from_text(&read(file)?)?;
         let out_file = format!("{file}.locked");
         if Path::new(&out_file).exists() {
             return Err(format!("{out_file} exists already"));
@@ -1509,6 +1567,7 @@ impl Cli {
                 ..self.wallet.new_keys().map_err(err)?.pay(amount)
             },
             conditions,
+            payouts,
             created: now(),
             seen: None,
         };
@@ -1626,7 +1685,20 @@ impl Cli {
                     .iter()
                     .map(|k| if ours(k) { "ours" } else { "theirs" })
                     .collect();
-                let mut rules = vec![format!("keys {}", keys.join(" + "))];
+                let mut rules = vec![if cond.threshold == keys.len() {
+                    format!("keys {}", keys.join(" + "))
+                } else {
+                    format!("{} of keys {}", cond.threshold, keys.join(", "))
+                }];
+                if cond.payouts.is_some() {
+                    let amounts: Vec<String> = (0..cond.keys.len())
+                        .map(|m| {
+                            lk.payout(&cond.payout(m))
+                                .map_or("?".into(), |o| coins(o.amount))
+                        })
+                        .collect();
+                    rules.push(format!("protected (payouts {})", amounts.join(", ")));
+                }
                 if let Some(m) = cond.min_state {
                     rules.push(format!("state above {m}"));
                 }
@@ -1765,11 +1837,12 @@ impl Cli {
     }
 
     /// Picks (and records, in `txn`) the key of ours for condition key
-    /// `root` that signs next: the smallest unused index above the
+    /// `root` (member `member` of its key set) that signs next: the smallest unused index above the
     /// condition's state number. `None` if `root` isn't ours.
     fn take_signer(
         &self,
         txn: &mut heed::RwTxn,
+        member: u8,
         root: &crate::hash::Hash,
         above: Option<u32>,
     ) -> Result<Option<(Signer, crate::wots::SecretKey)>, String> {
@@ -1791,6 +1864,7 @@ impl Cli {
         let (sk, pubkey) = self.wallet.signer_key(&record.id, index);
         Ok(Some((
             Signer {
+                member,
                 pubkey,
                 index,
                 path: record.tree.path(index),
@@ -1801,13 +1875,16 @@ impl Cli {
 
     /// Spends locked output `prefix` by branch `branch` (from 1) to a new
     /// output of ours, paying `fee`: signs with our keys, and submits the
-    /// transaction if no others are needed, else writes it to `file`.
+    /// transaction if no others are needed, else writes it to `file`. In a
+    /// protected branch, members `without` (from 0) don't sign, and are
+    /// paid their payouts.
     fn unlock(
         &self,
         prefix: &str,
         branch: usize,
         fee: Amount,
         file: Option<&str>,
+        without: &[usize],
     ) -> Result<String, String> {
         let lk = self.find_locked(prefix)?;
         let condition = branch
@@ -1834,12 +1911,43 @@ impl Cli {
                 tip.height + 1
             ));
         }
+        // The payouts of the members who won't sign.
+        let mut payouts = Vec::new();
+        if !without.is_empty() {
+            if condition.payouts.is_none() {
+                return Err("that branch isn't protected: every signer it needs signs".into());
+            }
+            let mut members = without.to_vec();
+            members.sort_unstable();
+            members.dedup();
+            if members.last().is_some_and(|&m| m >= condition.keys.len()) {
+                return Err(format!(
+                    "that branch has members 1 to {}",
+                    condition.keys.len()
+                ));
+            }
+            if condition.keys.len() - members.len() < condition.threshold {
+                return Err(format!(
+                    "that branch needs {} of its {} members to sign",
+                    condition.threshold,
+                    condition.keys.len()
+                ));
+            }
+            for m in members {
+                payouts.push(
+                    lk.payout(&condition.payout(m))
+                        .ok_or(format!("we don't know member {}'s payout output", m + 1))?,
+                );
+            }
+        }
+        let paid: Amount = payouts.iter().map(|p| p.amount).sum();
         let amount = lk
             .output
             .amount
             .checked_sub(fee)
+            .and_then(|a| a.checked_sub(paid))
             .filter(|&a| a > 0)
-            .ok_or("the fee must be less than the output's amount")?;
+            .ok_or("the fee and payouts must be less than the output's amount")?;
         // The output: ours; starting its nonce with the preimage, if the
         // branch needs one.
         let preimage = match &condition.hashlock {
@@ -1863,23 +1971,8 @@ impl Cli {
             }
             None => self.wallet.new_keys().map_err(err)?,
         };
-        let output = keys.pay(amount);
-        // Our signers, picked and recorded before anything is signed; a
-        // placeholder for each key of someone else's.
-        let mut signers = Vec::new();
-        let mut secret = Vec::new();
-        for k in &condition.keys {
-            match self.take_signer(&mut txn, k, condition.min_state)? {
-                Some((signer, sk)) => {
-                    signers.push(signer);
-                    secret.push(Some(sk));
-                }
-                None => {
-                    signers.push(placeholder_signer());
-                    secret.push(None);
-                }
-            }
-        }
+        let mut outputs = vec![keys.pay(amount)];
+        outputs.extend(payouts);
         let tree = lk.key_tree();
         let body = TxBody {
             inputs: vec![Input {
@@ -1891,35 +1984,31 @@ impl Cli {
                     condition: condition.clone(),
                     leaf,
                     path: tree.path(leaf as usize),
-                    signers,
+                    signers: vec![],
                     preimage,
                 },
             }],
-            outputs: vec![output],
-            signed_outputs: if condition.mode == SigMode::All { 0 } else { 1 },
+            signed_outputs: if condition.mode == SigMode::All {
+                0
+            } else {
+                outputs.len()
+            },
+            outputs,
         };
-        let msg = body.message(0).ok_or("couldn't make the transaction")?;
-        let signatures: Vec<Signature> = secret
-            .into_iter()
-            .map(|sk| sk.map_or_else(placeholder_signature, |sk| sk.sign(&msg)))
-            .collect();
-        let missing = signatures
-            .iter()
-            .filter(|s| **s == placeholder_signature())
-            .count();
-        let tx = Transaction { body, signatures };
+        let mut tx = Transaction {
+            body,
+            signatures: vec![],
+        };
+        let added = self.add_signatures(&mut txn, &mut tx)?;
+        let missing = missing_signatures(&tx);
         if missing > 0 {
             let file = file.ok_or("others must sign too: give a file to write it to")?;
             write_new(file, &partial_text(&tx))?;
             txn.commit().map_err(err)?;
             return Ok(format!(
-                "signed with our key{}; {missing} more signature{} needed: send {file} to \
-                 the other signer (cosign {file})",
-                if condition.keys.len() - missing == 1 {
-                    ""
-                } else {
-                    "s"
-                },
+                "signed with {added} key{} of ours; {missing} more signature{} needed: send \
+                 {file} to the other signers (cosign {file})",
+                if added == 1 { "" } else { "s" },
                 if missing == 1 { "" } else { "s" },
             ));
         }
@@ -1938,53 +2027,26 @@ impl Cli {
     /// Adds our signatures to the partial transaction in `file`.
     fn cosign(&self, file: &str) -> Result<String, String> {
         let mut tx = partial_from_text(&read(file)?)?;
-        let l = &self.ledger;
-        let mut txn = l.env.write_txn().map_err(err)?;
-        let messages = tx
-            .body
-            .messages()
-            .ok_or("its transaction isn't well formed")?;
-        let mut at = 0;
-        let mut added = 0;
-        let mut summary = Vec::new();
-        for input in tx.body.inputs.iter_mut() {
-            let n = input.signature_count();
-            if let Spend::Condition {
-                condition, signers, ..
-            } = &mut input.spend
-            {
-                for j in 0..n {
-                    if signers[j].pubkey == placeholder_signer().pubkey
-                        && let Some((signer, sk)) =
-                            self.take_signer(&mut txn, &condition.keys[j], condition.min_state)?
-                    {
-                        signers[j] = signer;
-                        tx.signatures[at + j] = sk.sign(&messages[at + j]);
-                        added += 1;
-                    }
-                }
-                summary.push(format!("{} coins in", coins(input.amount)));
-            }
-            at += n;
-        }
+        let mut txn = self.ledger.env.write_txn().map_err(err)?;
+        let added = self.add_signatures(&mut txn, &mut tx)?;
         if added == 0 {
-            return Err("none of its missing signatures are ours".into());
+            return Err("none of the signatures it still needs can be ours".into());
         }
-        let out: Amount = tx.body.outputs.iter().map(|o| o.amount).sum();
-        summary.push(format!("{} coins out", coins(out)));
-        let missing = tx
-            .signatures
-            .iter()
-            .filter(|s| **s == placeholder_signature())
-            .count();
+        let coins_in: Amount = tx.body.inputs.iter().map(|i| i.amount).sum();
+        let coins_out: Amount = tx.body.outputs.iter().map(|o| o.amount).sum();
+        let summary = format!(
+            "{} coins in, {} coins out",
+            coins(coins_in),
+            coins(coins_out)
+        );
+        let s = if added == 1 { "" } else { "s" };
+        let missing = missing_signatures(&tx);
         if missing > 0 {
             let out_file = format!("{file}.cosigned");
             write_new(&out_file, &partial_text(&tx))?;
             txn.commit().map_err(err)?;
             return Ok(format!(
-                "added {added} signature{} ({}); {missing} still needed: {out_file}",
-                if added == 1 { "" } else { "s" },
-                summary.join(", ")
+                "added {added} signature{s} ({summary}); {missing} still needed: {out_file}"
             ));
         }
         txn.commit().map_err(err)?;
@@ -1992,13 +2054,70 @@ impl Cli {
             .map_err(|e| format!("the transaction isn't valid: {e}"))?;
         match self.submit(&tx.to_bytes()) {
             Ok(id) => Ok(format!(
-                "added {added} signature{} ({}): transaction {} submitted",
-                if added == 1 { "" } else { "s" },
-                summary.join(", "),
+                "added {added} signature{s} ({summary}): transaction {} submitted",
                 &hex(&crate::hash::to_bytes(&id))[..16]
             )),
             Err(e) => Err(format!("signed, but the mempool turned it away: {e}")),
         }
+    }
+
+    /// Adds signers of ours to `tx`'s condition inputs, each up to its
+    /// threshold (protected: each member not paid out), for members of its
+    /// key set whose keys are ours and that haven't signed (in member
+    /// order), recording each key's use in `txn` before it signs. Returns
+    /// how many signed.
+    fn add_signatures(&self, txn: &mut heed::RwTxn, tx: &mut Transaction) -> Result<usize, String> {
+        let messages: Vec<_> = (0..tx.body.inputs.len())
+            .map(|i| tx.body.message(i))
+            .collect::<Option<_>>()
+            .ok_or("its transaction isn't well formed")?;
+        let wanted: Vec<Vec<bool>> = tx
+            .body
+            .inputs
+            .iter()
+            .map(|i| match i.condition() {
+                Some(c) => (0..c.keys.len()).map(|m| is_signing(c, tx, m)).collect(),
+                None => vec![],
+            })
+            .collect();
+        let limits: Vec<usize> = tx
+            .body
+            .inputs
+            .iter()
+            .map(|i| i.condition().map_or(0, |c| signing_members(c, tx)))
+            .collect();
+        let mut added = 0;
+        let mut at = 0;
+        for (i, input) in tx.body.inputs.iter_mut().enumerate() {
+            if let Spend::Condition {
+                condition, signers, ..
+            } = &mut input.spend
+            {
+                for (member, &wanted) in wanted[i].iter().enumerate() {
+                    if signers.len() >= limits[i] {
+                        break;
+                    }
+                    if !wanted || signers.iter().any(|s| s.member as usize == member) {
+                        continue;
+                    }
+                    let Some((signer, sk)) = self.take_signer(
+                        txn,
+                        member as u8,
+                        &condition.keys[member],
+                        condition.min_state,
+                    )?
+                    else {
+                        continue;
+                    };
+                    let p = signers.partition_point(|s| (s.member as usize) < member);
+                    signers.insert(p, signer);
+                    tx.signatures.insert(at + p, sk.sign(&messages[i]));
+                    added += 1;
+                }
+            }
+            at += input.signature_count();
+        }
+        Ok(added)
     }
 
     /// The payment whose id (in hex) starts with `prefix` (at least 4
@@ -2784,6 +2903,110 @@ mod tests {
         assert!(listed.contains("its spend revealed preimage"), "{listed}");
         assert!(listed.contains("hashlock (preimage known)"), "{listed}");
         assert!(run(&alice, &format!("unlock {two} 3 0.01")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 2-of-3 lock: Alice signs, Carol cosigns while Bob is offline,
+    /// and the spend goes through; a third signature isn't added.
+    #[test]
+    fn two_of_three_unlock_without_the_third() {
+        let genesis = Header {
+            timestamp: now() - 1_000_000,
+            state: crate::state::empty_state(),
+            ..Header::default()
+        };
+        let (alice, bob, carol) = (node(&genesis), node(&genesis), node(&genesis));
+        block(&[&alice, &carol], &[pay(&alice, 10 * COIN)], &[]);
+        let dir = std::env::temp_dir().join(format!("r-cli-2of3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name).display().to_string();
+        let key = |n: &Node| {
+            run(n, "signer 2")
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        let keys = [key(&alice), key(&bob), key(&carol)].join("\n");
+        std::fs::write(path("spec"), format!("branch\n{keys}\nthreshold 2\n")).unwrap();
+        let out = run(&alice, &format!("lock 4 0.01 {}", path("spec"))).unwrap();
+        let id = id_after(&out, "locked output ");
+        mine(&[&alice, &carol]);
+        run(&carol, &format!("import {}.locked", path("spec"))).unwrap();
+        let listed = run(&carol, "locked").unwrap();
+        assert!(
+            listed.contains("2 of keys theirs, theirs, ours"),
+            "{listed}"
+        );
+        let partial = path("partial");
+        let out = run(&alice, &format!("unlock {id} 1 0.01 {partial}")).unwrap();
+        assert!(out.contains("1 more signature needed"), "{out}");
+        let out = run(&carol, &format!("cosign {partial}")).unwrap();
+        assert!(
+            out.contains("added 1 signature") && out.contains("submitted"),
+            "{out}"
+        );
+        mine(&[&carol, &alice]);
+        assert_eq!(spendable(&alice), "9.98");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A protected 2-of-3: Alice and Bob spend it while Carol is offline,
+    /// and Carol's wallet finds her payout.
+    #[test]
+    fn a_quorum_pays_the_member_who_doesnt_sign() {
+        let genesis = Header {
+            timestamp: now() - 1_000_000,
+            state: crate::state::empty_state(),
+            ..Header::default()
+        };
+        let (alice, bob, carol) = (node(&genesis), node(&genesis), node(&genesis));
+        let all = [&alice, &bob, &carol];
+        block(&all, &[pay(&alice, 10 * COIN)], &[]);
+        let dir = std::env::temp_dir().join(format!("r-cli-protect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name).display().to_string();
+        let first = |n: &Node, cmd: &str| run(n, cmd).unwrap().lines().next().unwrap().to_string();
+        let mut spec = "branch\n".to_string();
+        for (n, amount) in [(&alice, 1), (&bob, 1), (&carol, 2)] {
+            spec += &format!("{}\n", first(n, "signer 2"));
+            spec += &format!("{}\n", first(n, &format!("payout {amount}")));
+        }
+        spec += "threshold 2\nstate 0\nafter-blocks 1\n";
+        // Protection needs a delay.
+        std::fs::write(path("nodelay"), spec.replace("after-blocks 1\n", "")).unwrap();
+        let e = run(&alice, &format!("lock 4 0.01 {}", path("nodelay"))).unwrap_err();
+        assert!(e.contains("after-blocks"), "{e}");
+        std::fs::write(path("spec"), &spec).unwrap();
+        let out = run(&alice, &format!("lock 4 0.01 {}", path("spec"))).unwrap();
+        let id = id_after(&out, "locked output ");
+        mine(&all);
+        run(&bob, &format!("import {}.locked", path("spec"))).unwrap();
+        let listed = run(&bob, "locked").unwrap();
+        assert!(
+            listed.contains("2 of keys theirs, ours, theirs, protected (payouts 1, 1, 2)"),
+            "{listed}"
+        );
+
+        // Carol is offline: without her, she's paid. Without two, too few
+        // sign.
+        let partial = path("partial");
+        let e = run(&alice, &format!("unlock {id} 1 0.01 {partial} without=2,3")).unwrap_err();
+        assert!(e.contains("needs 2 of its 3"), "{e}");
+        let out = run(&alice, &format!("unlock {id} 1 0.01 {partial} without=3")).unwrap();
+        assert!(out.contains("1 more signature needed"), "{out}");
+        let out = run(&bob, &format!("cosign {partial}")).unwrap();
+        assert!(
+            out.contains("added 1 signature") && out.contains("submitted"),
+            "{out}"
+        );
+        mine(&[&bob, &alice, &carol]);
+        // Alice: 5.99 change and 4 - 0.01 - 2; Carol her 2.
+        assert_eq!(spendable(&alice), "7.98");
+        assert_eq!(spendable(&carol), "2");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

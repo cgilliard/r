@@ -263,7 +263,7 @@ fn open(
         Some(pow_tree) => {
             log.line(
                 "setting up the provers and verifier (item chunks of 682/2730, signature chunks \
-                 of 7/30/120, condition chunks of 48/195, 16-op segments, nodes at 2^15)",
+                 of 7/30/120, condition chunks of 9/39, 16-op segments, nodes at 2^15)",
             );
             let keys = KeyCache::open(cache.join("keys"));
             let chain = provers(consensus, genesis, pow_tree, &keys);

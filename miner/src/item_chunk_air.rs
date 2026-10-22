@@ -40,7 +40,10 @@
 //!   absorbs it into the digest, and `R4`, if it's signed, into the signed
 //!   outputs' digest; an output flagged as publishing a preimage adds its
 //!   nonce's first limbs to `P_pre`, which the aggregation matches against
-//!   the condition chunks' hashlock preimages; `R5` binds the flag;
+//!   the condition chunks' hashlock preimages, and one flagged as a payout
+//!   adds its transaction's digest and its commitment
+//!   ([`payout_element`]), matched against the payouts the condition
+//!   chunks require of protected inputs; `R5` binds the flags;
 //! - end: `R0` checks both digests are the claimed ones and the counts
 //!   match, and `R0..R2` absorb the digest, the signed outputs' digest and
 //!   their count into the transaction-hash sponge; `R5` returns to idle.
@@ -57,7 +60,8 @@
 //! ([`input_element`]), `P_out` over outputs' (commitment, nonce)
 //! ([`output_element`]), `P_sig` over key spends' (pkh, digest, leaf)
 //! ([`sig_element`]), `P_cond` over condition inputs' [`cond_element`],
-//! `P_pre` over published preimages ([`preimage_element`]). The
+//! `P_pre` over published preimages ([`preimage_element`]) and payouts
+//! ([`payout_element`]). The
 //! transaction hash ([`chunk_hash`]) is a sponge, with a random blinding
 //! as its initial capacity.
 //!
@@ -125,12 +129,13 @@ const CMT: usize = CRT + 1;
 /// A key spend's leaf.
 const NIDX: usize = CMT + HASH_LEN;
 /// An output's flags: signed; publishes a preimage (its nonce's first
-/// limbs).
+/// limbs); pays a protected input's non-signing member.
 const SGN: usize = NIDX + 1;
 const PREO: usize = SGN + 1;
+const PAYO: usize = PREO + 1;
 /// Per-transaction constants: claimed digest, input and output counts,
 /// signed outputs' claimed digest and count.
-const MSG: usize = PREO + 1;
+const MSG: usize = PAYO + 1;
 const NIN: usize = MSG + HASH_LEN;
 const NOUT: usize = NIN + 1;
 const OMSG: usize = NOUT + 1;
@@ -383,6 +388,15 @@ pub fn preimage_element(lambda: BabyBear4, pre: &[BabyBear; PRE_LIMBS]) -> BabyB
     fingerprint(lambda, pre.iter().copied())
 }
 
+/// The multiset element of a payout: its transaction's digest and the
+/// commitment, then a one (so it's never a preimage's).
+pub fn payout_element(lambda: BabyBear4, msg: &Hash, commitment: &Hash) -> BabyBear4 {
+    fingerprint(
+        lambda,
+        msg.iter().chain(commitment).copied().chain([BabyBear::ONE]),
+    )
+}
+
 /// `prod (r - e)` over `elements`.
 pub fn product(r: BabyBear4, elements: impl IntoIterator<Item = BabyBear4>) -> BabyBear4 {
     elements
@@ -478,21 +492,23 @@ impl Air for ItemChunkAir {
         let (kstart, kin, kcin, kout, kend) = (l[KSTART], l[KIN], l[KCIN], l[KOUT], l[KEND]);
         let inp = kin + kcin;
         let io = inp + kout;
-        let (sgn, preo) = (l[SGN], l[PREO]);
+        let (sgn, preo, payo) = (l[SGN], l[PREO], l[PAYO]);
         let items = p[ITEMS];
 
         poseidon2_air::eval(c, l);
 
         // Item kinds: at most one flag, constant in the item, as are its
         // values. Output flags only on outputs.
-        for flag in [kstart, kin, kcin, kout, kend, sgn, preo] {
+        for flag in [kstart, kin, kcin, kout, kend, sgn, preo, payo] {
             c.assert_zero(items * flag * (flag - one));
         }
         let kinds = kstart + inp + kout + kend;
         c.assert_zero(items * kinds * (kinds - one));
         c.assert_zero(items * sgn * (one - kout));
         c.assert_zero(items * preo * (one - kout));
-        for col in (KSTART..KEND + 1).chain(AMT..PREO + 1) {
+        c.assert_zero(items * payo * (one - kout));
+        c.assert_zero(items * preo * payo);
+        for col in (KSTART..KEND + 1).chain(AMT..PAYO + 1) {
             c.assert_zero(p[SAME_ITEM] * (n[col] - l[col]));
         }
         // Transaction constants change only after an end. (A start needs
@@ -596,14 +612,20 @@ impl Air for ItemChunkAir {
                 .chain([l[CNT_CIN]]),
         );
         let e_pre = element(&mut col(NONCE, PRE_LIMBS));
-        for (row, col, flag, e) in [
-            (R2, PIN, inp, e_in),
-            (R2, POUT, kout, e_out),
-            (R0, PSIG, kin, e_sig),
-            (R0, PCOND, kcin, e_cond),
-            (R0, PPRE, preo, e_pre),
+        let e_pay = element(&mut col(MSG, HASH_LEN).chain(col(CMT, HASH_LEN)).chain([one]));
+        // P_pre takes a published preimage or a payout (never both).
+        let f_pre: [V; 4] = core::array::from_fn(|b| {
+            let unit = if b == 0 { one } else { zero };
+            unit - (preo + payo) * unit + preo * (r[b] - e_pre[b]) + payo * (r[b] - e_pay[b])
+        });
+        for (row, col, f) in [
+            (R2, PIN, factor(inp, e_in)),
+            (R2, POUT, factor(kout, e_out)),
+            (R0, PSIG, factor(kin, e_sig)),
+            (R0, PCOND, factor(kcin, e_cond)),
+            (R0, PPRE, f_pre),
         ] {
-            let next = ext_mul(ext(col, l), factor(flag, e));
+            let next = ext_mul(ext(col, l), f);
             for b in 0..4 {
                 c.assert_zero(p[row] * (n[col + b] - next[b]));
                 c.assert_zero_transition(items * (one - p[row]) * (n[col + b] - l[col + b]));
@@ -670,12 +692,13 @@ impl Air for ItemChunkAir {
         c.assert_zero(end * (l[CNT_OUT] - l[NOUT]));
         c.assert_zero(end * (l[CNT_SG] - l[NS]));
         // Transaction hash: an input's R5 absorbs its leaf, creation height
-        // and kind, an output's whether it publishes a preimage; an end's
+        // and kind, an output's whether it publishes a preimage or pays a
+        // payout; an end's
         // R0, R1 and R2 absorb its digest, signed-outputs digest, then their
         // count.
         let absorbs: [(V, Vec<V>); 5] = [
             (p[R5] * inp, vec![l[NIDX], l[CRT], kcin]),
-            (p[R5] * kout, vec![preo]),
+            (p[R5] * kout, vec![preo, payo]),
             (end, col(MSG, HASH_LEN).collect()),
             (p[R1] * kend, col(OMSG, HASH_LEN).collect()),
             (p[R2] * kend, vec![l[NS]]),
@@ -787,6 +810,8 @@ pub enum Item {
         signed: bool,
         /// Publishes a hashlock input's preimage (its nonce's first limbs).
         publishes: bool,
+        /// Pays a protected input's non-signing member.
+        pays: bool,
     },
     End,
 }
@@ -824,8 +849,10 @@ pub fn stream(txs: &[Transaction], created: impl Fn(u64) -> u32) -> Vec<Item> {
             });
         }
 
-        // The outputs publishing the hashlock inputs' preimages.
+        // The outputs publishing the hashlock inputs' preimages, and those
+        // paying protected inputs' payouts.
         let publishers = body.publishers().expect("validated");
+        let payouts = body.payouts().expect("validated");
         for (i, o) in body.outputs.iter().enumerate() {
             items.push(Item::Output {
                 hash: hash::from_bytes(&o.hash).expect("canonical output hash"),
@@ -833,6 +860,7 @@ pub fn stream(txs: &[Transaction], created: impl Fn(u64) -> u32) -> Vec<Item> {
                 nonce: output::nonce_limbs(&o.nonce),
                 signed: i < body.signed_outputs,
                 publishes: publishers.contains(&Some(i)),
+                pays: payouts.contains(&i),
             });
         }
         items.push(Item::End);
@@ -916,7 +944,9 @@ fn tx_hash_blocks(b: &Boundary, item: &Item) -> Vec<Vec<BabyBear>> {
             BabyBear::new(created),
             BabyBear::from(condition),
         ]],
-        Item::Output { publishes, .. } => vec![vec![BabyBear::from(publishes)]],
+        Item::Output {
+            publishes, pays, ..
+        } => vec![vec![BabyBear::from(publishes), BabyBear::from(pays)]],
         Item::End => vec![
             b.tx.msg.to_vec(),
             b.tx.omsg.to_vec(),
@@ -1067,7 +1097,7 @@ impl ItemChunkAir {
             let zero_hash = [BabyBear::ZERO; HASH_LEN];
             let zero_amount = [BabyBear::ZERO; AMOUNT_LIMBS];
             let zero_nonce = [BabyBear::ZERO; NONCE_LIMBS];
-            let (hash, amount, nonce, position, created, leaf, sgn, preo) = match item {
+            let (hash, amount, nonce, position, created, leaf, sgn, preo, payo) = match item {
                 Some(Item::Input {
                     pkh,
                     amount,
@@ -1076,15 +1106,28 @@ impl ItemChunkAir {
                     created,
                     leaf,
                     ..
-                }) => (pkh, amount, nonce, position, created, leaf, false, false),
+                }) => (
+                    pkh, amount, nonce, position, created, leaf, false, false, false,
+                ),
                 Some(Item::Output {
                     hash,
                     amount,
                     nonce,
                     signed,
                     publishes,
-                }) => (hash, amount, nonce, 0, 0, 0, signed, publishes),
-                _ => (zero_hash, zero_amount, zero_nonce, 0, 0, 0, false, false),
+                    pays,
+                }) => (hash, amount, nonce, 0, 0, 0, signed, publishes, pays),
+                _ => (
+                    zero_hash,
+                    zero_amount,
+                    zero_nonce,
+                    0,
+                    0,
+                    0,
+                    false,
+                    false,
+                    false,
+                ),
             };
             let tx_blocks = item
                 .as_ref()
@@ -1146,6 +1189,12 @@ impl ItemChunkAir {
             }
             if preo {
                 st.ppre *= r - fp(&nonce[..PRE_LIMBS]);
+            }
+            if payo {
+                let mut xs = st.b.tx.msg.to_vec();
+                xs.extend(commitment);
+                xs.push(BabyBear::ONE);
+                st.ppre *= r - fp(&xs);
             }
             if kstart {
                 st.b.dig = digest_init(BabyBear::new(st.b.tx.nin), BabyBear::new(st.b.tx.nout));
@@ -1290,6 +1339,7 @@ impl ItemChunkAir {
                 row[NIDX] = BabyBear::new(leaf);
                 row[SGN] = BabyBear::from(sgn);
                 row[PREO] = BabyBear::from(preo);
+                row[PAYO] = BabyBear::from(payo);
             }
         }
 
@@ -1416,6 +1466,7 @@ mod tests {
                     leaf: 0,
                     path: keys.path(0),
                     signers: vec![Signer {
+                        member: 0,
                         pubkey,
                         index: 0,
                         path: vec![],
@@ -1776,6 +1827,7 @@ mod tests {
                 nonce,
                 signed: false,
                 publishes: false,
+                pays: false,
             },
             Item::End,
         ];

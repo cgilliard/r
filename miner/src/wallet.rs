@@ -736,26 +736,56 @@ impl SignerRecord {
 }
 
 /// An output paid to conditions, which we watch: the output (hash, amount,
-/// nonce), its conditions (its key tree's leaves, in order), when we
-/// learned of it, and (once seen in the state) its slot and creation
-/// height.
+/// nonce), its conditions (its key tree's leaves, in order), the payout
+/// outputs its protected branches name, when we learned of it, and (once
+/// seen in the state) its slot and creation height.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Locked {
     pub output: Output,
     pub conditions: Vec<Condition>,
+    pub payouts: Vec<Output>,
     pub created: u64,
     pub seen: Option<(u64, u32)>,
 }
 
+/// An output as bytes: hash, amount, nonce.
+fn output_bytes(o: &Output) -> Vec<u8> {
+    let mut out = o.hash.to_vec();
+    out.extend(o.amount.to_le_bytes());
+    out.extend(o.nonce);
+    out
+}
+
+const OUTPUT_LEN: usize = OUTPUT_HASH_LEN + 8 + NONCE_LEN;
+
+fn output_from_bytes(b: &[u8]) -> Option<Output> {
+    (b.len() == OUTPUT_LEN).then(|| Output {
+        hash: b[..OUTPUT_HASH_LEN].try_into().expect("length"),
+        amount: u64::from_le_bytes(
+            b[OUTPUT_HASH_LEN..OUTPUT_HASH_LEN + 8]
+                .try_into()
+                .expect("8 bytes"),
+        ),
+        nonce: b[OUTPUT_HASH_LEN + 8..].try_into().expect("length"),
+    })
+}
+
+/// An output as text, for a conditions file's `payout` line.
+pub fn output_to_hex(o: &Output) -> String {
+    hex(&output_bytes(o))
+}
+
 impl Locked {
     fn to_bytes(&self) -> Vec<u8> {
-        let mut out = self.output.hash.to_vec();
-        out.extend(self.output.amount.to_le_bytes());
-        out.extend(self.output.nonce);
+        let mut out = output_bytes(&self.output);
         out.extend(self.created.to_le_bytes());
         let (slot, height) = self.seen.unwrap_or((u64::MAX, 0));
         out.extend(slot.to_le_bytes());
         out.extend(height.to_le_bytes());
+        out.extend((self.payouts.len() as u16).to_le_bytes());
+        for p in &self.payouts {
+            out.extend(output_bytes(p));
+        }
         for c in &self.conditions {
             let b = c.to_bytes();
             out.extend((b.len() as u16).to_le_bytes());
@@ -770,9 +800,16 @@ impl Locked {
         let (nonce, b) = b.split_at_checked(NONCE_LEN)?;
         let (created, b) = b.split_at_checked(8)?;
         let (slot, b) = b.split_at_checked(8)?;
-        let (height, mut b) = b.split_at_checked(4)?;
+        let (height, b) = b.split_at_checked(4)?;
         let slot = u64::from_le_bytes(slot.try_into().ok()?);
         let height = u32::from_le_bytes(height.try_into().ok()?);
+        let (n, mut b) = b.split_at_checked(2)?;
+        let mut payouts = Vec::new();
+        for _ in 0..u16::from_le_bytes(n.try_into().ok()?) {
+            let (p, rest) = b.split_at_checked(OUTPUT_LEN)?;
+            payouts.push(output_from_bytes(p)?);
+            b = rest;
+        }
         let mut conditions = Vec::new();
         while !b.is_empty() {
             let (len, rest) = b.split_at_checked(2)?;
@@ -788,6 +825,7 @@ impl Locked {
                 nonce: nonce.try_into().ok()?,
             },
             conditions,
+            payouts,
             created: u64::from_le_bytes(created.try_into().ok()?),
             seen: (slot != u64::MAX).then_some((slot, height)),
         })
@@ -800,14 +838,19 @@ impl Locked {
 
     /// The file describing it for others: its output and conditions.
     pub fn to_text(&self) -> String {
-        let mut out = self.output.hash.to_vec();
-        out.extend(self.output.amount.to_le_bytes());
-        out.extend(self.output.nonce);
         format!(
             "{LOCKED_HEADER}\noutput {}\n{}",
-            hex(&out),
-            conditions_to_text(&self.conditions)
+            output_to_hex(&self.output),
+            conditions_to_text(&self.conditions, &self.payouts)
         )
+    }
+
+    /// The payout output with this commitment, if we know it.
+    pub fn payout(&self, commitment: &Hash) -> Option<Output> {
+        self.payouts
+            .iter()
+            .find(|p| p.commitment().and_then(|c| c.to_field()) == Some(*commitment))
+            .copied()
     }
 
     pub fn from_text(text: &str) -> Result<Self, String> {
@@ -818,25 +861,16 @@ impl Locked {
             ));
         }
         let first = lines.next().unwrap_or("");
-        let bytes = first
+        let output = first
             .strip_prefix("output ")
-            .and_then(|h| unhex(h.trim()))
-            .filter(|b| b.len() == OUTPUT_HASH_LEN + 8 + NONCE_LEN)
+            .and_then(|h| output_from_bytes(&unhex(h.trim())?))
             .ok_or("bad output line")?;
-        let output = Output {
-            hash: bytes[..OUTPUT_HASH_LEN].try_into().expect("length"),
-            amount: u64::from_le_bytes(
-                bytes[OUTPUT_HASH_LEN..OUTPUT_HASH_LEN + 8]
-                    .try_into()
-                    .expect("8 bytes"),
-            ),
-            nonce: bytes[OUTPUT_HASH_LEN + 8..].try_into().expect("length"),
-        };
         let rest: Vec<&str> = lines.collect();
-        let conditions = conditions_from_text(&rest.join("\n"))?;
+        let (conditions, payouts) = conditions_from_text(&rest.join("\n"))?;
         let locked = Self {
             output,
             conditions,
+            payouts,
             created: 0,
             seen: None,
         };
@@ -850,12 +884,20 @@ impl Locked {
 const LOCKED_HEADER: &str = "r locked output 1";
 
 /// Conditions as text: each starts with a `branch` line, then one line per
-/// rule: `key <hex>` (once, or twice for 2-of-2), `state <n>` (each
-/// signing key's index must be above `n`), `mode all | anyone-can-pay |
+/// rule: `key <hex>` (once per key, up to 16), each optionally followed by
+/// `payout <hex>` (the member's payout output, from `payout`: given for
+/// every key, they protect the branch), `threshold <k>` (how many of the
+/// keys must sign; all of them if not given), `state <n>` (each signing
+/// key's index must be above `n`), `mode all | anyone-can-pay |
 /// any-prevout`, `after-height <h>`, `after-blocks <n>`, `hashlock <hex>`.
-/// Lines starting with `#` are comments.
-pub fn conditions_from_text(text: &str) -> Result<Vec<Condition>, String> {
+/// Lines starting with `#` are comments. Returns the conditions and the
+/// payout outputs.
+pub fn conditions_from_text(text: &str) -> Result<(Vec<Condition>, Vec<Output>), String> {
     let mut out: Vec<Condition> = Vec::new();
+    // Thresholds given, by branch (all the keys otherwise); payouts given,
+    // by branch and key.
+    let mut thresholds: Vec<Option<usize>> = Vec::new();
+    let mut payouts: Vec<Vec<Option<Output>>> = Vec::new();
     let hash_of = |v: &str| -> Result<Hash, String> {
         unhex(v)
             .and_then(|b| hash::from_bytes(b.as_slice().try_into().ok()?))
@@ -870,6 +912,8 @@ pub fn conditions_from_text(text: &str) -> Result<Vec<Condition>, String> {
                 keys: vec![],
                 ..Condition::key([BabyBear::ZERO; hash::HASH_LEN])
             });
+            thresholds.push(None);
+            payouts.push(Vec::new());
             continue;
         }
         let c = out
@@ -879,7 +923,28 @@ pub fn conditions_from_text(text: &str) -> Result<Vec<Condition>, String> {
         let v = v.trim();
         let number = |v: &str| v.parse::<u32>().map_err(|_| format!("bad number \"{v}\""));
         match k {
-            "key" => c.keys.push(hash_of(v)?),
+            "key" => {
+                c.keys.push(hash_of(v)?);
+                payouts.last_mut().expect("a branch").push(None);
+            }
+            "payout" => {
+                let p = unhex(v)
+                    .and_then(|b| output_from_bytes(&b))
+                    .filter(|o| o.commitment().and_then(|c| c.to_field()).is_some())
+                    .ok_or(format!("bad payout \"{v}\""))?;
+                let slot = payouts
+                    .last_mut()
+                    .expect("a branch")
+                    .last_mut()
+                    .ok_or("a payout follows its key")?;
+                if slot.replace(p).is_some() {
+                    return Err("one payout per key".into());
+                }
+            }
+            "threshold" => {
+                *thresholds.last_mut().expect("a branch") =
+                    Some(v.parse().map_err(|_| format!("bad number \"{v}\""))?)
+            }
             "state" => c.min_state = Some(number(v)?),
             "after-height" => c.after_height = number(v)?,
             "after-blocks" => c.after_blocks = number(v)?,
@@ -901,24 +966,54 @@ pub fn conditions_from_text(text: &str) -> Result<Vec<Condition>, String> {
     if out.len() > KEY_LEAVES {
         return Err(format!("at most {KEY_LEAVES} branches"));
     }
+    let mut outputs = Vec::new();
+    for (i, ((c, t), p)) in out.iter_mut().zip(thresholds).zip(payouts).enumerate() {
+        c.threshold = t.unwrap_or(c.keys.len());
+        if p.iter().any(Option::is_some) {
+            let p: Vec<Output> = p
+                .into_iter()
+                .collect::<Option<_>>()
+                .ok_or(format!("branch {}: a payout for every key, or none", i + 1))?;
+            c.payouts = Some(
+                p.iter()
+                    .map(|o| o.commitment().and_then(|c| c.to_field()).expect("checked"))
+                    .collect(),
+            );
+            outputs.extend(p);
+        }
+    }
     for (i, c) in out.iter().enumerate() {
         if !c.is_well_formed() {
             return Err(format!(
-                "branch {}: it needs one or two keys, a state number and locks in range",
+                "branch {}: it needs 1 to 16 keys, a threshold from 1 to their number, a \
+                 state number and locks in range, and with payouts an after-blocks delay",
                 i + 1
             ));
         }
     }
-    Ok(out)
+    Ok((out, outputs))
 }
 
-/// The text form of `conditions` ([`conditions_from_text`]).
-pub fn conditions_to_text(conditions: &[Condition]) -> String {
+/// The text form of `conditions` ([`conditions_from_text`]), with their
+/// payouts from `payouts`.
+pub fn conditions_to_text(conditions: &[Condition], payouts: &[Output]) -> String {
     let mut out = String::new();
     for c in conditions {
         out.push_str("branch\n");
-        for k in &c.keys {
+        for (m, k) in c.keys.iter().enumerate() {
             out.push_str(&format!("key {}\n", hex(&hash::to_bytes(k))));
+            if c.payouts.is_some() {
+                let want = c.payout(m);
+                if let Some(p) = payouts
+                    .iter()
+                    .find(|p| p.commitment().and_then(|c| c.to_field()) == Some(want))
+                {
+                    out.push_str(&format!("payout {}\n", output_to_hex(p)));
+                }
+            }
+        }
+        if c.threshold < c.keys.len() {
+            out.push_str(&format!("threshold {}\n", c.threshold));
         }
         if let Some(m) = c.min_state {
             out.push_str(&format!("state {m}\n"));

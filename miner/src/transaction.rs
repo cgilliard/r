@@ -15,8 +15,9 @@
 //! sign the message its [`SigMode`] gives. The fee is implicit:
 //! `sum(inputs) - sum(outputs)`.
 //!
-//! A condition needs one or two signatures (`2-of-2`), each by a key of a
-//! key tree of the signer's chosen depth (up to [`MAX_KEY_DEPTH`]); it can
+//! A condition needs `k` of up to [`MAX_SIGNERS`] keys to sign (a
+//! threshold), each key a key tree of its owner's chosen depth (up to
+//! [`MAX_KEY_DEPTH`]); it can
 //! require each signing key's index to exceed a state number, which, with a
 //! key per state, lets a later state's transaction replace an earlier one
 //! (payment channels). It can also lock the output until a height
@@ -25,6 +26,14 @@
 //! which the spending transaction must publish as the start of one of its
 //! outputs' nonces (an output per hashlock input), so whoever watches the
 //! chain learns it.
+//!
+//! A condition can also protect its members: each key comes with a payout
+//! (an output's commitment, which its member made), and when fewer than
+//! all of them sign, the spending transaction must create the payout of
+//! each member that doesn't. With a state number, any `k` members can then
+//! move a shared output on without the others, who keep what the last
+//! state they signed gave them. Protection needs `after_blocks`, so a
+//! published old state can be replaced before a quorum spends it.
 //!
 //! [`Transaction::validate`] performs every check that needs no chain state
 //! and returns the [`Totals`]. It does not require inputs to cover outputs, so
@@ -61,6 +70,9 @@ pub type KeyPath = [Hash; KEY_LEVELS];
 /// The deepest key tree a condition's signer may use: `2^24` one-time
 /// keys, so up to `2^24` states.
 pub const MAX_KEY_DEPTH: usize = 24;
+/// The most keys a condition may have, and the levels of their set.
+pub const MAX_SIGNERS: usize = 1 << KEY_SET_LEVELS;
+pub const KEY_SET_LEVELS: usize = 4;
 /// The largest state number a condition may name (a signer's key index
 /// must exceed it).
 pub const MAX_STATE: u32 = (1 << MAX_KEY_DEPTH) - 1;
@@ -249,8 +261,11 @@ impl SigMode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Condition {
     /// The signers' key-tree roots ([`SignerTree::root`]; a single key's
-    /// hash is a tree of depth 0): one, or two for 2-of-2.
+    /// hash is a tree of depth 0): one to [`MAX_SIGNERS`], committed as a
+    /// set ([`Condition::key_set`]).
     pub keys: Vec<Hash>,
+    /// How many of them must sign (from 1 to their number).
+    pub threshold: usize,
     /// If set, each signing key's index must be above this.
     pub min_state: Option<u32>,
     pub mode: SigMode,
@@ -261,32 +276,89 @@ pub struct Condition {
     /// If set, the spending transaction must publish a preimage of this
     /// ([`hashlock`]).
     pub hashlock: Option<Hash>,
+    /// If set (protection), a payout commitment per key: at least the
+    /// threshold must sign, and the spending transaction must create the
+    /// payout of each key that doesn't ([`TxBody::payouts`]), so members
+    /// who don't sign keep what the state gave them. Needs `after_blocks`.
+    pub payouts: Option<Vec<Hash>>,
 }
 
 impl Condition {
     /// A condition of one key and nothing else.
     pub fn key(root: Hash) -> Self {
+        Self::all_of(vec![root])
+    }
+
+    /// A condition all of `keys` must sign, and nothing else.
+    pub fn all_of(keys: Vec<Hash>) -> Self {
         Self {
-            keys: vec![root],
+            threshold: keys.len(),
+            keys,
             min_state: None,
             mode: SigMode::All,
             after_height: 0,
             after_blocks: 0,
             hashlock: None,
+            payouts: None,
         }
     }
 
-    /// The flags its leaf hashes: two keys (1), a state rule (2), a
-    /// hashlock (4).
+    /// The flags its leaf hashes: a state rule (2), a hashlock (4),
+    /// protection (8).
     fn flags(&self) -> u32 {
-        (self.keys.len() == 2) as u32
-            | (self.min_state.is_some() as u32) << 1
+        (self.min_state.is_some() as u32) << 1
             | (self.hashlock.is_some() as u32) << 2
+            | (self.payouts.is_some() as u32) << 3
+    }
+
+    /// Member `m`'s payout commitment (zero without protection).
+    pub fn payout(&self, m: usize) -> Hash {
+        self.payouts
+            .as_ref()
+            .and_then(|p| p.get(m).copied())
+            .unwrap_or([BabyBear::ZERO; HASH_LEN])
+    }
+
+    /// The key set's leaves: `merge(key, payout)` per key, then zeros up to
+    /// [`MAX_SIGNERS`] (no key tree has a zero root).
+    fn key_set_leaves(&self) -> [Hash; MAX_SIGNERS] {
+        core::array::from_fn(|i| match self.keys.get(i) {
+            Some(k) => hash::merge(k, &self.payout(i)),
+            None => [BabyBear::ZERO; HASH_LEN],
+        })
+    }
+
+    /// The key set: the Merkle root ([`hash::merge`], [`KEY_SET_LEVELS`]
+    /// levels) of each key merged with its payout, padded with zeros.
+    pub fn key_set(&self) -> Hash {
+        let mut level = self.key_set_leaves().to_vec();
+        while level.len() > 1 {
+            level = level
+                .chunks_exact(2)
+                .map(|p| hash::merge(&p[0], &p[1]))
+                .collect();
+        }
+        level[0]
+    }
+
+    /// Member `member`'s siblings in the key set, bottom up.
+    pub fn key_set_path(&self, member: usize) -> [Hash; KEY_SET_LEVELS] {
+        let mut level = self.key_set_leaves().to_vec();
+        let mut i = member;
+        core::array::from_fn(|_| {
+            let sibling = level[i ^ 1];
+            level = level
+                .chunks_exact(2)
+                .map(|p| hash::merge(&p[0], &p[1]))
+                .collect();
+            i >>= 1;
+            sibling
+        })
     }
 
     /// Its key-tree leaf: `sponge(CONDITION, [min state, after height,
-    /// after blocks, mode, flags], [key 1, key 2, hashlock])`, with zeros
-    /// for what's absent.
+    /// after blocks, mode, flags], [key set, hashlock, threshold, key
+    /// count])`, with zeros for what's absent.
     pub fn leaf(&self) -> Hash {
         let zero = [BabyBear::ZERO; HASH_LEN];
         hash::sponge(
@@ -299,16 +371,20 @@ impl Condition {
                 BabyBear::new(self.flags()),
             ],
             &[
-                &self.keys[0],
-                self.keys.get(1).unwrap_or(&zero),
+                &self.key_set(),
                 self.hashlock.as_ref().unwrap_or(&zero),
+                &[
+                    BabyBear::new(self.threshold as u32),
+                    BabyBear::new(self.keys.len() as u32),
+                ],
             ],
         )
     }
 
-    /// Its encoding: key count and keys, mode, flags (bit 0: state rule,
-    /// bit 1: hashlock), state number, after height, after blocks (`u32`s,
-    /// little-endian), the hashlock if any.
+    /// Its encoding: key count and keys, threshold, mode, flags (bit 0:
+    /// state rule, bit 1: hashlock, bit 2: protection), state number, after
+    /// height, after blocks (`u32`s, little-endian), the hashlock if any,
+    /// the payouts if protected.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         self.write(&mut out);
@@ -327,25 +403,30 @@ impl Condition {
         for k in &self.keys {
             put_elems(out, k);
         }
+        out.push(self.threshold as u8);
         out.push(self.mode as u8);
-        out.push(self.min_state.is_some() as u8 | (self.hashlock.is_some() as u8) << 1);
+        out.push((self.flags() >> 1) as u8);
         out.extend(self.min_state.unwrap_or(0).to_le_bytes());
         out.extend(self.after_height.to_le_bytes());
         out.extend(self.after_blocks.to_le_bytes());
         if let Some(h) = &self.hashlock {
             put_elems(out, h);
         }
+        for p in self.payouts.iter().flatten() {
+            put_elems(out, p);
+        }
     }
 
     fn read(r: &mut Reader<'_>) -> Option<Self> {
         let n_keys = r.u8()? as usize;
-        if !(1..=2).contains(&n_keys) {
+        if !(1..=MAX_SIGNERS).contains(&n_keys) {
             return None;
         }
         let keys = (0..n_keys).map(|_| r.hash()).collect::<Option<Vec<_>>>()?;
+        let threshold = r.u8()? as usize;
         let mode = SigMode::from_u8(r.u8()?)?;
         let flags = r.u8()?;
-        if flags >> 2 != 0 {
+        if flags >> 3 != 0 {
             return None;
         }
         let state = r.u32()?;
@@ -360,23 +441,49 @@ impl Condition {
         } else {
             None
         };
+        let payouts = if flags & 4 == 4 {
+            Some((0..n_keys).map(|_| r.hash()).collect::<Option<Vec<_>>>()?)
+        } else {
+            None
+        };
         Some(Self {
             keys,
+            threshold,
             min_state,
             mode,
             after_height,
             after_blocks,
             hashlock,
+            payouts,
         })
     }
 
-    /// Whether its values are in range: one or two keys, a state number up
-    /// to [`MAX_STATE`], locks up to [`MAX_LOCK`].
+    /// Whether its values are in range: one to [`MAX_SIGNERS`] keys (none
+    /// zero), a threshold from 1 to their number, a state number up to
+    /// [`MAX_STATE`], locks up to [`MAX_LOCK`], and with protection a
+    /// payout per key and a block count of at least one (else a quorum
+    /// could spend an old state before the others can replace it).
     pub fn is_well_formed(&self) -> bool {
-        (1..=2).contains(&self.keys.len())
+        (1..=MAX_SIGNERS).contains(&self.keys.len())
+            && (1..=self.keys.len()).contains(&self.threshold)
+            && self.keys.iter().all(|k| *k != [BabyBear::ZERO; HASH_LEN])
             && self.min_state.is_none_or(|m| m <= MAX_STATE)
             && self.after_height <= MAX_LOCK
             && self.after_blocks <= MAX_LOCK
+            && self
+                .payouts
+                .as_ref()
+                .is_none_or(|p| p.len() == self.keys.len() && self.after_blocks >= 1)
+    }
+
+    /// Whether `signers` (members, in order) are enough: exactly the
+    /// threshold, or with protection at least it.
+    pub fn enough_signers(&self, signers: usize) -> bool {
+        if self.payouts.is_some() {
+            (self.threshold..=self.keys.len()).contains(&signers)
+        } else {
+            signers == self.threshold
+        }
     }
 }
 
@@ -392,10 +499,11 @@ pub fn preimage_limbs(preimage: &Preimage) -> [BabyBear; PREIMAGE_LEN / NONCE_LI
     core::array::from_fn(|j| output::nonce_limbs(&nonce)[j])
 }
 
-/// One of a condition's signers: the key that signs, its index (state) and
-/// its path in the signer's key tree.
+/// One of a condition's signers: which of its keys (`member`), the key
+/// that signs, its index (state) and its path in that key's tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Signer {
+    pub member: u8,
     pub pubkey: PublicKey,
     pub index: u32,
     /// Siblings, bottom up: the tree's depth.
@@ -424,9 +532,10 @@ pub enum Spend {
         leaf: u8,
         path: KeyPath,
     },
-    /// By meeting the condition at `leaf`: one signer per key, in order,
-    /// and the preimage of its hashlock, if it has one (which an output of
-    /// the transaction must publish: [`TxBody::publishers`]).
+    /// By meeting the condition at `leaf`: as many signers as its
+    /// threshold (with protection, at least as many), of distinct keys in
+    /// key order, and the preimage of its hashlock, if it has one (which an
+    /// output of the transaction must publish: [`TxBody::publishers`]).
     Condition {
         condition: Condition,
         leaf: u8,
@@ -473,7 +582,7 @@ impl Input {
     pub fn signature_count(&self) -> usize {
         match &self.spend {
             Spend::Key { .. } => 1,
-            Spend::Condition { condition, .. } => condition.keys.len(),
+            Spend::Condition { signers, .. } => signers.len(),
         }
     }
 
@@ -592,6 +701,58 @@ impl TxBody {
                 .find(|&o| !taken[o] && self.outputs[o].nonce[..PREIMAGE_LEN] == p[..])?;
             taken[o] = true;
             out.push(Some(o));
+        }
+        Some(out)
+    }
+
+    /// The commitments protected inputs must pay, in input order: each
+    /// non-signing member's payout.
+    pub fn required_payouts(&self) -> Vec<Hash> {
+        let mut out = Vec::new();
+        for input in &self.inputs {
+            let Spend::Condition {
+                condition: c,
+                signers,
+                ..
+            } = &input.spend
+            else {
+                continue;
+            };
+            let Some(payouts) = &c.payouts else {
+                continue;
+            };
+            for (m, p) in payouts.iter().enumerate() {
+                if !signers.iter().any(|s| s.member as usize == m) {
+                    out.push(*p);
+                }
+            }
+        }
+        out
+    }
+
+    /// The outputs paying [`TxBody::required_payouts`], in that order: each
+    /// the first output with that commitment not taken yet, by another
+    /// payout or by a preimage ([`TxBody::publishers`]). `None` if one has
+    /// none.
+    pub fn payouts(&self) -> Option<Vec<usize>> {
+        let required = self.required_payouts();
+        if required.is_empty() {
+            return Some(Vec::new());
+        }
+        let mut taken = vec![false; self.outputs.len()];
+        for o in self.publishers()?.into_iter().flatten() {
+            taken[o] = true;
+        }
+        let commitments = self
+            .outputs
+            .iter()
+            .map(|o| o.commitment()?.to_field())
+            .collect::<Option<Vec<_>>>()?;
+        let mut out = Vec::new();
+        for p in required {
+            let o = (0..self.outputs.len()).find(|&o| !taken[o] && commitments[o] == p)?;
+            taken[o] = true;
+            out.push(o);
         }
         Some(out)
     }
@@ -719,6 +880,9 @@ pub enum TxError {
     /// An input's preimage isn't the start of an output's nonce (one per
     /// hashlock input).
     PreimageNotPublished,
+    /// A protected input's non-signing member isn't paid its payout (an
+    /// output per payout, none also publishing a preimage).
+    PayoutMissing,
     /// Input signs anyone-can-pay or any-prevout after another condition
     /// input: only the first condition input may (so no two share the
     /// signed outputs).
@@ -754,6 +918,9 @@ impl fmt::Display for TxError {
             Self::Hashlock(i) => write!(f, "input {i}: its preimage doesn't meet its hashlock"),
             Self::PreimageNotPublished => {
                 write!(f, "an input's preimage isn't published by an output")
+            }
+            Self::PayoutMissing => {
+                write!(f, "a member who doesn't sign isn't paid its payout")
             }
             Self::PartialSigner(i) => write!(
                 f,
@@ -875,7 +1042,9 @@ impl Transaction {
                     for h in path {
                         put_elems(&mut out, h);
                     }
+                    out.push(signers.len() as u8);
                     for s in signers {
+                        out.push(s.member);
                         put_pubkey(&mut out, &s.pubkey);
                         out.extend(s.index.to_le_bytes());
                         out.push(s.path.len() as u8);
@@ -935,11 +1104,15 @@ impl Transaction {
                 },
                 1 => {
                     let condition = Condition::read(&mut r)?;
-                    let n_keys = condition.keys.len();
                     let leaf = r.u8()?;
                     let path = r.key_path()?;
-                    let mut signers = Vec::with_capacity(n_keys);
-                    for _ in 0..n_keys {
+                    let n_signers = r.u8()? as usize;
+                    if n_signers > condition.keys.len() {
+                        return None;
+                    }
+                    let mut signers = Vec::with_capacity(n_signers);
+                    for _ in 0..n_signers {
+                        let member = r.u8()?;
                         let pubkey = r.pubkey()?;
                         let index = r.u32()?;
                         let depth = r.u8()? as usize;
@@ -948,6 +1121,7 @@ impl Transaction {
                         }
                         let path = (0..depth).map(|_| r.hash()).collect::<Option<Vec<_>>>()?;
                         signers.push(Signer {
+                            member,
                             pubkey,
                             index,
                             path,
@@ -1061,10 +1235,11 @@ impl Transaction {
             } = &input.spend
             {
                 let fits = c.is_well_formed()
-                    && signers.len() == c.keys.len()
-                    && signers.iter().zip(&c.keys).all(|(s, k)| {
+                    && c.enough_signers(signers.len())
+                    && signers.windows(2).all(|w| w[0].member < w[1].member)
+                    && signers.iter().all(|s| {
                         s.is_well_formed()
-                            && s.root() == *k
+                            && c.keys.get(s.member as usize) == Some(&s.root())
                             && c.min_state.is_none_or(|m| s.index > m)
                     });
                 if !fits {
@@ -1083,6 +1258,9 @@ impl Transaction {
         }
         if self.body.publishers().is_none() {
             return Err(TxError::PreimageNotPublished);
+        }
+        if self.body.payouts().is_none() {
+            return Err(TxError::PayoutMissing);
         }
         let totals = Totals {
             inputs: total(inputs.iter().map(|i| i.amount))?,
@@ -1447,8 +1625,15 @@ mod tests {
             Self { seed, keys, tree }
         }
 
+        /// Key `index`, signing as member 0 of a condition's key set.
         fn signer(&self, index: u32) -> Signer {
+            self.member(0, index)
+        }
+
+        /// Key `index`, signing as member `member`.
+        fn member(&self, member: u8, index: u32) -> Signer {
             Signer {
+                member,
                 pubkey: self.keys[index as usize].clone(),
                 index,
                 path: self.tree.path(index),
@@ -1498,11 +1683,13 @@ mod tests {
     fn channel(a: &Party, b: &Party, state: u32) -> Condition {
         Condition {
             keys: vec![a.tree.root(), b.tree.root()],
+            threshold: 2,
             min_state: Some(state),
             mode: SigMode::AnyPrevout,
             after_height: 0,
             after_blocks: 0,
             hashlock: None,
+            payouts: None,
         }
     }
 
@@ -1520,7 +1707,7 @@ mod tests {
             inputs: vec![cond_input(
                 &[channel(&a, &b, state)],
                 0,
-                vec![a.signer(9), b.signer(9)],
+                vec![a.signer(9), b.member(1, 9)],
                 1000,
                 position,
                 state as u8,
@@ -1758,7 +1945,7 @@ mod tests {
         claim.nonce[..PREIMAGE_LEN].copy_from_slice(&pre);
         let body = TxBody {
             inputs: vec![
-                cond_input(&conditions, 0, vec![a.signer(2), b.signer(3)], 60, 8, 1),
+                cond_input(&conditions, 0, vec![a.signer(2), b.member(1, 3)], 60, 8, 1),
                 with_preimage(cond_input(&conditions, 1, vec![a.signer(0)], 40, 9, 2), pre),
             ],
             outputs: vec![claim, out(80, 5)],
@@ -1787,5 +1974,130 @@ mod tests {
             condition.after_blocks = MAX_LOCK + 1;
         }
         assert_eq!(bad.validate(), Err(TxError::BadCondition(1)));
+    }
+
+    /// Any 2 of 3 keys spend a 2-of-3 condition; one, a repeated member,
+    /// members out of order, or a key at the wrong member don't.
+    #[test]
+    fn a_threshold_of_the_keys_signs() {
+        let parties = [
+            Party::new(8000, 2),
+            Party::new(8100, 2),
+            Party::new(8200, 2),
+        ];
+        let cond = Condition {
+            threshold: 2,
+            ..Condition::all_of(parties.iter().map(|p| p.tree.root()).collect())
+        };
+        let spend = |signers: Vec<Signer>, keys: Vec<SecretKey>| {
+            let input = cond_input(std::slice::from_ref(&cond), 0, signers, 70, 3, 1);
+            Transaction::sign(TxBody::new(vec![input], vec![out(60, 2)]), keys).unwrap()
+        };
+        let m = |p: usize, i: u32| parties[p].member(p as u8, i);
+        let sk = |p: usize, i: u32| parties[p].sk(i);
+        for (x, y) in [(0, 1), (0, 2), (1, 2)] {
+            let t = spend(vec![m(x, 0), m(y, 0)], vec![sk(x, 0), sk(y, 0)]);
+            assert_eq!(t.validate(), totals(70, 60), "{x} and {y}");
+            assert_eq!(Transaction::from_bytes(&t.to_bytes()), Some(t));
+        }
+        let bad = [
+            spend(vec![m(0, 0)], vec![sk(0, 0)]),
+            spend(vec![m(1, 0), m(1, 1)], vec![sk(1, 0), sk(1, 1)]),
+            spend(vec![m(2, 0), m(0, 0)], vec![sk(2, 0), sk(0, 0)]),
+            spend(
+                vec![m(0, 0), parties[1].member(2, 0)],
+                vec![sk(0, 0), sk(1, 0)],
+            ),
+        ];
+        for t in bad {
+            assert_eq!(t.validate(), Err(TxError::BadCondition(0)));
+        }
+        // Thresholds must be from 1 to the number of keys.
+        for threshold in [0, 4] {
+            assert!(
+                !Condition {
+                    threshold,
+                    ..cond.clone()
+                }
+                .is_well_formed()
+            );
+        }
+    }
+
+    /// A protected 2-of-3 condition: two members spend it, paying the
+    /// third its payout; a payout missing, wrong or taken twice, too few
+    /// signers, or protection without a delay don't.
+    #[test]
+    fn protection_pays_the_members_who_dont_sign() {
+        let parties = [
+            Party::new(8300, 2),
+            Party::new(8400, 2),
+            Party::new(8500, 2),
+        ];
+        let payouts = [out(20, 10), out(30, 11), out(15, 12)];
+        let field = |o: &Output| o.commitment().unwrap().to_field().unwrap();
+        let cond = Condition {
+            threshold: 2,
+            after_blocks: 5,
+            payouts: Some(payouts.iter().map(field).collect()),
+            ..Condition::all_of(parties.iter().map(|p| p.tree.root()).collect())
+        };
+        assert!(cond.is_well_formed());
+        assert_eq!(Condition::from_bytes(&cond.to_bytes()), Some(cond.clone()));
+        let m = |p: usize| parties[p].member(p as u8, 0);
+        let sk = |p: usize| parties[p].sk(0);
+        let spend = |cond: &Condition, signers: Vec<usize>, outputs: Vec<Output>| {
+            let input = cond_input(
+                std::slice::from_ref(cond),
+                0,
+                signers.iter().map(|&p| m(p)).collect(),
+                65,
+                3,
+                1,
+            );
+            let keys = signers.iter().map(|&p| sk(p)).collect();
+            Transaction::sign(TxBody::new(vec![input], outputs), keys).unwrap()
+        };
+
+        // 0 and 2 sign; 1 is paid.
+        let t = spend(&cond, vec![0, 2], vec![out(30, 2), payouts[1]]);
+        assert_eq!(t.validate(), totals(65, 60));
+        assert_eq!(t.body.required_payouts(), vec![field(&payouts[1])]);
+        assert_eq!(t.body.payouts(), Some(vec![1]));
+        assert_eq!(Transaction::from_bytes(&t.to_bytes()), Some(t));
+        // All sign: nobody needs paying.
+        let t = spend(&cond, vec![0, 1, 2], vec![out(60, 2)]);
+        assert_eq!(t.validate(), totals(65, 60));
+        assert_eq!(t.body.payouts(), Some(vec![]));
+
+        // Unpaid, or paid the wrong amount.
+        let t = spend(&cond, vec![0, 2], vec![out(60, 2)]);
+        assert_eq!(t.validate(), Err(TxError::PayoutMissing));
+        let mut short = payouts[1];
+        short.amount -= 1;
+        let t = spend(&cond, vec![0, 2], vec![out(30, 2), short]);
+        assert_eq!(t.validate(), Err(TxError::PayoutMissing));
+        // Two members unpaid need two outputs, even with equal payouts.
+        let same = Condition {
+            threshold: 1,
+            payouts: Some(vec![field(&payouts[1]); 3]),
+            ..cond.clone()
+        };
+        let t = spend(&same, vec![0], vec![out(15, 2), payouts[1]]);
+        assert_eq!(t.validate(), Err(TxError::PayoutMissing));
+        // Below the threshold.
+        let t = spend(&cond, vec![2], vec![payouts[0], payouts[1]]);
+        assert_eq!(t.validate(), Err(TxError::BadCondition(0)));
+        // Protection needs a delay, and a payout per key.
+        let no_delay = Condition {
+            after_blocks: 0,
+            ..cond.clone()
+        };
+        assert!(!no_delay.is_well_formed());
+        let t = spend(&no_delay, vec![0, 2], vec![out(30, 2), payouts[1]]);
+        assert_eq!(t.validate(), Err(TxError::BadCondition(0)));
+        let mut few = cond.clone();
+        few.payouts.as_mut().unwrap().pop();
+        assert!(!few.is_well_formed());
     }
 }

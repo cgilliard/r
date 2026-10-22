@@ -614,8 +614,7 @@ pub const SIG_SHAPES: [SigChunkAir; 3] = [
 /// Condition chunk shapes, smallest first (`2^10`, `2^12` rows: shorter
 /// traces can't hide what a proof reveals). Blocks without condition
 /// spends have none.
-pub const COND_SHAPES: [CondChunkAir; 2] =
-    [CondChunkAir { slots: 48 }, CondChunkAir { slots: 195 }];
+pub const COND_SHAPES: [CondChunkAir; 2] = [CondChunkAir { slots: 9 }, CondChunkAir { slots: 39 }];
 
 /// Cuts `n` things into chunks: full chunks of the largest capacity, then
 /// the smallest that holds the rest. Returns (shape index, range).
@@ -698,7 +697,7 @@ fn signatures_and_conditions(
                         condition: condition.clone(),
                         leaf: *leaf,
                         path: *path,
-                        indices: signers.iter().map(|s| s.index).collect(),
+                        signers: signers.iter().map(|s| (s.member, s.index)).collect(),
                         preimage: preimage.map(|p| preimage_limbs(&p)),
                     });
                     index += 1;
@@ -1254,10 +1253,12 @@ mod tests {
         txn.commit().unwrap();
     }
 
-    /// A block with condition spends: a 2-of-2 channel update (any-prevout,
-    /// a later state's keys) and a hashlocked, timelocked output claimed
-    /// with its preimage (anyone-can-pay, with a fee input added), proved
-    /// and checked; and a spend before its timelock is refused.
+    /// A block with condition spends: a 2-of-3 channel update (any-prevout,
+    /// a later state's keys, the third party offline) and two hashlocked
+    /// outputs claimed in one transaction with their own preimages (the
+    /// first anyone-can-pay, the second and an added fee coin signing
+    /// everything), proved and checked; and a spend before its timelock is
+    /// refused.
     #[test]
     #[ignore = "slow: run in release"]
     fn proves_a_block_with_condition_spends() {
@@ -1269,18 +1270,23 @@ mod tests {
             (seed, keys, tree)
         };
         let (a, b) = (party(100), party(200));
-        let signer = |p: &(u32, Vec<crate::wots::PublicKey>, SignerTree), i: u32| Signer {
+        let signer = |p: &(u32, Vec<crate::wots::PublicKey>, SignerTree), member, i: u32| Signer {
+            member,
             pubkey: p.1[i as usize].clone(),
             index: i,
             path: p.2.path(i),
         };
+        // A 2-of-3 channel (a third party, c, stays offline).
+        let c = party(300);
         let channel = |state: u32| Condition {
-            keys: vec![a.2.root(), b.2.root()],
+            keys: vec![a.2.root(), b.2.root(), c.2.root()],
+            threshold: 2,
             min_state: Some(state),
             mode: SigMode::AnyPrevout,
             after_height: 0,
             after_blocks: 0,
             hashlock: None,
+            payouts: None,
         };
         let pre = [42u8; 15];
         let htlc = Condition {
@@ -1289,17 +1295,39 @@ mod tests {
             mode: SigMode::AnyoneCanPay,
             ..Condition::key(a.2.root())
         };
+        // A second hashlock, with another preimage, signing everything.
+        let pre2 = [43u8; 15];
+        let htlc2 = Condition {
+            hashlock: Some(hashlock(&pre2)),
+            ..Condition::key(a.2.root())
+        };
         let output = |conds: &[Condition], amount, tag: u8| Output {
             hash: KeyTree::of_conditions(conds).output_hash(),
             amount,
             nonce: [tag; NONCE_LEN],
         };
+        // A protected 2-of-3 channel: c's payout is 400.
+        let c_payout = pay(8, 400);
+        let field = |o: &Output| o.commitment().unwrap().to_field().unwrap();
+        let protected = Condition {
+            threshold: 2,
+            min_state: Some(1),
+            after_blocks: 2,
+            payouts: Some(vec![
+                field(&pay(11, 300)),
+                field(&c_payout),
+                field(&pay(12, 300)),
+            ]),
+            ..Condition::all_of(vec![a.2.root(), c.2.root(), b.2.root()])
+        };
         // The chain holds, from block 1: the channel at state 3, the
-        // HTLC, and a coin for fees.
+        // HTLCs, a coin for fees and the protected channel.
         let funds = [
             output(&[channel(3)], 1000, 1),
             output(std::slice::from_ref(&htlc), 300, 2),
             pay(9, 50),
+            output(std::slice::from_ref(&htlc2), 200, 4),
+            output(std::slice::from_ref(&protected), 1000, 5),
         ];
         let env = TempEnv::new();
         let tree = StateTree::open(env.env()).unwrap();
@@ -1328,7 +1356,7 @@ mod tests {
                     &funds[0],
                     &channel(3),
                     1,
-                    vec![signer(&a, 6), signer(&b, 6)],
+                    vec![signer(&a, 0, 6), signer(&b, 1, 6)],
                     None,
                 )],
                 outputs: vec![output(&[channel(6)], 990, 3)],
@@ -1345,25 +1373,59 @@ mod tests {
                 &funds[1],
                 &htlc,
                 2,
-                vec![signer(&a, 0)],
+                vec![signer(&a, 0, 0)],
                 Some(pre),
             )],
             outputs: vec![claim_out],
             signed_outputs: 1,
         };
         let claim_sig = body.messages().unwrap()[0];
+        // The second HTLC (its own preimage and output) and the fee coin
+        // are added; they sign everything.
+        let mut claim2_out = pay(7, 200);
+        claim2_out.nonce[..15].copy_from_slice(&pre2);
         let (fee_sk, fee_input) = spend(9, 50, funds[2].nonce, 3);
+        body.inputs.push(cond_input(
+            &funds[3],
+            &htlc2,
+            4,
+            vec![signer(&a, 0, 1)],
+            Some(pre2),
+        ));
         body.inputs.push(fee_input);
+        body.outputs.push(claim2_out);
         body.outputs.push(pay(6, 30));
         let messages = body.messages().unwrap();
         let claim = Transaction {
-            signatures: vec![key(100).0.sign(&claim_sig), fee_sk.sign(&messages[1])],
+            signatures: vec![
+                key(100).0.sign(&claim_sig),
+                key(101).0.sign(&messages[1]),
+                fee_sk.sign(&messages[2]),
+            ],
             body,
         };
+        // a and b move the protected channel on without c (member 1),
+        // paying c its 400.
+        let exit = Transaction::sign(
+            TxBody::new(
+                vec![cond_input(
+                    &funds[4],
+                    &protected,
+                    5,
+                    vec![signer(&a, 0, 2), signer(&b, 2, 2)],
+                    None,
+                )],
+                vec![pay(10, 590), c_payout],
+            ),
+            vec![key(102).0, key(202).0],
+        )
+        .unwrap();
         assert!(update.validate().is_ok() && claim.validate().is_ok());
+        assert_eq!(exit.body.payouts(), Some(vec![1]));
+        assert!(exit.validate().is_ok());
         let reward =
-            Transaction::sign(TxBody::new(vec![], vec![pay(4, SUBSIDY + 30)]), vec![]).unwrap();
-        let txs = [update, claim, reward];
+            Transaction::sign(TxBody::new(vec![], vec![pay(4, SUBSIDY + 40)]), vec![]).unwrap();
+        let txs = [update, claim, exit, reward];
 
         // At height 2 the HTLC is still locked (created at 1, 2 blocks).
         let mut txn = env.env().write_txn().unwrap();
@@ -1397,6 +1459,7 @@ mod tests {
             (s.lambda(), s.r()),
             challenges(&prev, &claimed, &s.tx_hash())
         );
-        assert_eq!((agg.inputs, agg.outputs.len()), (vec![1, 2, 3], 4));
+        assert_eq!(s.q_pre(), BabyBear4::ONE);
+        assert_eq!((agg.inputs, agg.outputs.len()), (vec![1, 2, 3, 4, 5], 7));
     }
 }
