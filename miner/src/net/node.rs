@@ -78,9 +78,12 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod post;
+mod relay;
 mod tree;
 
 pub use post::{GRACE, Post, PostConfig, PostEvent, REGISTER_EVERY};
+pub use relay::RelayKeys;
+use relay::Via;
 
 use super::peers::PeerStore;
 use super::wire::{
@@ -197,6 +200,9 @@ pub enum Event {
     Post(Post),
     /// The wallet has the answer to this payment: stop delivering it.
     PostDone(crate::wallet::SlateId),
+    /// The relay consensus ([`crate::onion`]): onion mode over these relays
+    /// (with the consensus file's hash), or init mode.
+    Relays(Option<(Vec<crate::onion::Relay>, crate::aux_leaves::Leaf)>),
 }
 
 /// The node's peers as of a moment: what the `peers` command shows.
@@ -254,6 +260,9 @@ pub struct Config {
     /// A wallet's payment address and hosts, to send and receive slates
     /// ([`post`]). Every node hosts others either way.
     pub post: Option<PostConfig>,
+    /// Relay onion circuits with this identity ([`relay`]), advertising
+    /// [`cap::ONION`].
+    pub relay: Option<RelayKeys>,
     /// Most open sessions, inbound and outbound.
     pub max_peers: usize,
     /// Fast sync: a new node starts this many blocks below the best peer's
@@ -277,6 +286,7 @@ impl Config {
             peer_store: None,
             preimages: None,
             post: None,
+            relay: None,
             sync_depth: None,
             loss_per_mille: 0,
         }
@@ -537,6 +547,7 @@ pub struct Node<B: Backend> {
     drop_counter: u32,
     trees: tree::Trees,
     post: post::PostState,
+    circuits: relay::Circuits,
 }
 
 fn now_secs() -> u64 {
@@ -607,6 +618,9 @@ impl<B: Backend> Node<B> {
         if cfg.preimages.is_some() {
             cfg.capabilities |= cap::TREE;
         }
+        if cfg.relay.is_some() {
+            cfg.capabilities |= cap::ONION;
+        }
         let mut rng = Rng::from_os().expect("OS randomness");
         let mut secret = [BabyBear::ZERO; HASH_LEN];
         rng.fill(&mut secret);
@@ -676,6 +690,7 @@ impl<B: Backend> Node<B> {
             drop_counter: 0,
             trees: tree::Trees::default(),
             post: post::PostState::default(),
+            circuits: relay::Circuits::default(),
         }
     }
 
@@ -722,6 +737,7 @@ impl<B: Backend> Node<B> {
                     }
                     Event::Post(post) => self.start_post(post),
                     Event::PostDone(id) => self.post_done(&id),
+                    Event::Relays(relays) => self.set_relays(relays),
                 }
             }
             self.tick();
@@ -917,11 +933,26 @@ impl<B: Backend> Node<B> {
         match cookie {
             Some(c) if self.cookie_ok(&addr, &c) => {
                 let reopening = self.peers.values().any(|p| p.addr == addr);
+                // Dialing each other at once: the lower node id dials, the
+                // other answers (else each would take the other's session
+                // and ignore the answer to its own).
+                if !reopening && self.dials.contains_key(&addr) && self.node_id < node_id {
+                    return;
+                }
                 if !reopening && self.peers.len() >= self.cfg.max_peers {
                     return;
                 }
-                // A validated address: (re)open a session.
-                self.peers.retain(|_, p| p.addr != addr);
+                // A validated address: (re)open a session, dropping the old
+                // one with all that went through it.
+                let old: Vec<u32> = self
+                    .peers
+                    .iter()
+                    .filter(|(_, p)| p.addr == addr)
+                    .map(|(&s, _)| s)
+                    .collect();
+                for s in old {
+                    self.drop_peer(s, "it opened a new session");
+                }
                 self.dials.remove(&addr);
                 let session = loop {
                     let s = self.rng.next_element().as_u32();
@@ -984,7 +1015,8 @@ impl<B: Backend> Node<B> {
             f.others.retain(|&s| s != session);
         }
         self.tree_lost_session(session);
-        self.post_lost_session(session);
+        self.circuits_lost_session(session);
+        self.post_lost_via(Via::Session(session));
     }
 
     fn on_message(&mut self, session: u32, msg: Message) {
@@ -1154,15 +1186,23 @@ impl<B: Backend> Node<B> {
                 self.on_preimage_info(session, hash, size, root)
             }
             Message::NoPreimage { hash } => self.on_no_preimage(session, hash),
-            Message::Register { ek } => self.on_register(session, ek),
-            Message::Challenge { address, ct } => self.on_challenge(session, address, ct),
-            Message::Prove { address, proof } => self.on_prove(session, address, proof),
-            Message::Registered { address } => self.on_registered(session, address),
-            Message::Lookup { address } => self.on_lookup(session, address),
-            Message::AddressKey { address, ek } => self.on_address_key(session, address, ek),
-            Message::Offline { address } => self.on_offline(session, address),
-            Message::Deliver { to, post, ct, data } => self.on_deliver(session, to, post, ct, data),
-            Message::Forwarded { to, post } => self.on_forwarded(session, to, post),
+            msg @ (Message::Register { .. }
+            | Message::Challenge { .. }
+            | Message::Prove { .. }
+            | Message::Registered { .. }
+            | Message::Lookup { .. }
+            | Message::AddressKey { .. }
+            | Message::Offline { .. }
+            | Message::Deliver { .. }
+            | Message::Forwarded { .. }) => self.on_post_message(Via::Session(session), msg),
+            Message::Create {
+                circ,
+                challenge,
+                ek,
+            } => self.on_create(session, circ, challenge, ek),
+            Message::Created { circ, index, data } => self.on_created(session, circ, index, data),
+            Message::Forward { circ, cell } => self.on_forward(session, circ, cell),
+            Message::Backward { circ, cell } => self.on_backward(session, circ, cell),
             Message::Hello { .. } | Message::Cookie { .. } | Message::Welcome { .. } => {}
         }
     }
@@ -2572,6 +2612,7 @@ impl<B: Backend> Node<B> {
         }
         self.start_tx_fetches();
         self.tree_tick(now);
+        self.circuits_tick(now);
         self.post_tick(now);
         self.maybe_download();
         self.maybe_sync();
@@ -3572,7 +3613,12 @@ mod tests {
         let store_b = PreimageStore::open(env_b.env()).unwrap();
         let key = "ab".repeat(32);
         // A file that fits a packet, and one sent in chunks.
-        let small = format!("onion 10.0.0.1:7 {key}").into_bytes();
+        let small = format!(
+            "onion 10.0.0.1:7 {key} 10.0.0.2:7 {} 10.0.0.3:7 {}",
+            "cd".repeat(32),
+            "ef".repeat(32)
+        )
+        .into_bytes();
         let big: String = std::iter::once("onion".to_string())
             .chain((0..80).map(|i| format!("\n10.0.{}.{}:7333 {:064x}", i / 200, i % 200, i)))
             .collect();
@@ -3728,6 +3774,135 @@ mod tests {
             PostEvent::Failed { id, to, why } => {
                 assert_eq!((id, to), ([8; 16], nobody));
                 assert!(why.ends_with("is offline"), "{why}");
+            }
+            e => panic!("{e:?}"),
+        }
+        assert!(bob_rx.try_recv().is_err());
+        drop(nb);
+    }
+
+    #[test]
+    fn slates_cross_onion_circuits_through_rendezvous_points() {
+        use crate::onion::{Relay, identity, key_hash};
+        use crate::payments::{Payload, PaymentKeys};
+        // Three relays: every address's rendezvous points, and each one's
+        // two hops.
+        let mut relays = Vec::new();
+        let mut relay_nodes = Vec::new();
+        let mut relay_logs = Vec::new();
+        for seed in 10..13u8 {
+            let (pk, sk) = identity(&[seed; 32]);
+            let lines = Arc::new(Mutex::new(vec![]));
+            let n = start_with(
+                Mock::new(),
+                Config {
+                    relay: Some(RelayKeys {
+                        pk: Box::new(pk),
+                        sk: Box::new(sk),
+                    }),
+                    ..Config::new(*b"test")
+                },
+                lines.clone(),
+            );
+            relays.push(Relay {
+                addr: n.addr,
+                key_hash: key_hash(&pk),
+            });
+            relay_nodes.push(n);
+            relay_logs.push(lines);
+        }
+        relays.sort();
+        let consensus = Some((relays.clone(), [42u8; 32]));
+        for n in &relay_nodes {
+            n.events.send(Event::Relays(consensus.clone())).unwrap();
+        }
+        let wallet = |seed: u8| {
+            let keys = PaymentKeys::from_entropy(&[seed; 32]);
+            let (tx, rx) = channel();
+            let lines = Arc::new(Mutex::new(vec![]));
+            let node = start_with(
+                Mock::new(),
+                Config {
+                    post: Some(PostConfig {
+                        keys: keys.clone(),
+                        hosts: vec![],
+                        events: tx,
+                    }),
+                    ..Config::new(*b"test")
+                },
+                lines.clone(),
+            );
+            node.events.send(Event::Relays(consensus.clone())).unwrap();
+            (keys.address, node, rx, lines)
+        };
+        let (alice, na, alice_rx, alice_log) = wallet(1);
+        let (bob, nb, bob_rx, bob_log) = wallet(2);
+        let registered = |log: &Arc<Mutex<Vec<String>>>| {
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|l| l.contains("registered with rendezvous point"))
+                .count()
+        };
+        for log in [&alice_log, &bob_log] {
+            wait_for("registration at all 3 points", 20, || registered(log) == 3);
+        }
+        // Relays advertise ONION.
+        assert!(has_line(&alice_log, "capabilities 0005"));
+
+        // Alice to Bob, and Bob's answer back, through circuits.
+        let request = Payload::Request {
+            id: [7; 16],
+            amount: 5,
+            fee: 1,
+            reply: alice,
+        };
+        na.events
+            .send(Event::Post(Post {
+                to: bob,
+                id: [7; 16],
+                payload: request,
+                wait_for_answer: true,
+            }))
+            .unwrap();
+        match bob_rx.recv_timeout(Duration::from_secs(20)).unwrap() {
+            PostEvent::Received(p) => assert_eq!(p, request),
+            e => panic!("{e:?}"),
+        }
+        let held = Payload::Held { id: [7; 16] };
+        nb.events
+            .send(Event::Post(Post {
+                to: alice,
+                id: [7; 16],
+                payload: held,
+                wait_for_answer: false,
+            }))
+            .unwrap();
+        match alice_rx.recv_timeout(Duration::from_secs(20)).unwrap() {
+            PostEvent::Received(p) => assert_eq!(p, held),
+            e => panic!("{e:?}"),
+        }
+        na.events.send(Event::PostDone([7; 16])).unwrap();
+        // No relay saw a session with the other wallet: the wallets reached
+        // each other only through circuits.
+        for log in &relay_logs {
+            assert!(has_line(log, "connected"));
+        }
+
+        // An address no one registered: offline at every point.
+        let nobody = PaymentKeys::from_entropy(&[3; 32]).address;
+        na.events
+            .send(Event::Post(Post {
+                to: nobody,
+                id: [8; 16],
+                payload: request,
+                wait_for_answer: true,
+            }))
+            .unwrap();
+        match alice_rx.recv_timeout(Duration::from_secs(30)).unwrap() {
+            PostEvent::Failed { id, why, .. } => {
+                assert_eq!(id, [8; 16]);
+                assert!(why.contains("at all its rendezvous points"), "{why}");
             }
             e => panic!("{e:?}"),
         }

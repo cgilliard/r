@@ -3386,9 +3386,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("r-cli-relays-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("consensus.txt");
-        std::fs::write(&file, format!("onion\n10.1.2.3:7333 {key}\n")).unwrap();
+        let others = format!(
+            "10.1.2.4:7333 {}\n10.1.2.5:7333 {}\n",
+            "4".repeat(64),
+            "5".repeat(64)
+        );
+        std::fs::write(&file, format!("onion\n10.1.2.3:7333 {key}\n{others}")).unwrap();
         let out = run(&alice, &format!("aux_leaf_file 0 {}", file.display())).unwrap();
-        assert!(out.contains("this file says onion (1 relay)"), "{out}");
+        assert!(out.contains("this file says onion (3 relays)"), "{out}");
 
         // Ten blocks commit to it, but the newest ten don't count yet.
         for _ in 0..10 {
@@ -3399,7 +3404,7 @@ mod tests {
         assert!(out.contains("blocks counted: none yet"), "{out}");
         block(&[&alice], &[], &[]);
         let out = run(&alice, "relay_consensus").unwrap();
-        assert!(out.starts_with("mode: onion (1 relay)"), "{out}");
+        assert!(out.starts_with("mode: onion (3 relays)"), "{out}");
         assert!(out.contains("(1 block commits to it)"), "{out}");
         assert!(out.contains(&format!("\n  10.1.2.3:7333 {key}")), "{out}");
 

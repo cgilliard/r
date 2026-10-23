@@ -55,6 +55,8 @@ pub const MAX_INLINE_PREIMAGE: usize = MAX_PACKET - HEADER_LEN - 32 - 2;
 /// A SHA-256 hash, as aux trees use ([`crate::preimages`]).
 pub type Sha256 = [u8; 32];
 /// Longest sealed slate in a `DELIVER`: what's left of a datagram.
+/// Bytes in an onion cell ([`crate::onion_circuit`]).
+pub const CELL_LEN: usize = MAX_PACKET - HEADER_LEN - 4;
 pub const MAX_DELIVER_DATA: usize = MAX_PACKET - HEADER_LEN - 32 - 4 - CT_LEN - 2;
 const _: () = assert!(MAX_DELIVER_DATA >= 160);
 
@@ -276,6 +278,29 @@ pub enum Message {
         to: Address,
         post: u32,
     },
+    /// Onion mode ([`crate::onion_circuit`]): open circuit `circ` on this
+    /// link to the receiving relay: a challenge and a fresh key.
+    Create {
+        circ: u32,
+        challenge: [u8; 32],
+        ek: Box<[u8; EK_LEN]>,
+    },
+    /// Piece `index` of the relay's answer.
+    Created {
+        circ: u32,
+        index: u8,
+        data: Vec<u8>,
+    },
+    /// A cell going out on circuit `circ` (away from its client).
+    Forward {
+        circ: u32,
+        cell: Box<[u8; CELL_LEN]>,
+    },
+    /// A cell coming back on circuit `circ` (toward its client).
+    Backward {
+        circ: u32,
+        cell: Box<[u8; CELL_LEN]>,
+    },
 }
 
 /// What a preimage's chunks are requested under.
@@ -324,6 +349,10 @@ impl Message {
             Self::Offline { .. } => 36,
             Self::Deliver { .. } => 37,
             Self::Forwarded { .. } => 38,
+            Self::Create { .. } => 39,
+            Self::Created { .. } => 40,
+            Self::Forward { .. } => 41,
+            Self::Backward { .. } => 42,
         }
     }
 
@@ -368,6 +397,10 @@ impl Message {
             Self::Offline { .. } => "OFFLINE",
             Self::Deliver { .. } => "DELIVER",
             Self::Forwarded { .. } => "FORWARDED",
+            Self::Create { .. } => "CREATE",
+            Self::Created { .. } => "CREATED",
+            Self::Forward { .. } => "FORWARD",
+            Self::Backward { .. } => "BACKWARD",
         }
     }
 }
@@ -593,6 +626,29 @@ pub fn encode(magic: [u8; 4], packet: Packet, msg: &Message) -> Vec<u8> {
         Message::Forwarded { to, post } => {
             out.extend(to.0);
             out.extend(post.to_le_bytes());
+        }
+        Message::Create {
+            circ,
+            challenge,
+            ek,
+        } => {
+            out.extend(circ.to_le_bytes());
+            out.extend(challenge);
+            out.extend(&ek[..]);
+        }
+        Message::Created { circ, index, data } => {
+            assert!(
+                data.len() <= crate::onion_circuit::FRAGMENT,
+                "piece too long"
+            );
+            out.extend(circ.to_le_bytes());
+            out.push(*index);
+            out.extend((data.len() as u16).to_le_bytes());
+            out.extend(data);
+        }
+        Message::Forward { circ, cell } | Message::Backward { circ, cell } => {
+            out.extend(circ.to_le_bytes());
+            out.extend(&cell[..]);
         }
     }
     assert!(
@@ -889,6 +945,32 @@ pub fn decode(magic: [u8; 4], bytes: &[u8]) -> Result<(Packet, Message), WireErr
             to: Address(r.array()?),
             post: r.u32()?,
         },
+        39 => Message::Create {
+            circ: r.u32()?,
+            challenge: r.array()?,
+            ek: Box::new(r.array()?),
+        },
+        40 => {
+            let circ = r.u32()?;
+            let index = r.u8()?;
+            let len = r.u16()? as usize;
+            if len > crate::onion_circuit::FRAGMENT {
+                return Err(WireError::Malformed);
+            }
+            Message::Created {
+                circ,
+                index,
+                data: r.take(len)?.to_vec(),
+            }
+        }
+        41 => Message::Forward {
+            circ: r.u32()?,
+            cell: Box::new(r.array()?),
+        },
+        42 => Message::Backward {
+            circ: r.u32()?,
+            cell: Box::new(r.array()?),
+        },
         t => return Err(WireError::UnknownType(t)),
     };
     r.end()?;
@@ -1076,6 +1158,24 @@ mod tests {
             Message::Forwarded {
                 to: Address([13; 32]),
                 post: 77,
+            },
+            Message::Create {
+                circ: 5,
+                challenge: [16; 32],
+                ek: Box::new([17; EK_LEN]),
+            },
+            Message::Created {
+                circ: 5,
+                index: 4,
+                data: vec![18; crate::onion_circuit::FRAGMENT],
+            },
+            Message::Forward {
+                circ: u32::MAX,
+                cell: Box::new([19; CELL_LEN]),
+            },
+            Message::Backward {
+                circ: 6,
+                cell: Box::new([20; CELL_LEN]),
             },
         ];
         let packet = Packet {

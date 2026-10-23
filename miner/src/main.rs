@@ -56,6 +56,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         restore: args.restore,
         debug_no_proofs: args.debug_no_proofs,
         auto_receive: !args.no_automatic_receive,
+        relay: args.relay,
     };
     r::daemon::run(&args.data_dir, &net, &opts)
 }

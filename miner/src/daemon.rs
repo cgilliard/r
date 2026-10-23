@@ -51,8 +51,8 @@ use crate::header::{self, Consensus, FRAC_BITS, Header};
 use crate::ledger::{Added, Ledger, Verifier};
 use crate::mempool::Mempool;
 use crate::net::LedgerBackend;
-use crate::net::node::PostConfig;
 use crate::net::node::{self, Config, Event, Node};
+use crate::net::node::{PostConfig, RelayKeys};
 use crate::net::peers::PeerStore;
 use crate::net::wire::cap;
 use crate::output::{Amount, format_coins};
@@ -339,6 +339,7 @@ fn node(
     net: &Net,
     mempool: Arc<Mempool>,
     post: PostConfig,
+    relay: Option<RelayKeys>,
 ) -> Result<Node<LedgerBackend>, Box<dyn Error>> {
     let addr = net
         .listen
@@ -371,6 +372,7 @@ fn node(
         // Serve and fetch aux trees' preimages (advertising cap::TREE).
         preimages: Some(PreimageStore::open(&o.ledger.env)?),
         post: Some(post),
+        relay,
         sync_depth: Some(net.sync_depth),
         max_peers: net.max_peers,
         ..Config::new(magic)
@@ -428,6 +430,8 @@ pub struct Options {
     /// Answer payments to our address as they come (else they wait for
     /// `accept`).
     pub auto_receive: bool,
+    /// Relay onion circuits (`--relay`).
+    pub relay: bool,
 }
 
 /// Runs the node on the chain in `data_dir/chain` (creating it if there's
@@ -523,7 +527,21 @@ pub fn run(data_dir: &Path, net: &Net, opts: &Options) -> Result<(), Box<dyn Err
         events: post_events,
     };
 
-    let mut n = node(&log, &o, net, mempool.clone(), post)?;
+    // A relay's identity, from the recovery words too.
+    let relay = opts.relay.then(|| {
+        let (pk, sk) = crate::onion::identity(&entropy);
+        log.line(format!(
+            "relaying onion circuits as relay key {} (give it, with this node's address, to \
+             whoever keeps the consensus file)",
+            crate::wallet::hex(&crate::onion::key_hash(&pk))
+        ));
+        RelayKeys {
+            pk: Box::new(pk),
+            sk: Box::new(sk),
+        }
+    });
+
+    let mut n = node(&log, &o, net, mempool.clone(), post, relay)?;
     let synced = n.synced();
     let (events, rx) = channel();
     let node_thread = {
@@ -574,6 +592,28 @@ pub fn run(data_dir: &Path, net: &Net, opts: &Options) -> Result<(), Box<dyn Err
             Box::new(move |line| log.line(line))
         },
     });
+    // The relay consensus as the chain has it (onion mode or init), for the
+    // node, which checks it every few seconds.
+    {
+        let (ledger, events, stop) = (o.ledger.clone(), cli.events.clone(), stop.clone());
+        let preimages = PreimageStore::open(&o.ledger.env)?;
+        thread::spawn(move || {
+            let mut last = None;
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(c) = crate::onion::current(&ledger, &preimages) {
+                    let relays = match (c.mode, c.file) {
+                        (crate::onion::Mode::Onion(r), Some((file, _))) => Some((r, file)),
+                        _ => None,
+                    };
+                    if last.as_ref() != Some(&relays) {
+                        let _ = events.send(Event::Relays(relays.clone()));
+                        last = Some(relays);
+                    }
+                }
+                thread::sleep(Duration::from_secs(5));
+            }
+        });
+    }
     // What the post brings: payment requests to answer, answers to
     // finalize, failures.
     {

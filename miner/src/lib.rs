@@ -29,6 +29,7 @@ pub mod mnemonic;
 pub mod net;
 pub mod ntt;
 pub mod onion;
+pub mod onion_circuit;
 pub mod output;
 pub mod packed;
 pub mod par;

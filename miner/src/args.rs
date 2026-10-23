@@ -53,6 +53,9 @@ Options:
       --no-automatic-receive Hold payments sent to our address until
                              accepted (accept <id>), instead of answering
                              them as they come
+      --relay                Relay onion circuits for others (needs to
+                             accept peers): print this node's relay key
+                             with relay_key, for the consensus file
       --slate-host <HOST:PORT>
                              Pass payments through this host instead of the
                              seed nodes (may be repeated)
@@ -117,6 +120,8 @@ pub struct Args {
     pub no_automatic_receive: bool,
     /// Hosts for payments (`host:port`; the seeds if none).
     pub slate_hosts: Vec<String>,
+    /// Relay onion circuits.
+    pub relay: bool,
 }
 
 /// What the command line asked for.
@@ -189,6 +194,7 @@ impl Args {
         let mut debug_no_proofs = false;
         let mut no_automatic_receive = false;
         let mut slate_hosts: Vec<String> = Vec::new();
+        let mut relay = false;
         let mut args = args.into_iter().map(Into::into);
 
         while let Some(arg) = args.next() {
@@ -221,6 +227,7 @@ impl Args {
                 | "--restore"
                 | "--compact-db"
                 | "--no-automatic-receive"
+                | "--relay"
                 | "--debug-no-proof-validation" => {
                     let (opt, set) = match name {
                         "--no-mine" => ("--no-mine", &mut no_mine),
@@ -231,6 +238,7 @@ impl Args {
                         "--no-automatic-receive" => {
                             ("--no-automatic-receive", &mut no_automatic_receive)
                         }
+                        "--relay" => ("--relay", &mut relay),
                         _ => ("--debug-no-proof-validation", &mut debug_no_proofs),
                     };
                     if inline.is_some() {
@@ -320,6 +328,9 @@ impl Args {
         if no_listen && listen.is_some() {
             return Err(ArgsError::Conflict("--listen", "--no-listen"));
         }
+        if no_listen && relay {
+            return Err(ArgsError::Conflict("--relay", "--no-listen"));
+        }
         Ok(Command::Run(Args {
             data_dir: data_dir.unwrap_or_else(default_data_dir),
             no_mine,
@@ -336,6 +347,7 @@ impl Args {
             debug_no_proofs,
             no_automatic_receive,
             slate_hosts,
+            relay,
         }))
     }
 }
@@ -373,6 +385,7 @@ mod tests {
             debug_no_proofs: false,
             no_automatic_receive: false,
             slate_hosts: vec![],
+            relay: false,
         }))
     }
 
@@ -410,6 +423,7 @@ mod tests {
                 debug_no_proofs: false,
                 no_automatic_receive: false,
                 slate_hosts: vec![],
+                relay: false,
             }))
         };
         assert_eq!(parse(&["--no-mine"]), want(true, false));
@@ -555,6 +569,7 @@ mod tests {
             debug_no_proofs: false,
             no_automatic_receive: false,
             slate_hosts: vec![],
+            relay: false,
         }));
         assert_eq!(
             parse(&[
@@ -647,6 +662,7 @@ mod tests {
                 debug_no_proofs: false,
                 no_automatic_receive: false,
                 slate_hosts: vec![],
+                relay: false,
             }))
         );
     }

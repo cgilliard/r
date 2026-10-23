@@ -29,7 +29,14 @@ use crate::aux_leaves::Leaf;
 use crate::crypto::{keccak, mldsa};
 use crate::ledger::Ledger;
 use crate::mnemonic::{ENTROPY_LEN, sha256};
+use crate::payments::Address;
 use crate::preimages::PreimageStore;
+
+/// Fewest relays an onion-mode file may list: each rendezvous point is
+/// reached through 2 others.
+pub const MIN_RELAYS: usize = 3;
+/// Rendezvous points per payment address.
+pub const RENDEZVOUS: usize = 3;
 
 /// The aux leaf that holds the consensus file's hash.
 pub const CONSENSUS_LEAF: usize = 0;
@@ -128,11 +135,31 @@ pub fn parse(bytes: &[u8]) -> Result<Mode, String> {
         }
         relays.push(relay);
     }
-    if relays.is_empty() {
-        return Err("onion mode with no relays".into());
+    if relays.len() < MIN_RELAYS {
+        return Err(format!(
+            "onion mode needs at least {MIN_RELAYS} relays; this lists {}",
+            relays.len()
+        ));
     }
     relays.sort();
     Ok(Mode::Onion(relays))
+}
+
+/// The rendezvous points of `address` under the consensus file `file`
+/// among `relays`: the [`RENDEZVOUS`] whose `SHA-256(address || key hash ||
+/// file)` is lowest, best first. A recipient keeps a circuit open to each;
+/// a sender tries them in turn. They move when the file changes.
+pub fn rendezvous(address: &Address, relays: &[Relay], file: &Leaf) -> Vec<Relay> {
+    let mut ranked: Vec<(Leaf, Relay)> = relays
+        .iter()
+        .map(|r| (sha256(&[&address.0[..], &r.key_hash, file].concat()), *r))
+        .collect();
+    ranked.sort();
+    ranked
+        .into_iter()
+        .take(RENDEZVOUS)
+        .map(|(_, r)| r)
+        .collect()
 }
 
 /// The file with the most `votes` (oldest first), ties to the most recent
@@ -227,18 +254,23 @@ mod tests {
         assert_eq!(parse(b"init"), Ok(Mode::Init));
         assert_eq!(parse(b"  INIT \r\n"), Ok(Mode::Init));
         let text = format!(
-            "onion\n  1.2.3.4:5000   {KEY}\n{}\t[::1]:9\n",
-            KEY.replace('0', "f")
+            "onion\n  1.2.3.4:5000   {KEY}\n{}\t[::1]:9\n10.0.0.1:1 {}",
+            KEY.replace('0', "f"),
+            KEY.replace('0', "e")
         );
         let Ok(Mode::Onion(relays)) = parse(text.as_bytes()) else {
             panic!("{:?}", parse(text.as_bytes()));
         };
-        assert_eq!(relays.len(), 2);
+        assert_eq!(relays.len(), 3);
         assert_eq!(relays[0].addr, "1.2.3.4:5000".parse().unwrap());
         assert_eq!(relays[0].key_hash, parse_hash(KEY).unwrap());
-        assert_eq!(relays[1].addr, "[::1]:9".parse().unwrap());
+        assert_eq!(relays[2].addr, "[::1]:9".parse().unwrap());
         // Order doesn't matter: the same relays.
-        let swapped = format!("onion {} [::1]:9 1.2.3.4:5000 {KEY}", KEY.replace('0', "f"));
+        let swapped = format!(
+            "onion {} 10.0.0.1:1 {} [::1]:9 1.2.3.4:5000 {KEY}",
+            KEY.replace('0', "e"),
+            KEY.replace('0', "f")
+        );
         assert_eq!(parse(swapped.as_bytes()), Ok(Mode::Onion(relays)));
         for bad in [
             String::new(),
@@ -250,6 +282,8 @@ mod tests {
             format!("onion 1.2.3.4:5 {}", &KEY[2..]),
             format!("onion 1.2.3.4:5 {KEY} 1.2.3.4:5 {}", KEY.replace('0', "f")),
             format!("onion 1.2.3.4:5 {KEY} 1.2.3.4:6 {KEY}"),
+            // Too few relays.
+            format!("onion 1.2.3.4:5 {KEY} 1.2.3.4:6 {}", KEY.replace('0', "f")),
         ] {
             assert!(parse(bad.as_bytes()).is_err(), "{bad:?}");
         }
@@ -266,6 +300,26 @@ mod tests {
         assert!(window(5).is_empty());
         assert_eq!(window(11), 1..=1);
         assert_eq!(window(500), 391..=490);
+    }
+
+    #[test]
+    fn rendezvous_points_follow_the_address_and_the_file() {
+        let relays: Vec<Relay> = (0..10u8)
+            .map(|i| Relay {
+                addr: SocketAddr::from(([10, 0, 0, i], 7)),
+                key_hash: [i; 32],
+            })
+            .collect();
+        let (a, b) = (Address([1; 32]), Address([2; 32]));
+        let rps = rendezvous(&a, &relays, &[0; 32]);
+        assert_eq!(rps.len(), RENDEZVOUS);
+        assert_eq!(rendezvous(&a, &relays, &[0; 32]), rps);
+        assert_ne!(rendezvous(&b, &relays, &[0; 32]), rps);
+        assert_ne!(rendezvous(&a, &relays, &[1; 32]), rps);
+        // With the fewest relays, every one is a rendezvous point.
+        let mut three = rendezvous(&a, &relays[..3], &[0; 32]);
+        three.sort();
+        assert_eq!(three, relays[..3]);
     }
 
     #[test]
