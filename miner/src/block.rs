@@ -1206,6 +1206,7 @@ mod tests {
             timestamp: 1600,
             state: claimed,
             body: block.body_hash(),
+            aux_hash: [0; 32],
             nonce: 0,
         };
         let bytes = encode(&header, &block);

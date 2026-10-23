@@ -749,7 +749,7 @@ pub struct Locked {
 }
 
 /// An output as bytes: hash, amount, nonce.
-fn output_bytes(o: &Output) -> Vec<u8> {
+pub(crate) fn output_bytes(o: &Output) -> Vec<u8> {
     let mut out = o.hash.to_vec();
     out.extend(o.amount.to_le_bytes());
     out.extend(o.nonce);
@@ -758,7 +758,7 @@ fn output_bytes(o: &Output) -> Vec<u8> {
 
 const OUTPUT_LEN: usize = OUTPUT_HASH_LEN + 8 + NONCE_LEN;
 
-fn output_from_bytes(b: &[u8]) -> Option<Output> {
+pub(crate) fn output_from_bytes(b: &[u8]) -> Option<Output> {
     (b.len() == OUTPUT_LEN).then(|| Output {
         hash: b[..OUTPUT_HASH_LEN].try_into().expect("length"),
         amount: u64::from_le_bytes(

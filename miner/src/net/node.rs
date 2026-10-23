@@ -65,6 +65,9 @@
 //! an id fetches it (`GET_TX`, then its chunks, checked against the id),
 //! several at a time, and adds it through [`Backend::add_tx`]; a peer whose
 //! transaction is invalid in itself is dropped.
+//!
+//! **Preimages.** A node with a preimage store serves and fetches what
+//! blocks' aux roots lead to ([`tree`]).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -73,6 +76,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+mod post;
+mod tree;
+
+pub use post::{GRACE, Post, PostConfig, PostEvent, REGISTER_EVERY};
 
 use super::peers::PeerStore;
 use super::wire::{
@@ -85,6 +93,7 @@ use crate::chunk::{self, Assembly, ChunkError, Served};
 use crate::hash::{self, HASH_LEN, Hash, domain};
 use crate::header::{HEADER_BYTES, Header};
 use crate::ledger::{Added, Snapshot};
+use crate::preimages::PreimageStore;
 use crate::rng::Rng;
 use crate::state::SyncPut;
 
@@ -184,6 +193,10 @@ pub enum Event {
     NewTx(Hash),
     /// Send a [`PeerReport`] to the given channel.
     Peers(std::sync::mpsc::Sender<PeerReport>),
+    /// Send a payload to a payment address ([`post`]).
+    Post(Post),
+    /// The wallet has the answer to this payment: stop delivering it.
+    PostDone(crate::wallet::SlateId),
 }
 
 /// The node's peers as of a moment: what the `peers` command shows.
@@ -235,6 +248,12 @@ pub struct Config {
     pub outbound: usize,
     /// Where to keep the address book, if anywhere.
     pub peer_store: Option<PeerStore>,
+    /// Where to keep preimages for aux trees: with one, the node serves
+    /// and fetches them, and advertises [`cap::TREE`].
+    pub preimages: Option<PreimageStore>,
+    /// A wallet's payment address and hosts, to send and receive slates
+    /// ([`post`]). Every node hosts others either way.
+    pub post: Option<PostConfig>,
     /// Most open sessions, inbound and outbound.
     pub max_peers: usize,
     /// Fast sync: a new node starts this many blocks below the best peer's
@@ -256,6 +275,8 @@ impl Config {
             outbound: 8,
             max_peers: 64,
             peer_store: None,
+            preimages: None,
+            post: None,
             sync_depth: None,
             loss_per_mille: 0,
         }
@@ -514,6 +535,8 @@ pub struct Node<B: Backend> {
     synced: Arc<AtomicBool>,
     started: Instant,
     drop_counter: u32,
+    trees: tree::Trees,
+    post: post::PostState,
 }
 
 fn now_secs() -> u64 {
@@ -577,10 +600,13 @@ impl<B: Backend> Node<B> {
     /// `log`.
     pub fn new(
         socket: UdpSocket,
-        cfg: Config,
+        mut cfg: Config,
         backend: B,
         log: Box<dyn Fn(String) + Send>,
     ) -> Self {
+        if cfg.preimages.is_some() {
+            cfg.capabilities |= cap::TREE;
+        }
         let mut rng = Rng::from_os().expect("OS randomness");
         let mut secret = [BabyBear::ZERO; HASH_LEN];
         rng.fill(&mut secret);
@@ -648,6 +674,8 @@ impl<B: Backend> Node<B> {
             synced: Arc::new(AtomicBool::new(false)),
             started: now,
             drop_counter: 0,
+            trees: tree::Trees::default(),
+            post: post::PostState::default(),
         }
     }
 
@@ -692,6 +720,8 @@ impl<B: Backend> Node<B> {
                     Event::Peers(reply) => {
                         let _ = reply.send(self.peer_report());
                     }
+                    Event::Post(post) => self.start_post(post),
+                    Event::PostDone(id) => self.post_done(&id),
                 }
             }
             self.tick();
@@ -953,6 +983,8 @@ impl<B: Backend> Node<B> {
         for f in self.tx_fetches.values_mut() {
             f.others.retain(|&s| s != session);
         }
+        self.tree_lost_session(session);
+        self.post_lost_session(session);
     }
 
     fn on_message(&mut self, session: u32, msg: Message) {
@@ -992,6 +1024,9 @@ impl<B: Backend> Node<B> {
             }
             Message::BlockChunk { hash, index, data } => self.on_chunk(session, hash, index, &data),
             Message::NotFound { hash } => {
+                if self.trees.has_id(&hash) {
+                    self.tree_not_found(session, &hash);
+                }
                 if self
                     .tx_fetches
                     .get(&hash)
@@ -1113,6 +1148,21 @@ impl<B: Backend> Node<B> {
                 None => self.send_peer(session, &Message::NotFound { hash: id }),
             },
             Message::TxInfo { id, size, root } => self.on_tx_info(session, id, size, root),
+            Message::GetPreimage { hash } => self.on_get_preimage(session, hash),
+            Message::Preimage { hash, data } => self.on_preimage(session, hash, data),
+            Message::PreimageInfo { hash, size, root } => {
+                self.on_preimage_info(session, hash, size, root)
+            }
+            Message::NoPreimage { hash } => self.on_no_preimage(session, hash),
+            Message::Register { ek } => self.on_register(session, ek),
+            Message::Challenge { address, ct } => self.on_challenge(session, address, ct),
+            Message::Prove { address, proof } => self.on_prove(session, address, proof),
+            Message::Registered { address } => self.on_registered(session, address),
+            Message::Lookup { address } => self.on_lookup(session, address),
+            Message::AddressKey { address, ek } => self.on_address_key(session, address, ek),
+            Message::Offline { address } => self.on_offline(session, address),
+            Message::Deliver { to, post, ct, data } => self.on_deliver(session, to, post, ct, data),
+            Message::Forwarded { to, post } => self.on_forwarded(session, to, post),
             Message::Hello { .. } | Message::Cookie { .. } | Message::Welcome { .. } => {}
         }
     }
@@ -1392,10 +1442,11 @@ impl<B: Backend> Node<B> {
     // Serving.
 
     /// The body with header hash `hash`, ready to serve: its size and root.
-    /// (Or the mempool transaction with id `hash`.)
+    /// (Or the mempool transaction with id `hash`, or a preimage being
+    /// served in chunks under this id.)
     fn serve(&mut self, hash: &Hash) -> Option<(u32, Hash)> {
         let cached = |c: &VecDeque<(Hash, Served)>| c.iter().any(|(h, _)| h == hash);
-        if !cached(&self.served) && !cached(&self.served_txs) {
+        if !cached(&self.served) && !cached(&self.served_txs) && !cached(&self.trees.served) {
             if let Some(body) = self.backend.body(hash) {
                 if self.served.len() == SERVED_CACHE {
                     self.served.pop_front();
@@ -1413,6 +1464,7 @@ impl<B: Backend> Node<B> {
             .served
             .iter()
             .chain(&self.served_txs)
+            .chain(&self.trees.served)
             .find(|(h, _)| h == hash)?;
         Some((s.bytes.len() as u32, s.root))
     }
@@ -1432,6 +1484,7 @@ impl<B: Backend> Node<B> {
                 .served
                 .iter()
                 .chain(&self.served_txs)
+                .chain(&self.trees.served)
                 .find(|(h, _)| *h == hash)
                 .expect("cached")
                 .1;
@@ -1843,6 +1896,10 @@ impl<B: Backend> Node<B> {
     fn on_chunk(&mut self, session: u32, hash: Hash, index: u32, data: &[u8]) {
         if self.tx_fetches.contains_key(&hash) {
             self.on_tx_chunk(session, hash, index, data);
+            return;
+        }
+        if self.trees.has_id(&hash) {
+            self.on_tree_chunk(session, hash, index, data);
             return;
         }
         let Some(d) = &mut self.download else {
@@ -2514,6 +2571,8 @@ impl<B: Backend> Node<B> {
             }
         }
         self.start_tx_fetches();
+        self.tree_tick(now);
+        self.post_tick(now);
         self.maybe_download();
         self.maybe_sync();
         self.check_synced(now);
@@ -2591,6 +2650,8 @@ mod tests {
         /// The mempool: any bytes are a transaction, unless they start with
         /// 0xff (invalid).
         txs: HashMap<Hash, Vec<u8>>,
+        /// The aux hash of blocks mined from now on.
+        aux: [u8; 32],
     }
 
     /// A state download: the base, the nodes still wanted (with their
@@ -2646,6 +2707,7 @@ mod tests {
                 served: 0,
                 sync: None,
                 txs: HashMap::new(),
+                aux: [0; 32],
             })))
         }
 
@@ -2669,7 +2731,7 @@ mod tests {
         /// Adds a block on `parent` (the tip if `None`) whose body is `size`
         /// bytes derived from `seed`.
         fn mine_on(&self, parent: Option<Hash>, size: usize, seed: u8) -> Header {
-            let (parent, before) = {
+            let (parent, before, aux_hash) = {
                 let c = self.0.lock().unwrap();
                 let parent = c.blocks[&parent.unwrap_or(*c.main.last().unwrap())].0;
                 // The hashes up to the parent, by walking back.
@@ -2680,7 +2742,7 @@ mod tests {
                     before.push(h.hash());
                 }
                 before.reverse();
-                (parent, before)
+                (parent, before, c.aux)
             };
             let body: Vec<u8> = (0..size)
                 .map(|i| (i as u8).wrapping_mul(seed) ^ (i >> 8) as u8)
@@ -2690,6 +2752,7 @@ mod tests {
                 prev: parent.hash(),
                 timestamp: parent.timestamp + 1,
                 body: chunk::hash_of(domain::BLOCK_BODY, &body),
+                aux_hash,
                 nonce: seed as u64,
                 state: crate::state::State {
                     root: digest(&mock_root_node(&before)),
@@ -3495,5 +3558,180 @@ mod tests {
         let mut want = vec![a, b];
         want.sort();
         assert_eq!(saved, want);
+    }
+
+    #[test]
+    fn aux_trees_and_their_files_come_from_peers_that_serve_them() {
+        use crate::aux_leaves::{AUX_LEAVES, root};
+        use crate::mnemonic::sha256;
+        let (env_a, env_b) = (
+            crate::db::test::TempEnv::new(),
+            crate::db::test::TempEnv::new(),
+        );
+        let store_a = PreimageStore::open(env_a.env()).unwrap();
+        let store_b = PreimageStore::open(env_b.env()).unwrap();
+        let key = "ab".repeat(32);
+        // A file that fits a packet, and one sent in chunks.
+        let small = format!("onion 10.0.0.1:7 {key}").into_bytes();
+        let big: String = std::iter::once("onion".to_string())
+            .chain((0..80).map(|i| format!("\n10.0.{}.{}:7333 {:064x}", i / 200, i % 200, i)))
+            .collect();
+        let big = big.into_bytes();
+        assert!(big.len() > wire::MAX_INLINE_PREIMAGE);
+        let mut first = [[0u8; 32]; AUX_LEAVES];
+        first[0] = sha256(&small);
+        first[7] = [7; 32];
+        let mut second = [[0u8; 32]; AUX_LEAVES];
+        second[0] = sha256(&big);
+
+        // A mines on them (keeping the trees, as a miner does).
+        let a = Mock::new();
+        a.mine(100, 1);
+        store_a
+            .put_tree(&first, std::slice::from_ref(&small), 2)
+            .unwrap();
+        a.0.lock().unwrap().aux = root(&first);
+        a.mine(100, 2);
+        a.mine(100, 3);
+        store_a
+            .put_tree(&second, std::slice::from_ref(&big), 4)
+            .unwrap();
+        a.0.lock().unwrap().aux = root(&second);
+        a.mine(100, 4);
+        let na = start_with(
+            a.clone(),
+            Config {
+                follow: false,
+                preimages: Some(store_a),
+                ..Config::new(*b"test")
+            },
+            Arc::new(Mutex::new(vec![])),
+        );
+        // B already has the small file: its own aux leaf.
+        crate::aux_leaves::AuxStore::open(env_b.env())
+            .unwrap()
+            .set_file(env_b.env(), 3, &small)
+            .unwrap();
+        let b = Mock::new();
+        let lines = Arc::new(Mutex::new(vec![]));
+        let _nb = start_with(
+            b.clone(),
+            Config {
+                peers: vec![na.addr],
+                preimages: Some(store_b.clone()),
+                ..Config::new(*b"test")
+            },
+            lines.clone(),
+        );
+        wait_for("the files", 20, || {
+            store_b.get(&first[0]).unwrap().is_some() && store_b.get(&second[0]).unwrap().is_some()
+        });
+        assert_eq!(store_b.get(&first[0]).unwrap(), Some(small));
+        assert_eq!(store_b.get(&second[0]).unwrap(), Some(big));
+        // The trees came along: any leaf can be read from the root, but only
+        // the consensus leaf's file is fetched.
+        wait_for("the tree", 10, || {
+            store_b.leaf(&root(&first), 7).unwrap() == Some([7; 32])
+        });
+        // Only the big file was fetched.
+        let fetched: Vec<String> = lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.contains("fetched relay consensus file"))
+            .cloned()
+            .collect();
+        assert_eq!(fetched.len(), 1, "{fetched:?}");
+        assert!(
+            fetched[0].contains(&crate::wallet::hex(&second[0])[..16]),
+            "{fetched:?}"
+        );
+        assert!(fetched[0].contains("onion mode, 80 relays"), "{fetched:?}");
+        assert!(has_line(&lines, "capabilities 0003"));
+    }
+
+    #[test]
+    fn slates_pass_through_a_host_to_online_wallets_only() {
+        use crate::payments::{Payload, PaymentKeys};
+        let host = start(Mock::new(), true, vec![], 0);
+        let wallet = |seed: u8| {
+            let keys = PaymentKeys::from_entropy(&[seed; 32]);
+            let (tx, rx) = channel();
+            let lines = Arc::new(Mutex::new(vec![]));
+            let node = start_with(
+                Mock::new(),
+                Config {
+                    post: Some(PostConfig {
+                        keys: keys.clone(),
+                        hosts: vec![host.addr.to_string()],
+                        events: tx,
+                    }),
+                    ..Config::new(*b"test")
+                },
+                lines.clone(),
+            );
+            (keys.address, node, rx, lines)
+        };
+        let (alice, na, alice_rx, alice_log) = wallet(1);
+        let (bob, nb, bob_rx, bob_log) = wallet(2);
+        for log in [&alice_log, &bob_log] {
+            wait_for("registration", 10, || {
+                has_line(log, "payment address registered with host")
+            });
+        }
+
+        // Alice to Bob, and Bob's answer back.
+        let request = Payload::Request {
+            id: [7; 16],
+            amount: 5,
+            fee: 1,
+            reply: alice,
+        };
+        na.events
+            .send(Event::Post(Post {
+                to: bob,
+                id: [7; 16],
+                payload: request,
+                wait_for_answer: true,
+            }))
+            .unwrap();
+        match bob_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+            PostEvent::Received(p) => assert_eq!(p, request),
+            e => panic!("{e:?}"),
+        }
+        let held = Payload::Held { id: [7; 16] };
+        nb.events
+            .send(Event::Post(Post {
+                to: alice,
+                id: [7; 16],
+                payload: held,
+                wait_for_answer: false,
+            }))
+            .unwrap();
+        match alice_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+            PostEvent::Received(p) => assert_eq!(p, held),
+            e => panic!("{e:?}"),
+        }
+        na.events.send(Event::PostDone([7; 16])).unwrap();
+
+        // No one has registered this address: it's offline at once.
+        let nobody = PaymentKeys::from_entropy(&[3; 32]).address;
+        na.events
+            .send(Event::Post(Post {
+                to: nobody,
+                id: [8; 16],
+                payload: request,
+                wait_for_answer: true,
+            }))
+            .unwrap();
+        match alice_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            PostEvent::Failed { id, to, why } => {
+                assert_eq!((id, to), ([8; 16], nobody));
+                assert!(why.ends_with("is offline"), "{why}");
+            }
+            e => panic!("{e:?}"),
+        }
+        assert!(bob_rx.try_recv().is_err());
+        drop(nb);
     }
 }

@@ -40,6 +40,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::aux_leaves::AuxStore;
 use crate::block::{self, Block, BlockProver};
 use crate::chain::{self, Chain, ChainProof, ChainVerifier};
 use crate::cli::Cli;
@@ -50,11 +51,14 @@ use crate::header::{self, Consensus, FRAC_BITS, Header};
 use crate::ledger::{Added, Ledger, Verifier};
 use crate::mempool::Mempool;
 use crate::net::LedgerBackend;
+use crate::net::node::PostConfig;
 use crate::net::node::{self, Config, Event, Node};
 use crate::net::peers::PeerStore;
 use crate::net::wire::cap;
 use crate::output::{Amount, format_coins};
+use crate::payments::PaymentKeys;
 use crate::pow::{self, Dataset, DatasetTree};
+use crate::preimages::PreimageStore;
 use crate::stark::KeyCache;
 use crate::state::StateTree;
 use crate::store::ChainStore;
@@ -79,6 +83,9 @@ pub struct Net {
     pub snap_sync_limit: u64,
     /// Blocks below the tip whose bodies are kept (0: all).
     pub keep_blocks: u64,
+    /// Hosts that pass payments to and from our address (`host:port`; the
+    /// [`SEEDS`] if none).
+    pub slate_hosts: Vec<String>,
 }
 
 /// An amount in coins.
@@ -331,6 +338,7 @@ fn node(
     o: &Opened,
     net: &Net,
     mempool: Arc<Mempool>,
+    post: PostConfig,
 ) -> Result<Node<LedgerBackend>, Box<dyn Error>> {
     let addr = net
         .listen
@@ -360,6 +368,9 @@ fn node(
             SEEDS.map(String::from).to_vec()
         },
         peer_store: Some(PeerStore::open(&o.ledger.env)?),
+        // Serve and fetch aux trees' preimages (advertising cap::TREE).
+        preimages: Some(PreimageStore::open(&o.ledger.env)?),
+        post: Some(post),
         sync_depth: Some(net.sync_depth),
         max_peers: net.max_peers,
         ..Config::new(magic)
@@ -414,6 +425,9 @@ pub struct Options {
     pub restore: bool,
     /// Testing: make and check no chain proofs (`--debug-no-proof-validation`).
     pub debug_no_proofs: bool,
+    /// Answer payments to our address as they come (else they wait for
+    /// `accept`).
+    pub auto_receive: bool,
 }
 
 /// Runs the node on the chain in `data_dir/chain` (creating it if there's
@@ -474,7 +488,42 @@ pub fn run(data_dir: &Path, net: &Net, opts: &Options) -> Result<(), Box<dyn Err
     }
     let stop = Arc::new(AtomicBool::new(false));
 
-    let mut n = node(&log, &o, net, mempool.clone())?;
+    // Payments to and from our address pass through hosts: the seeds
+    // (which are on the real network), unless others are given.
+    let entropy = {
+        let txn = o.env.read_txn()?;
+        wallet_store.entropy(&txn)?.ok_or("no wallet")?
+    };
+    let payments = PaymentKeys::from_entropy(&entropy);
+    let hosts = if !net.slate_hosts.is_empty() {
+        net.slate_hosts.clone()
+    } else if opts.debug_no_proofs {
+        vec![]
+    } else {
+        SEEDS.map(String::from).to_vec()
+    };
+    log.line(format!(
+        "payment address {}; payments pass through {}; {}",
+        payments.address,
+        if hosts.is_empty() {
+            "no hosts (give --slate-host)".to_string()
+        } else {
+            hosts.join(", ")
+        },
+        if opts.auto_receive {
+            "answering payment requests as they come"
+        } else {
+            "holding payment requests until accepted"
+        }
+    ));
+    let (post_events, post_rx) = channel();
+    let post = PostConfig {
+        keys: payments.clone(),
+        hosts,
+        events: post_events,
+    };
+
+    let mut n = node(&log, &o, net, mempool.clone(), post)?;
     let synced = n.synced();
     let (events, rx) = channel();
     let node_thread = {
@@ -515,11 +564,30 @@ pub fn run(data_dir: &Path, net: &Net, opts: &Options) -> Result<(), Box<dyn Err
         synced,
         maturity: opts.coin_maturity,
         debug: opts.debug_no_proofs,
+        aux: AuxStore::open(&o.ledger.env)?,
+        preimages: PreimageStore::open(&o.ledger.env)?,
+        payments,
+        auto_receive: opts.auto_receive,
+        incoming: Default::default(),
         log: {
             let log = log.clone();
             Box::new(move |line| log.line(line))
         },
     });
+    // What the post brings: payment requests to answer, answers to
+    // finalize, failures.
+    {
+        let (cli, log) = (cli.clone(), log.clone());
+        thread::spawn(move || {
+            for event in post_rx {
+                let text = cli.on_post(event);
+                if !text.is_empty() {
+                    log.line(format!("wallet: {text}"));
+                    println!("{text}");
+                }
+            }
+        });
+    }
     // Signed payments not in a block yet go back to the mempool whenever
     // they've dropped out of it (say, a peer's reorg).
     {
@@ -633,6 +701,8 @@ impl Miner<'_> {
             events,
         } = self;
         let (env, store, tree, consensus) = (&o.env, o.store, o.tree, o.consensus);
+        let aux = AuxStore::open(env)?;
+        let preimages = PreimageStore::open(env)?;
         let data = o.data.expect("a miner has the dataset");
         let ledger = &o.ledger;
         // No provers with --debug-no-proof-validation.
@@ -867,13 +937,18 @@ impl Miner<'_> {
             }
 
             // 3. Mine the header, which commits to the block and its proof,
-            // checking for a new tip between batches of nonces.
+            // checking for a new tip between batches of nonces. It commits
+            // to the aux leaves as they are now, whose tree (and files) we
+            // keep to serve to peers.
+            let leaves = aux.leaves(env)?;
+            preimages.put_tree(&leaves, &aux.files(env)?, height)?;
             let mut header = Header {
                 height,
                 prev: parent.hash(),
                 timestamp: now().max(parent.timestamp + 1),
                 state: new_state,
                 body: block.body_hash(),
+                aux_hash: crate::aux_leaves::root(&leaves),
                 nonce: 0,
             };
             let log_target = consensus.log_target(&parent);
@@ -945,9 +1020,15 @@ impl Miner<'_> {
             reward_keys = None;
             log.line(match added {
                 Added::Extended | Added::Reorg { .. } => format!(
-                    "our block {} won height {} ({on_main} of ours on the main chain this run)",
+                    "our block {} won height {} ({on_main} of ours on the main chain this \
+                     run){}",
                     short(&header.hash()),
-                    header.height
+                    header.height,
+                    if header.aux_hash == [0; 32] {
+                        String::new()
+                    } else {
+                        format!(", aux root {}", crate::wallet::hex(&header.aux_hash))
+                    }
                 ),
                 _ => format!(
                     "our block {} lost height {}: a peer's block got there first",

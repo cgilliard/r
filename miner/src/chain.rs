@@ -661,11 +661,10 @@ pub struct ChainKeys {
 /// (`cargo test --release pinned_keys -- --ignored --nocapture` prints them).
 pub const KEYS: ChainKeys = ChainKeys {
     chain: BabyBear::new_array([
-        1798011805, 863899304, 328853176, 574527159, 90881192, 399795876, 72230506, 602258876,
+        857984617, 1532216041, 1405624799, 383778162, 967872618, 1357670319, 923798362, 415237157,
     ]),
     wrap: BabyBear::new_array([
-        468297187, 1469170972, 1871797730, 1695967766, 1429560398, 1986932927, 1960469485,
-        671708021,
+        849787445, 1882237317, 1020333995, 1115947182, 607433028, 13296237, 304693271, 226185238,
     ]),
 };
 
@@ -938,6 +937,8 @@ mod tests {
                 timestamp: parent.timestamp + 600,
                 state,
                 body: block.body_hash(),
+                // Any bytes: the chain proof hashes them too.
+                aux_hash: [0xa0 ^ parent.height as u8; 32],
                 nonce: 0,
             };
             assert!(header.mine(data, consensus.target(&parent)));

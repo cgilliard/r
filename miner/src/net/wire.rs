@@ -20,8 +20,10 @@
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+use crate::crypto::mlkem::{CT_LEN, EK_LEN};
 use crate::hash::{self, Hash};
 use crate::header::{HEADER_BYTES, Header};
+use crate::payments::Address;
 
 /// Stays 0 until launch: during development nothing older needs to talk
 /// to anything newer.
@@ -46,12 +48,27 @@ pub const MAX_TX_IDS: usize = 32;
 /// Longest `STATE` data: what's left of a datagram after its fields.
 pub const MAX_STATE_DATA: usize = MAX_PACKET - HEADER_LEN - 32 - 1 - 8 - 2;
 const _: () = assert!(crate::state::MAX_SYNC_REPLY <= MAX_STATE_DATA);
+/// Longest preimage sent whole in a `PREIMAGE`; longer ones are sent as
+/// chunks.
+pub const MAX_INLINE_PREIMAGE: usize = MAX_PACKET - HEADER_LEN - 32 - 2;
+
+/// A SHA-256 hash, as aux trees use ([`crate::preimages`]).
+pub type Sha256 = [u8; 32];
+/// Longest sealed slate in a `DELIVER`: what's left of a datagram.
+pub const MAX_DELIVER_DATA: usize = MAX_PACKET - HEADER_LEN - 32 - 4 - CT_LEN - 2;
+const _: () = assert!(MAX_DELIVER_DATA >= 160);
 
 /// Capability bits in `HELLO` and `WELCOME`.
 pub mod cap {
     /// Accepts connections on its address (the `HELLO`'s source IP and
     /// listen port), so it may be passed on to other nodes in `PEERS`.
     pub const LISTENING: u16 = 1;
+    /// Serves the preimages of hashes that blocks' aux roots lead to
+    /// (`GET_PREIMAGE`), and fetches those of recent blocks
+    /// ([`crate::preimages`]).
+    pub const TREE: u16 = 2;
+    /// Relays onion-routed traffic ([`crate::onion`]).
+    pub const ONION: u16 = 4;
 }
 
 /// A node's best chain, as it advertises it.
@@ -193,6 +210,77 @@ pub enum Message {
         size: u32,
         root: Hash,
     },
+    /// The bytes whose SHA-256 is `hash`.
+    GetPreimage {
+        hash: Sha256,
+    },
+    /// They are `data` (up to [`MAX_INLINE_PREIMAGE`] bytes).
+    Preimage {
+        hash: Sha256,
+        data: Vec<u8>,
+    },
+    /// They are `size` bytes with this chunk root: fetch their chunks with
+    /// `GET_BLOCK_CHUNKS` under [`preimage_id`]`(size, root)`.
+    PreimageInfo {
+        hash: Sha256,
+        size: u32,
+        root: Hash,
+    },
+    /// The sender doesn't have them.
+    NoPreimage {
+        hash: Sha256,
+    },
+    /// Init mode ([`crate::payments`]): register (or keep registered) the
+    /// payment address of this key with the receiving host.
+    Register {
+        ek: Box<[u8; EK_LEN]>,
+    },
+    /// Prove you hold the key: a secret sealed to it.
+    Challenge {
+        address: Address,
+        ct: Box<[u8; CT_LEN]>,
+    },
+    /// The proof ([`crate::payments::register_proof`]).
+    Prove {
+        address: Address,
+        proof: [u8; 32],
+    },
+    /// The address is registered with the sender for a while: refresh it.
+    Registered {
+        address: Address,
+    },
+    /// The key of a payment address registered with the receiver.
+    Lookup {
+        address: Address,
+    },
+    AddressKey {
+        address: Address,
+        ek: Box<[u8; EK_LEN]>,
+    },
+    /// No one with this address is registered with the sender (or it went
+    /// quiet): it's offline.
+    Offline {
+        address: Address,
+    },
+    /// A sealed slate for `to`: to its host, which passes it on (or
+    /// answers `OFFLINE`); then to the recipient. `post` is the sender's
+    /// number for it.
+    Deliver {
+        to: Address,
+        post: u32,
+        ct: Box<[u8; CT_LEN]>,
+        data: Vec<u8>,
+    },
+    /// The host passed delivery `post` on.
+    Forwarded {
+        to: Address,
+        post: u32,
+    },
+}
+
+/// What a preimage's chunks are requested under.
+pub fn preimage_id(size: u32, root: &Hash) -> Hash {
+    crate::chunk::object_hash(hash::domain::PREIMAGE, size as usize, root)
 }
 
 impl Message {
@@ -223,6 +311,19 @@ impl Message {
             Self::TxInv { .. } => 23,
             Self::GetTx { .. } => 24,
             Self::TxInfo { .. } => 25,
+            Self::GetPreimage { .. } => 26,
+            Self::Preimage { .. } => 27,
+            Self::PreimageInfo { .. } => 28,
+            Self::NoPreimage { .. } => 29,
+            Self::Register { .. } => 30,
+            Self::Challenge { .. } => 31,
+            Self::Prove { .. } => 32,
+            Self::Registered { .. } => 33,
+            Self::Lookup { .. } => 34,
+            Self::AddressKey { .. } => 35,
+            Self::Offline { .. } => 36,
+            Self::Deliver { .. } => 37,
+            Self::Forwarded { .. } => 38,
         }
     }
 
@@ -254,6 +355,19 @@ impl Message {
             Self::TxInv { .. } => "TX_INV",
             Self::GetTx { .. } => "GET_TX",
             Self::TxInfo { .. } => "TX_INFO",
+            Self::GetPreimage { .. } => "GET_PREIMAGE",
+            Self::Preimage { .. } => "PREIMAGE",
+            Self::PreimageInfo { .. } => "PREIMAGE_INFO",
+            Self::NoPreimage { .. } => "NO_PREIMAGE",
+            Self::Register { .. } => "REGISTER",
+            Self::Challenge { .. } => "CHALLENGE",
+            Self::Prove { .. } => "PROVE",
+            Self::Registered { .. } => "REGISTERED",
+            Self::Lookup { .. } => "LOOKUP",
+            Self::AddressKey { .. } => "ADDRESS_KEY",
+            Self::Offline { .. } => "OFFLINE",
+            Self::Deliver { .. } => "DELIVER",
+            Self::Forwarded { .. } => "FORWARDED",
         }
     }
 }
@@ -439,6 +553,46 @@ pub fn encode(magic: [u8; 4], packet: Packet, msg: &Message) -> Vec<u8> {
             put_hash(&mut out, id);
             out.extend(size.to_le_bytes());
             put_hash(&mut out, root);
+        }
+        Message::GetPreimage { hash } | Message::NoPreimage { hash } => out.extend(hash),
+        Message::Preimage { hash, data } => {
+            assert!(data.len() <= MAX_INLINE_PREIMAGE, "preimage too long");
+            out.extend(hash);
+            out.extend((data.len() as u16).to_le_bytes());
+            out.extend(data);
+        }
+        Message::PreimageInfo { hash, size, root } => {
+            out.extend(hash);
+            out.extend(size.to_le_bytes());
+            put_hash(&mut out, root);
+        }
+        Message::Register { ek } => out.extend(&ek[..]),
+        Message::Challenge { address, ct } => {
+            out.extend(address.0);
+            out.extend(&ct[..]);
+        }
+        Message::Prove { address, proof } => {
+            out.extend(address.0);
+            out.extend(proof);
+        }
+        Message::Registered { address }
+        | Message::Lookup { address }
+        | Message::Offline { address } => out.extend(address.0),
+        Message::AddressKey { address, ek } => {
+            out.extend(address.0);
+            out.extend(&ek[..]);
+        }
+        Message::Deliver { to, post, ct, data } => {
+            assert!(data.len() <= MAX_DELIVER_DATA, "sealed slate too long");
+            out.extend(to.0);
+            out.extend(post.to_le_bytes());
+            out.extend(&ct[..]);
+            out.extend((data.len() as u16).to_le_bytes());
+            out.extend(data);
+        }
+        Message::Forwarded { to, post } => {
+            out.extend(to.0);
+            out.extend(post.to_le_bytes());
         }
     }
     assert!(
@@ -674,6 +828,67 @@ pub fn decode(magic: [u8; 4], bytes: &[u8]) -> Result<(Packet, Message), WireErr
             size: r.u32()?,
             root: r.hash()?,
         },
+        26 => Message::GetPreimage { hash: r.array()? },
+        27 => {
+            let hash = r.array()?;
+            let len = r.u16()? as usize;
+            if len > MAX_INLINE_PREIMAGE {
+                return Err(WireError::Malformed);
+            }
+            Message::Preimage {
+                hash,
+                data: r.take(len)?.to_vec(),
+            }
+        }
+        28 => Message::PreimageInfo {
+            hash: r.array()?,
+            size: r.u32()?,
+            root: r.hash()?,
+        },
+        29 => Message::NoPreimage { hash: r.array()? },
+        30 => Message::Register {
+            ek: Box::new(r.array()?),
+        },
+        31 => Message::Challenge {
+            address: Address(r.array()?),
+            ct: Box::new(r.array()?),
+        },
+        32 => Message::Prove {
+            address: Address(r.array()?),
+            proof: r.array()?,
+        },
+        33 => Message::Registered {
+            address: Address(r.array()?),
+        },
+        34 => Message::Lookup {
+            address: Address(r.array()?),
+        },
+        35 => Message::AddressKey {
+            address: Address(r.array()?),
+            ek: Box::new(r.array()?),
+        },
+        36 => Message::Offline {
+            address: Address(r.array()?),
+        },
+        37 => {
+            let to = Address(r.array()?);
+            let post = r.u32()?;
+            let ct = Box::new(r.array()?);
+            let len = r.u16()? as usize;
+            if len > MAX_DELIVER_DATA {
+                return Err(WireError::Malformed);
+            }
+            Message::Deliver {
+                to,
+                post,
+                ct,
+                data: r.take(len)?.to_vec(),
+            }
+        }
+        38 => Message::Forwarded {
+            to: Address(r.array()?),
+            post: r.u32()?,
+        },
         t => return Err(WireError::UnknownType(t)),
     };
     r.end()?;
@@ -813,6 +1028,55 @@ mod tests {
                 size: 2400,
                 root: h(7),
             },
+            Message::GetPreimage { hash: [3; 32] },
+            Message::Preimage {
+                hash: [4; 32],
+                data: vec![],
+            },
+            Message::Preimage {
+                hash: [4; 32],
+                data: vec![8; MAX_INLINE_PREIMAGE],
+            },
+            Message::PreimageInfo {
+                hash: [5; 32],
+                size: 1 << 20,
+                root: h(8),
+            },
+            Message::NoPreimage { hash: [6; 32] },
+            Message::Register {
+                ek: Box::new([7; EK_LEN]),
+            },
+            Message::Challenge {
+                address: Address([8; 32]),
+                ct: Box::new([9; CT_LEN]),
+            },
+            Message::Prove {
+                address: Address([8; 32]),
+                proof: [10; 32],
+            },
+            Message::Registered {
+                address: Address([8; 32]),
+            },
+            Message::Lookup {
+                address: Address([11; 32]),
+            },
+            Message::AddressKey {
+                address: Address([11; 32]),
+                ek: Box::new([12; EK_LEN]),
+            },
+            Message::Offline {
+                address: Address([11; 32]),
+            },
+            Message::Deliver {
+                to: Address([13; 32]),
+                post: 77,
+                ct: Box::new([14; CT_LEN]),
+                data: vec![15; MAX_DELIVER_DATA],
+            },
+            Message::Forwarded {
+                to: Address([13; 32]),
+                post: 77,
+            },
         ];
         let packet = Packet {
             session: 0xdead,
@@ -837,7 +1101,7 @@ mod tests {
                 m.name()
             );
         }
-        assert_eq!(MAX_HEADERS, 9);
+        assert_eq!(MAX_HEADERS, 7);
     }
 
     #[test]

@@ -48,12 +48,14 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         max_peers: args.max_peers,
         snap_sync_limit: args.snap_sync_limit,
         keep_blocks: args.keep_blocks,
+        slate_hosts: args.slate_hosts.clone(),
     };
     let opts = r::daemon::Options {
         mine: !args.no_mine,
         coin_maturity: args.coin_maturity,
         restore: args.restore,
         debug_no_proofs: args.debug_no_proofs,
+        auto_receive: !args.no_automatic_receive,
     };
     r::daemon::run(&args.data_dir, &net, &opts)
 }

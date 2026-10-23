@@ -54,6 +54,7 @@ pub fn build(bitcoin_hash: &[u8; 32], bitcoin_height: u64, timestamp: u64) -> He
         timestamp,
         state: state::empty_state(),
         body: body(bitcoin_hash, bitcoin_height),
+        aux_hash: [0; crate::header::AUX_HASH_LEN],
         nonce: 0,
     }
 }

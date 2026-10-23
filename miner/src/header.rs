@@ -1,7 +1,9 @@
 //! Block headers, proof-of-work checks and difficulty.
 //!
-//! A header commits to its parent, the state after its block, and the block
-//! body ([`crate::block::Block::body_hash`], which includes the proof). It
+//! A header commits to its parent, the state after its block, the block
+//! body ([`crate::block::Block::body_hash`], which includes the proof) and
+//! an auxiliary hash ([`Header::aux_hash`]: any 32 bytes its miner chooses,
+//! which consensus ignores; layer 2 gives them meaning). It
 //! has no difficulty field: the target follows from the parent's height and
 //! timestamp by ASERT (absolutely scheduled exponentially rising targets),
 //! anchored at genesis. The target doubles for every half-life the chain
@@ -124,7 +126,9 @@ pub fn target_of(log_target: i64) -> u128 {
 }
 
 /// Bytes in a serialized header ([`Header::to_bytes`]).
-pub const HEADER_BYTES: usize = 4 * 8 + 3 * hash::HASH_BYTES;
+pub const HEADER_BYTES: usize = 4 * 8 + 3 * hash::HASH_BYTES + AUX_HASH_LEN;
+/// Bytes in a header's [`Header::aux_hash`].
+pub const AUX_HASH_LEN: usize = 32;
 
 /// Bits per limb of a work value in a circuit or statement.
 pub const WORK_LIMB_BITS: u32 = 12;
@@ -188,8 +192,21 @@ pub struct Header {
     pub state: State,
     /// The block's [`crate::block::Block::body_hash`].
     pub body: Hash,
+    /// Any 32 bytes the miner chooses. Consensus only hashes them; layer 2
+    /// gives them meaning (such as committing to a file).
+    pub aux_hash: [u8; AUX_HASH_LEN],
     pub nonce: u64,
 }
+
+/// An aux hash as field elements: 3-byte limbs, like an output's nonce
+/// ([`crate::output::nonce_limbs`]).
+pub fn aux_limbs(aux: &[u8; AUX_HASH_LEN]) -> [crate::babybear::BabyBear; AUX_LIMBS] {
+    crate::output::nonce_limbs(aux)
+}
+
+/// Limbs of [`aux_limbs`].
+pub const AUX_LIMBS: usize = crate::output::NONCE_LIMBS;
+const _: () = assert!(AUX_HASH_LEN == crate::output::NONCE_LEN);
 
 impl Header {
     /// The hash of every field but the nonce, which the PoW starts from.
@@ -205,6 +222,7 @@ impl Header {
                 &self.state.root,
                 &[lo, hi],
                 &self.body,
+                &aux_limbs(&self.aux_hash),
             ],
         )
     }
@@ -214,8 +232,8 @@ impl Header {
         hash::sponge(domain::HEADER, &[], &[&self.seed(), &u64_limbs(self.nonce)])
     }
 
-    /// `height | prev | timestamp | state root | state size | body |
-    /// nonce`, integers as little-endian `u64`s and hashes as
+    /// `height | prev | timestamp | state root | state size | body | aux
+    /// hash | nonce`, integers as little-endian `u64`s and hashes as
     /// [`hash::to_bytes`].
     pub fn to_bytes(&self) -> [u8; HEADER_BYTES] {
         let mut out = [0u8; HEADER_BYTES];
@@ -230,6 +248,7 @@ impl Header {
         put(&hash::to_bytes(&self.state.root));
         put(&self.state.size.to_le_bytes());
         put(&hash::to_bytes(&self.body));
+        put(&self.aux_hash);
         put(&self.nonce.to_le_bytes());
         out
     }
@@ -254,6 +273,7 @@ impl Header {
         let root = hash_at(take(hash::HASH_BYTES))?;
         let size = u64_at(take(8));
         let body = hash_at(take(hash::HASH_BYTES))?;
+        let aux_hash = take(AUX_HASH_LEN).try_into().expect("aux hash bytes");
         let nonce = u64_at(take(8));
         if size > state::CAPACITY {
             return None;
@@ -264,6 +284,7 @@ impl Header {
             timestamp,
             state: State { root, size },
             body,
+            aux_hash,
             nonce,
         })
     }
@@ -370,6 +391,7 @@ mod tests {
                 size: 1,
             },
             body: [BabyBear::ZERO; HASH_LEN],
+            aux_hash: [0; 32],
             nonce: 0,
         }
     }
@@ -490,17 +512,20 @@ mod tests {
     #[test]
     fn hashes_cover_every_field() {
         let h = header(5, 1234);
-        let mut changed = [h; 7];
+        let mut changed = [h; 9];
         changed[0].height += 1;
         changed[1].prev[3] += BabyBear::ONE;
         changed[2].timestamp += 1;
         changed[3].state.root[7] += BabyBear::ONE;
         changed[4].state.size += 1;
         changed[5].body[0] += BabyBear::ONE;
-        changed[6].nonce += 1;
+        changed[6].aux_hash[0] ^= 1;
+        changed[7].aux_hash[31] ^= 0x80;
+        changed[8].nonce += 1;
         for (i, c) in changed.iter().enumerate() {
             assert_ne!(c.hash(), h.hash(), "field {i}");
-            assert_eq!(c.seed() == h.seed(), i == 6, "field {i}");
+            assert_eq!(c.seed() == h.seed(), i == 8, "field {i}");
+            assert_eq!(Header::from_bytes(&c.to_bytes()), Some(*c), "field {i}");
         }
     }
 

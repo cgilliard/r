@@ -73,6 +73,9 @@ pub mod domain {
     pub const SIG_APO: u32 = 37;
     /// The outputs anyone-can-pay and any-prevout signatures cover.
     pub const SIGNED_OUTPUTS: u32 = 38;
+    /// Not consensus: the chunk id of a relayed preimage
+    /// ([`crate::net::wire::preimage_id`]).
+    pub const PREIMAGE: u32 = 39;
 
     #[cfg(test)]
     pub const ALL: &[u32] = &[
@@ -114,6 +117,7 @@ pub mod domain {
         SIG_ACP,
         SIG_APO,
         SIGNED_OUTPUTS,
+        PREIMAGE,
     ];
 }
 

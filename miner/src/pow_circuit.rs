@@ -18,7 +18,8 @@ use crate::babybear::{BabyBear, P};
 use crate::circuit::{Cell, Circuit};
 use crate::hash::{DOMAIN_SLOT, HASH_LEN, domain};
 use crate::header::{
-    Consensus, FRAC_BITS, Header, MAX_LOG_TARGET, MIN_LOG_TARGET, WORK_LIMB_BITS, WORK_LIMBS,
+    AUX_LIMBS, Consensus, FRAC_BITS, Header, MAX_LOG_TARGET, MIN_LOG_TARGET, WORK_LIMB_BITS,
+    WORK_LIMBS, aux_limbs,
 };
 use crate::poseidon2::WIDTH;
 use crate::pow::{self, DatasetTree, LOG_ITEMS, ROUNDS, VALUE_BITS, VALUE_LIMB_BITS, u64_limbs};
@@ -42,6 +43,8 @@ pub struct HeaderCells {
     pub root: HashCells,
     pub size: [Cell; 2],
     pub body: HashCells,
+    /// [`crate::header::aux_limbs`] (only hashed: no range checks).
+    pub aux_hash: [Cell; AUX_LIMBS],
     pub nonce: [Cell; LIMBS],
 }
 
@@ -66,6 +69,7 @@ impl HeaderCells {
             root: h.state.root.map(|v| c.input(v)),
             size: [c.input(lo), c.input(hi)],
             body: h.body.map(|v| c.input(v)),
+            aux_hash: aux_limbs(&h.aux_hash).map(|v| c.input(v)),
             nonce,
         }
     }
@@ -78,6 +82,7 @@ impl HeaderCells {
         elems.extend(self.root);
         elems.extend(self.size);
         elems.extend(self.body);
+        elems.extend(self.aux_hash);
         sponge(c, domain::POW_SEED, &elems, None)
     }
 
@@ -504,6 +509,7 @@ mod tests {
         Header {
             height,
             timestamp,
+            aux_hash: [0xff; 32],
             ..Header::default()
         }
     }
@@ -634,6 +640,7 @@ mod tests {
         let parent = Header {
             height: 41,
             timestamp: 1_000_000 + 41 * 600 + 77,
+            aux_hash: [7; 32],
             ..Header::default()
         };
         let mut h = Header {
@@ -678,6 +685,13 @@ mod tests {
                 },
             ),
             ("height", Header { height: 43, ..h }),
+            (
+                "aux hash",
+                Header {
+                    aux_hash: [8; 32],
+                    ..h
+                },
+            ),
             (
                 "prev",
                 Header {

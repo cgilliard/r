@@ -712,6 +712,7 @@ pub(crate) mod tests {
                 timestamp: self.tip.timestamp + 600,
                 state: self.state(),
                 body: block.body_hash(),
+                aux_hash: [0; 32],
                 nonce: 0,
             };
             self.tip = header;

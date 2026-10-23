@@ -1,7 +1,9 @@
 //! The node's command line: the wallet, and a look at the node, typed at its
 //! prompt while it runs (its log goes to a file).
 //!
-//! Payments go through files, as in Grin ([`crate::wallet`]):
+//! Payments go to a payment address over the network (`send <amount>
+//! <fee> <address>`: both wallets online; [`crate::payments`]), or through
+//! files, as in Grin ([`crate::wallet`]):
 //!
 //! - `send <amount> <fee> <file>`: picks coins, locks them, and writes the
 //!   slate to `<file>` for the receiver;
@@ -28,10 +30,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::aux_leaves::{AUX_LEAVES, AuxStore};
 use crate::ledger::Ledger;
 use crate::mempool::{Chainstate, Mempool, Refused};
 use crate::net::node::Event;
+use crate::net::node::{Post, PostEvent};
+use crate::onion;
 use crate::output::{Amount, Output, format_coins, parse_coins};
+use crate::payments::{Address, Payload, PaymentKeys};
+use crate::preimages::{MAX_PREIMAGE, PreimageStore};
 use crate::transaction::{
     Condition, Input, MAX_KEY_DEPTH, PREIMAGE_LEN, SigMode, Signer, Spend, Transaction, TxBody,
     hashlock,
@@ -84,6 +91,14 @@ commands:
   info                         balance and chain height
   outputs                      the wallet's outputs, one per line
   seed                         the recovery words
+  address                      our payment address (from the recovery words)
+  send <amount> <fee> <address>
+                               pay a payment address over the network: the
+                               receiver must be online; finalized when it
+                               answers
+  incoming                     payment requests waiting (with
+                               --no-automatic-receive)
+  accept <id>                  answer a waiting payment request
   send <amount> <fee> <file>   start a payment: writes the slate to <file>
   receive <file>               answer a slate: writes <file>.response
   finalize <file>              sign and submit a payment from its response
@@ -127,6 +142,19 @@ commands:
   cosign <file>                sign a transaction from unlock where our
                                keys are needed; submits it once complete,
                                else writes <file>.cosigned
+  aux_leaf <n> <hex>           set aux leaf <n> (0-15) to 32 bytes (64 hex
+                               digits; zero clears it): blocks we mine
+                               commit to the leaves' Merkle root
+  aux_leaf_file <n> <file>     set aux leaf <n> to the SHA-256 of <file>
+                               (kept, so peers can fetch it from us); leaf
+                               0 is the relay consensus file, and takes
+                               only a valid one
+  print_aux_leaves             the 16 aux leaves and their root
+  relay_consensus              the relay consensus in force (init or onion
+                               and its relays): the file most of the 100
+                               blocks ending 10 below the tip commit to
+  relay_key                    this wallet's relay key hash (from the
+                               recovery words), for a consensus file
   debug-fill <txs> <fee>       testing (--debug-no-proof-validation only):
                                fill blocks with up to <txs> transactions of
                                ~100 KB, each spending one coin to 4 new
@@ -159,6 +187,28 @@ pub struct Cli {
     pub log: Box<dyn Fn(String) + Send + Sync>,
     /// `--debug-no-proof-validation`: allows `debug-fill`.
     pub debug: bool,
+    /// The aux leaves our mined headers commit to.
+    pub aux: AuxStore,
+    /// Preimages blocks' aux roots lead to (the relay consensus files).
+    pub preimages: PreimageStore,
+    /// Our payment address and its keys.
+    pub payments: PaymentKeys,
+    /// Answer payment requests as they come (else they wait for `accept`).
+    pub auto_receive: bool,
+    /// Payment requests waiting for `accept`, with who sent them.
+    pub incoming: std::sync::Mutex<Vec<(Slate, Address)>>,
+}
+
+/// A relay consensus mode, for people.
+fn describe_mode(mode: &onion::Mode) -> String {
+    match mode {
+        onion::Mode::Init => "init (no relays: slates go through the seed nodes)".into(),
+        onion::Mode::Onion(r) => format!(
+            "onion ({} relay{})",
+            r.len(),
+            if r.len() == 1 { "" } else { "s" }
+        ),
+    }
 }
 
 fn now() -> u64 {
@@ -292,11 +342,24 @@ impl Cli {
             ["status"] => self.status()?,
             ["peers"] => self.peers(false)?,
             ["peers", "all"] => self.peers(true)?,
-            ["send", amount, fee, file] => {
+            ["send", amount, fee, to] => {
                 let amount = parse_coins(amount).ok_or("bad amount")?;
                 let fee = parse_coins(fee).ok_or("bad fee")?;
-                self.send(amount, fee, file)?
+                // An address, or else a file.
+                match to.parse::<Address>() {
+                    Ok(address) => self.send_to(amount, fee, address)?,
+                    Err(e) if to.to_ascii_lowercase().starts_with("tab1") => {
+                        return Err(format!("bad payment address: {e}"));
+                    }
+                    Err(_) => self.send(amount, fee, to)?,
+                }
             }
+            ["address"] => format!(
+                "payment address: {}\n(from the recovery words; others pay it with: send <amount> <fee> <address>)",
+                self.payments.address
+            ),
+            ["incoming"] => self.incoming(),
+            ["accept", id] => self.accept(id)?,
             ["receive", file] => self.receive(file)?,
             ["finalize", file] => self.finalize(file)?,
             ["txs"] => self.txs()?,
@@ -358,6 +421,25 @@ impl Cli {
                 self.unlock(id, branch, fee, files.first().copied(), &without)?
             }
             ["cosign", file] => self.cosign(file)?,
+            ["aux_leaf", n, value] => {
+                let value = unhex(value)
+                    .and_then(|v| <[u8; 32]>::try_from(v).ok())
+                    .ok_or("the value is 32 bytes: 64 hex digits")?;
+                self.set_aux_leaf(n, &value, None)?
+            }
+            ["aux_leaf_file", n, file] => {
+                let bytes =
+                    std::fs::read(file).map_err(|e| format!("couldn't read {file}: {e}"))?;
+                if bytes.len() > MAX_PREIMAGE {
+                    return Err(format!(
+                        "{file} is over {MAX_PREIMAGE} bytes, more than peers fetch"
+                    ));
+                }
+                self.set_aux_leaf(n, &crate::mnemonic::sha256(&bytes), Some(&bytes))?
+            }
+            ["print_aux_leaves"] => self.print_aux_leaves()?,
+            ["relay_consensus"] => self.relay_consensus()?,
+            ["relay_key"] => self.relay_key()?,
             [cmd, ..] => return Err(format!("unknown or incomplete command \"{cmd}\"; try help")),
         };
         Ok(Outcome::Text(text))
@@ -779,6 +861,56 @@ impl Cli {
         if Path::new(file).exists() {
             return Err(format!("{file} exists already"));
         }
+        let sent = self.start_payment(amount, fee)?;
+        let id = sent.id;
+        if let Err(e) = write_new(file, &Slate { id, amount, fee }.to_text()) {
+            let _ = self.forget(&id);
+            return Err(e);
+        }
+        Ok(format!(
+            "payment {} of {} coins (fee {}): slate written to {file}\n\
+             send it to the receiver, then run: finalize {file}.response",
+            hex(&id),
+            coins(amount),
+            coins(fee),
+        ))
+    }
+
+    /// Pays `amount` to a payment address over the network: the receiver
+    /// answers (if online), and the payment is finalized when it does.
+    fn send_to(&self, amount: Amount, fee: Amount, to: Address) -> Result<String, String> {
+        if amount == 0 {
+            return Err("the amount must be more than 0".into());
+        }
+        if to == self.payments.address {
+            return Err("that's our own address".into());
+        }
+        let sent = self.start_payment(amount, fee)?;
+        let post = Post {
+            to,
+            id: sent.id,
+            payload: Payload::Request {
+                id: sent.id,
+                amount,
+                fee,
+                reply: self.payments.address,
+            },
+            wait_for_answer: true,
+        };
+        if self.events.send(Event::Post(post)).is_err() {
+            let _ = self.forget(&sent.id);
+            return Err("the network isn't running".into());
+        }
+        Ok(format!(
+            "payment {} of {} coins (fee {}) sent to {to}; it's finalized when they answer",
+            hex(&sent.id),
+            coins(amount),
+            coins(fee),
+        ))
+    }
+
+    /// Picks coins for `amount` and `fee` and locks them in a new payment.
+    fn start_payment(&self, amount: Amount, fee: Amount) -> Result<Sent, String> {
         let need = amount.checked_add(fee).ok_or("too much")?;
         // The largest spendable coins first.
         let mut spendable: Vec<Coin> = self
@@ -832,10 +964,6 @@ impl Cli {
         };
         self.store.put_sent(&mut txn, &sent).map_err(err)?;
         txn.commit().map_err(err)?;
-        if let Err(e) = write_new(file, &Slate { id, amount, fee }.to_text()) {
-            let _ = self.forget(&id);
-            return Err(e);
-        }
         (self.log)(format!(
             "wallet: payment {} started: {} coins, fee {}, from {} output{}",
             hex(&id),
@@ -844,23 +972,59 @@ impl Cli {
             sent.coins.len(),
             if sent.coins.len() == 1 { "" } else { "s" },
         ));
-        Ok(format!(
-            "payment {} of {} coins (fee {}): slate written to {file}\n\
-             send it to the receiver, then run: finalize {file}.response",
-            hex(&id),
-            coins(amount),
-            coins(fee),
-        ))
+        Ok(sent)
     }
 
     fn receive(&self, file: &str) -> Result<String, String> {
         let slate = Slate::from_text(&read(file)?)?;
-        if slate.amount == 0 {
-            return Err("the slate is for 0 coins".into());
-        }
         let out_file = format!("{file}.response");
         if Path::new(&out_file).exists() {
             return Err(format!("{out_file} exists already"));
+        }
+        let (response, new) = self.answer(&slate)?;
+        if let Err(e) = write_new(&out_file, &response.to_text()) {
+            if new {
+                let mut txn = self.ledger.env.write_txn().map_err(err)?;
+                self.store
+                    .remove_received(&mut txn, &slate.id)
+                    .map_err(err)?;
+                txn.commit().map_err(err)?;
+            }
+            return Err(e);
+        }
+        Ok(format!(
+            "receiving {} coins (fee {} paid by the sender): response written to {out_file}\n\
+             send it back to the sender to finalize",
+            coins(slate.amount),
+            coins(slate.fee),
+        ))
+    }
+
+    /// Our answer to `slate`: an output for its amount, kept on record
+    /// (and whether it's new: a slate answered before gets the same answer).
+    fn answer(&self, slate: &Slate) -> Result<(Response, bool), String> {
+        if slate.amount == 0 {
+            return Err("the slate is for 0 coins".into());
+        }
+        let before = {
+            let txn = self.ledger.env.read_txn().map_err(err)?;
+            self.store
+                .receiveds(&txn)
+                .map_err(err)?
+                .into_iter()
+                .find(|r| r.id == slate.id)
+        };
+        if let Some(r) = before {
+            if r.amount != slate.amount {
+                return Err("we answered a slate with this id for another amount".into());
+            }
+            let response = Response {
+                id: slate.id,
+                amount: slate.amount,
+                fee: slate.fee,
+                output: self.wallet.keys_for(&r.r).pay(r.amount),
+            };
+            return Ok((response, false));
         }
         let keys = self.wallet.new_keys().map_err(err)?;
         let output = keys.pay(slate.amount);
@@ -885,29 +1049,20 @@ impl Cli {
             fee: slate.fee,
             output,
         };
-        if let Err(e) = write_new(&out_file, &response.to_text()) {
-            let mut txn = self.ledger.env.write_txn().map_err(err)?;
-            self.store
-                .remove_received(&mut txn, &slate.id)
-                .map_err(err)?;
-            txn.commit().map_err(err)?;
-            return Err(e);
-        }
         (self.log)(format!(
             "wallet: answered payment {} of {} coins",
             hex(&slate.id),
             coins(slate.amount)
         ));
-        Ok(format!(
-            "receiving {} coins (fee {} paid by the sender): response written to {out_file}\n\
-             send it back to the sender to finalize",
-            coins(slate.amount),
-            coins(slate.fee),
-        ))
+        Ok((response, true))
     }
 
     fn finalize(&self, file: &str) -> Result<String, String> {
-        let response = Response::from_text(&read(file)?)?;
+        self.finalize_response(Response::from_text(&read(file)?)?)
+    }
+
+    /// Signs and submits our payment that `response` answers.
+    fn finalize_response(&self, response: Response) -> Result<String, String> {
         // Only a slate we sent, as we sent it.
         let mut sent = self.find(&hex(&response.id))?.ok_or(
             "unknown slate: we sent no payment with its id (it was modified, or isn't \
@@ -1499,6 +1654,242 @@ impl Cli {
             hex(&root),
             1u64 << depth
         ))
+    }
+
+    /// Sets aux leaf `n` (text, 0 to 15) to `value`, the hash of `file`
+    /// if it's from one (kept, to serve to peers).
+    fn set_aux_leaf(
+        &self,
+        n: &str,
+        value: &[u8; 32],
+        file: Option<&[u8]>,
+    ) -> Result<String, String> {
+        let n: usize = n
+            .parse()
+            .ok()
+            .filter(|&n| n < AUX_LEAVES)
+            .ok_or(format!("the leaf number is 0 to {}", AUX_LEAVES - 1))?;
+        // The consensus leaf only takes a valid consensus file.
+        if n == onion::CONSENSUS_LEAF
+            && let Some(Err(e)) = file.map(onion::parse)
+        {
+            return Err(format!(
+                "not a valid relay consensus file ({e}); leaf {n} is unchanged"
+            ));
+        }
+        let env = &self.ledger.env;
+        match file {
+            Some(f) => self.aux.set_file(env, n, f).map(|_| ()),
+            None => self.aux.set(env, n, value),
+        }
+        .map_err(err)?;
+        let root = self.aux.root(env).map_err(err)?;
+        let mut out = format!(
+            "aux leaf {n} is {}\nroot {} (in the blocks we mine from the next one)",
+            hex(value),
+            hex(&root)
+        );
+        if n == onion::CONSENSUS_LEAF && *value != [0; 32] {
+            out += &match file.map(onion::parse) {
+                None => "\nleaf 0 is the relay consensus file's hash: peers fetch the file from                          nodes that have it"
+                    .to_string(),
+                Some(mode) => format!(
+                    "\nleaf 0 is the relay consensus: this file says {}",
+                    describe_mode(&mode.expect("checked"))
+                ),
+            };
+        }
+        Ok(out)
+    }
+
+    /// Handles what the post brings ([`PostEvent`]): what to tell the user.
+    pub fn on_post(&self, event: PostEvent) -> String {
+        match event {
+            PostEvent::Received(Payload::Request {
+                id,
+                amount,
+                fee,
+                reply,
+            }) => {
+                let slate = Slate { id, amount, fee };
+                if !self.auto_receive {
+                    let mut incoming = self.incoming.lock().expect("lock");
+                    if !incoming.iter().any(|(s, _)| s.id == id) {
+                        incoming.push((slate, reply));
+                    }
+                    drop(incoming);
+                    self.post(reply, id, Payload::Held { id }, false);
+                    return format!(
+                        "payment request {} for {} coins from {reply}: accept it with: accept {}",
+                        hex(&id),
+                        coins(amount),
+                        &hex(&id)[..8]
+                    );
+                }
+                self.answer_post(&slate, reply)
+            }
+            PostEvent::Received(Payload::Response(response)) => {
+                let id = response.id;
+                let done = self.find(&hex(&id)).ok().flatten();
+                match done {
+                    // An answer again (it was delivered twice).
+                    Some(s) if s.tx.is_some() => String::new(),
+                    Some(_) => {
+                        let _ = self.events.send(Event::PostDone(id));
+                        self.finalize_response(response)
+                            .unwrap_or_else(|e| format!("payment {}: {e}", hex(&id)))
+                    }
+                    None => String::new(),
+                }
+            }
+            PostEvent::Received(Payload::Held { id }) => {
+                if self.find(&hex(&id)).ok().flatten().is_none() {
+                    return String::new();
+                }
+                let _ = self.events.send(Event::PostDone(id));
+                format!(
+                    "payment {}: the receiver will answer once they accept it",
+                    hex(&id)
+                )
+            }
+            PostEvent::Failed { id, to, why } => {
+                // A request of ours: the payment is off.
+                match self.find(&hex(&id)).ok().flatten() {
+                    Some(s) if s.tx.is_none() => {
+                        let _ = self.forget(&id);
+                        format!(
+                            "payment {} to {to} failed: {why}; its coins are unlocked",
+                            hex(&id)
+                        )
+                    }
+                    Some(_) => String::new(),
+                    None => format!("couldn't answer payment {} from {to}: {why}", hex(&id)),
+                }
+            }
+        }
+    }
+
+    fn post(&self, to: Address, id: SlateId, payload: Payload, wait_for_answer: bool) {
+        let _ = self.events.send(Event::Post(Post {
+            to,
+            id,
+            payload,
+            wait_for_answer,
+        }));
+    }
+
+    /// Answers a payment request from `reply` over the network.
+    fn answer_post(&self, slate: &Slate, reply: Address) -> String {
+        match self.answer(slate) {
+            Ok((response, new)) => {
+                self.post(reply, slate.id, Payload::Response(response), false);
+                if new {
+                    format!(
+                        "received payment {} of {} coins from {reply}: answered (it's ours once \
+                         the sender finalizes it and it's in a block)",
+                        hex(&slate.id),
+                        coins(slate.amount)
+                    )
+                } else {
+                    String::new()
+                }
+            }
+            Err(e) => format!("payment request {} from {reply}: {e}", hex(&slate.id)),
+        }
+    }
+
+    /// Payment requests waiting for `accept` (with --no-automatic-receive).
+    fn incoming(&self) -> String {
+        let incoming = self.incoming.lock().expect("lock");
+        if incoming.is_empty() {
+            return "no payment requests waiting".into();
+        }
+        incoming
+            .iter()
+            .map(|(s, from)| format!("{} {} coins from {from}", hex(&s.id), coins(s.amount)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Answers a payment request held for approval.
+    fn accept(&self, prefix: &str) -> Result<String, String> {
+        if prefix.len() < 4 {
+            return Err("give at least 4 characters of the id".into());
+        }
+        let found = {
+            let mut incoming = self.incoming.lock().expect("lock");
+            let at: Vec<usize> = (0..incoming.len())
+                .filter(|&i| hex(&incoming[i].0.id).starts_with(&prefix.to_lowercase()))
+                .collect();
+            match at[..] {
+                [] => return Err("no payment request waiting has that id (see incoming)".into()),
+                [i] => incoming.remove(i),
+                _ => return Err("more than one request matches; give more of the id".into()),
+            }
+        };
+        Ok(self.answer_post(&found.0, found.1))
+    }
+
+    /// The relay consensus in force, and why.
+    fn relay_consensus(&self) -> Result<String, String> {
+        let c = onion::current(&self.ledger, &self.preimages)?;
+        let heights = if c.heights.is_empty() {
+            "none yet".to_string()
+        } else {
+            format!("{} to {}", c.heights.start(), c.heights.end())
+        };
+        let mut out = format!(
+            "mode: {}\nfrom: {}\nblocks counted: {heights} (the {} blocks ending {} below the tip)",
+            describe_mode(&c.mode),
+            match c.file {
+                Some((h, votes)) => format!(
+                    "file {} ({votes} {} to it)",
+                    hex(&h),
+                    if votes == 1 {
+                        "block commits"
+                    } else {
+                        "blocks commit"
+                    }
+                ),
+                None => "no block commits to a valid file we have: init by default".to_string(),
+            },
+            onion::WINDOW,
+            onion::LAG,
+        );
+        if let onion::Mode::Onion(relays) = &c.mode {
+            for r in relays {
+                out += &format!("\n  {} {}", r.addr, hex(&r.key_hash));
+            }
+        }
+        Ok(out)
+    }
+
+    /// This wallet's relay key, as a consensus file names it.
+    fn relay_key(&self) -> Result<String, String> {
+        let txn = self.ledger.env.read_txn().map_err(err)?;
+        let entropy = self.store.entropy(&txn).map_err(err)?.ok_or("no wallet")?;
+        let (pk, _) = onion::identity(&entropy);
+        Ok(format!(
+            "relay key hash: {}\n(from the recovery words; a relay's line in the consensus \
+             file is <ip:port> <key hash>)",
+            hex(&onion::key_hash(&pk))
+        ))
+    }
+
+    /// The aux leaves and their root.
+    fn print_aux_leaves(&self) -> Result<String, String> {
+        let env = &self.ledger.env;
+        let leaves = self.aux.leaves(env).map_err(err)?;
+        let mut lines: Vec<String> = leaves
+            .iter()
+            .enumerate()
+            .map(|(n, l)| format!("leaf {n:2} {}", hex(l)))
+            .collect();
+        lines.push(format!(
+            "root    {}",
+            hex(&crate::aux_leaves::root(&leaves))
+        ));
+        Ok(lines.join("\n"))
     }
 
     /// Makes and keeps a hashlock preimage, and prints its hash.
@@ -2201,6 +2592,11 @@ mod tests {
             maturity: 3,
             log: Box::new(|_| {}),
             debug: true,
+            aux: AuxStore::open(env.env()).unwrap(),
+            preimages: PreimageStore::open(env.env()).unwrap(),
+            payments: PaymentKeys::from_entropy(&entropy),
+            auto_receive: true,
+            incoming: Default::default(),
         };
         Node {
             _env: env,
@@ -2237,12 +2633,21 @@ mod tests {
             outputs: created.to_vec(),
             proof: tiny_proof(),
         };
+        // Committing to the first node's aux leaves, as its miner would.
+        let leaves = nodes[0].cli.aux.leaves(&l.env).unwrap();
+        let files = nodes[0].cli.aux.files(&l.env).unwrap();
+        nodes[0]
+            .cli
+            .preimages
+            .put_tree(&leaves, &files, tip.height + 1)
+            .unwrap();
         let header = Header {
             height: tip.height + 1,
             prev: tip.hash(),
             timestamp: tip.timestamp + 600,
             state,
             body: block.body_hash(),
+            aux_hash: crate::aux_leaves::root(&leaves),
             nonce: 0,
         };
         for n in nodes {
@@ -2962,6 +3367,134 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn the_relay_consensus_follows_recent_blocks() {
+        let alice = node(&genesis());
+        let out = run(&alice, "relay_consensus").unwrap();
+        assert!(out.starts_with("mode: init"), "{out}");
+        assert!(out.contains("no block commits"), "{out}");
+
+        // Our relay key, from the recovery words.
+        let entropy = {
+            let txn = alice.cli.ledger.env.read_txn().unwrap();
+            alice.cli.store.entropy(&txn).unwrap().unwrap()
+        };
+        let key = hex(&onion::key_hash(&onion::identity(&entropy).0));
+        let out = run(&alice, "relay_key").unwrap();
+        assert!(out.starts_with(&format!("relay key hash: {key}")), "{out}");
+
+        let dir = std::env::temp_dir().join(format!("r-cli-relays-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("consensus.txt");
+        std::fs::write(&file, format!("onion\n10.1.2.3:7333 {key}\n")).unwrap();
+        let out = run(&alice, &format!("aux_leaf_file 0 {}", file.display())).unwrap();
+        assert!(out.contains("this file says onion (1 relay)"), "{out}");
+
+        // Ten blocks commit to it, but the newest ten don't count yet.
+        for _ in 0..10 {
+            block(&[&alice], &[], &[]);
+        }
+        let out = run(&alice, "relay_consensus").unwrap();
+        assert!(out.starts_with("mode: init"), "{out}");
+        assert!(out.contains("blocks counted: none yet"), "{out}");
+        block(&[&alice], &[], &[]);
+        let out = run(&alice, "relay_consensus").unwrap();
+        assert!(out.starts_with("mode: onion (1 relay)"), "{out}");
+        assert!(out.contains("(1 block commits to it)"), "{out}");
+        assert!(out.contains(&format!("\n  10.1.2.3:7333 {key}")), "{out}");
+
+        // Back to init from block 12. Blocks 1 to 11 commit to onion, so
+        // init takes over once as many count for it (ties go to the
+        // latest): at tip 32, blocks 12 to 22.
+        std::fs::write(&file, "init").unwrap();
+        run(&alice, &format!("aux_leaf_file 0 {}", file.display())).unwrap();
+        for _ in 12..=31 {
+            block(&[&alice], &[], &[]);
+        }
+        let out = run(&alice, "relay_consensus").unwrap();
+        assert!(out.starts_with("mode: onion"), "{out}");
+        assert!(out.contains("(11 blocks commit to it)"), "{out}");
+        block(&[&alice], &[], &[]);
+        let out = run(&alice, "relay_consensus").unwrap();
+        assert!(out.starts_with("mode: init"), "{out}");
+        assert!(out.contains("blocks counted: 1 to 22"), "{out}");
+        assert!(out.contains("(11 blocks commit to it)"), "{out}");
+
+        // A file that isn't valid is refused, leaving the leaf as it was.
+        let leaf = alice.cli.aux.leaves(&alice.cli.ledger.env).unwrap()[0];
+        std::fs::write(&file, "onion 10.1.2.3:7333").unwrap();
+        let e = run(&alice, &format!("aux_leaf_file 0 {}", file.display())).unwrap_err();
+        assert!(
+            e.starts_with("not a valid relay consensus file (\"10.1.2.3:7333\" has no partner"),
+            "{e}"
+        );
+        assert_eq!(
+            alice.cli.aux.leaves(&alice.cli.ledger.env).unwrap()[0],
+            leaf
+        );
+        // Other leaves take any file.
+        run(&alice, &format!("aux_leaf_file 1 {}", file.display())).unwrap();
+        for _ in 0..25 {
+            block(&[&alice], &[], &[]);
+        }
+        let out = run(&alice, "relay_consensus").unwrap();
+        assert!(out.starts_with("mode: init"), "{out}");
+        assert!(out.contains("(36 blocks commit to it)"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn aux_leaves_are_set_printed_and_kept() {
+        let alice = node(&genesis());
+        let zero = "0".repeat(64);
+        let out = run(&alice, "print_aux_leaves").unwrap();
+        assert!(out.contains(&format!("leaf 15 {zero}")), "{out}");
+        assert!(out.ends_with(&format!("root    {zero}")), "{out}");
+
+        let value = "ab".repeat(32);
+        let out = run(&alice, &format!("aux_leaf 3 {value}")).unwrap();
+        assert!(out.starts_with(&format!("aux leaf 3 is {value}")), "{out}");
+        let dir = std::env::temp_dir().join(format!("r-cli-aux-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("consensus.txt");
+        std::fs::write(&file, "abc").unwrap();
+        run(&alice, &format!("aux_leaf_file 15 {}", file.display())).unwrap();
+        let mut leaves = [[0u8; 32]; AUX_LEAVES];
+        leaves[3] = [0xab; 32];
+        leaves[15] = crate::mnemonic::sha256(b"abc");
+        let root = crate::aux_leaves::root(&leaves);
+        let out = run(&alice, "print_aux_leaves").unwrap();
+        assert!(out.contains(&format!("leaf  3 {value}")), "{out}");
+        assert!(
+            out.contains(
+                "leaf 15 ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            ),
+            "{out}"
+        );
+        assert!(out.ends_with(&format!("root    {}", hex(&root))), "{out}");
+        // Kept in the database.
+        let store = AuxStore::open(&alice.cli.ledger.env).unwrap();
+        assert_eq!(store.root(&alice.cli.ledger.env).unwrap(), root);
+
+        for bad in [
+            format!("aux_leaf 16 {value}"),
+            format!("aux_leaf x {value}"),
+            "aux_leaf 0 abcd".to_string(),
+            format!("aux_leaf_file 0 {}", dir.join("missing").display()),
+        ] {
+            assert!(run(&alice, &bad).is_err(), "{bad}");
+        }
+        // Zero clears.
+        run(&alice, &format!("aux_leaf 3 {zero}")).unwrap();
+        run(&alice, &format!("aux_leaf 15 {zero}")).unwrap();
+        assert!(
+            run(&alice, "print_aux_leaves")
+                .unwrap()
+                .ends_with(&format!("root    {zero}"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A protected 2-of-3: Alice and Bob spend it while Carol is offline,
     /// and Carol's wallet finds her payout.
     #[test]
@@ -3017,6 +3550,109 @@ mod tests {
         assert_eq!(spendable(&alice), "7.98");
         assert_eq!(spendable(&carol), "2");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The next post `n`'s wallet hands its node.
+    fn next_post(n: &Node) -> Post {
+        loop {
+            match n.events.try_recv() {
+                Ok(Event::Post(p)) => return p,
+                Ok(_) => {}
+                Err(e) => panic!("no post: {e:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_payment_goes_to_an_address() {
+        let genesis = Header {
+            timestamp: now() - 1_000_000,
+            state: crate::state::empty_state(),
+            ..Header::default()
+        };
+        let (alice, bob) = (node(&genesis), node(&genesis));
+        block(&[&alice, &bob], &[pay(&alice, 5 * COIN)], &[]);
+        let bob_address = bob.cli.payments.address;
+        let out = run(&bob, "address").unwrap();
+        assert!(
+            out.starts_with(&format!("payment address: {bob_address}")),
+            "{out}"
+        );
+
+        // A typo is caught, not taken for a file name.
+        let mut typo = bob_address.to_string();
+        typo.pop();
+        typo.push('q');
+        let e = run(&alice, &format!("send 2 0.01 {typo}")).unwrap_err();
+        assert!(e.starts_with("bad payment address"), "{e}");
+
+        let out = run(&alice, &format!("send 2 0.01 {bob_address}")).unwrap();
+        assert!(out.contains(&format!("sent to {bob_address}")), "{out}");
+        assert_eq!(spendable(&alice), "0");
+        let request = next_post(&alice);
+        assert_eq!(request.to, bob_address);
+        assert!(request.wait_for_answer);
+
+        // Bob answers it (twice: a delivery can come again), the same way.
+        let out = bob.cli.on_post(PostEvent::Received(request.payload));
+        assert!(out.starts_with("received payment"), "{out}");
+        let response = next_post(&bob);
+        assert_eq!(bob.cli.on_post(PostEvent::Received(request.payload)), "");
+        assert_eq!(next_post(&bob).payload, response.payload);
+        assert_eq!(response.to, alice.cli.payments.address);
+        assert!(!response.wait_for_answer);
+
+        // Alice finalizes it once.
+        let out = alice.cli.on_post(PostEvent::Received(response.payload));
+        assert!(out.contains("signed and submitted"), "{out}");
+        assert!(matches!(alice.events.try_recv(), Ok(Event::PostDone(_))));
+        assert_eq!(alice.cli.on_post(PostEvent::Received(response.payload)), "");
+        assert_eq!(alice.cli.mempool.ids().len(), 1);
+
+        // A failed request unlocks its coins.
+        block(&[&alice, &bob], &[pay(&alice, COIN)], &[]);
+        run(&alice, &format!("send 0.5 0.01 {bob_address}")).unwrap();
+        let p = next_post(&alice);
+        let out = alice.cli.on_post(PostEvent::Failed {
+            id: p.id,
+            to: bob_address,
+            why: "it is offline".into(),
+        });
+        assert!(
+            out.contains("failed: it is offline; its coins are unlocked"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn requests_can_wait_to_be_accepted() {
+        let genesis = Header {
+            timestamp: now() - 1_000_000,
+            state: crate::state::empty_state(),
+            ..Header::default()
+        };
+        let (alice, mut bob) = (node(&genesis), node(&genesis));
+        bob.cli.auto_receive = false;
+        block(&[&alice, &bob], &[pay(&alice, 5 * COIN)], &[]);
+        run(&alice, &format!("send 2 0.01 {}", bob.cli.payments.address)).unwrap();
+        let request = next_post(&alice);
+        let out = bob.cli.on_post(PostEvent::Received(request.payload));
+        assert!(out.contains("accept it with: accept"), "{out}");
+        let held = next_post(&bob);
+        assert!(matches!(held.payload, Payload::Held { .. }));
+        let out = alice.cli.on_post(PostEvent::Received(held.payload));
+        assert!(out.contains("will answer once they accept"), "{out}");
+        let id = hex(&request.id);
+        assert!(run(&bob, "incoming").unwrap().starts_with(&id));
+        let out = run(&bob, &format!("accept {}", &id[..8])).unwrap();
+        assert!(out.starts_with("received payment"), "{out}");
+        assert_eq!(
+            run(&bob, "incoming").unwrap(),
+            "no payment requests waiting"
+        );
+        let response = next_post(&bob);
+        let out = alice.cli.on_post(PostEvent::Received(response.payload));
+        assert!(out.contains("signed and submitted"), "{out}");
     }
 
     #[test]

@@ -14,6 +14,7 @@ on; with none of those, from the seed nodes tabernacle1.root.sx:3737 and
 tabernacle2.root.sx:3737), syncs the chain, verifies and follows peers' blocks, relays
 transactions, and mines (unless --no-mine) once caught up. Its log goes to
 <PATH>/node.log; the terminal takes wallet commands (type help): payments go
+to a payment address (both wallets online, through the seed nodes), or
 through files, with send, receive and finalize.
 
 Options:
@@ -49,6 +50,12 @@ Options:
                              can be spent [default: 6]
       --restore              Restore the wallet from its 24 recovery words
                              (asked for at the start; needs a new --data-dir)
+      --no-automatic-receive Hold payments sent to our address until
+                             accepted (accept <id>), instead of answering
+                             them as they come
+      --slate-host <HOST:PORT>
+                             Pass payments through this host instead of the
+                             seed nodes (may be repeated)
       --debug-no-proof-validation
                              Testing only: make and check no chain proofs
                              (blocks carry an empty one), so large blocks
@@ -106,6 +113,10 @@ pub struct Args {
     pub restore: bool,
     /// Testing: make and check no chain proofs.
     pub debug_no_proofs: bool,
+    /// Hold payments to our address until accepted.
+    pub no_automatic_receive: bool,
+    /// Hosts for payments (`host:port`; the seeds if none).
+    pub slate_hosts: Vec<String>,
 }
 
 /// What the command line asked for.
@@ -176,6 +187,8 @@ impl Args {
         let mut coin_maturity: Option<u64> = None;
         let mut restore = false;
         let mut debug_no_proofs = false;
+        let mut no_automatic_receive = false;
+        let mut slate_hosts: Vec<String> = Vec::new();
         let mut args = args.into_iter().map(Into::into);
 
         while let Some(arg) = args.next() {
@@ -207,6 +220,7 @@ impl Args {
                 | "--status"
                 | "--restore"
                 | "--compact-db"
+                | "--no-automatic-receive"
                 | "--debug-no-proof-validation" => {
                     let (opt, set) = match name {
                         "--no-mine" => ("--no-mine", &mut no_mine),
@@ -214,6 +228,9 @@ impl Args {
                         "--status" => ("--status", &mut status),
                         "--restore" => ("--restore", &mut restore),
                         "--compact-db" => ("--compact-db", &mut compact_db),
+                        "--no-automatic-receive" => {
+                            ("--no-automatic-receive", &mut no_automatic_receive)
+                        }
                         _ => ("--debug-no-proof-validation", &mut debug_no_proofs),
                     };
                     if inline.is_some() {
@@ -259,6 +276,20 @@ impl Args {
                         .ok_or(ArgsError::InvalidValue("--max-peers"))?;
                     max_peers = Some(max);
                 }
+                "--slate-host" => {
+                    let value = match inline {
+                        Some(v) => OsString::from(v),
+                        None => args.next().ok_or(ArgsError::MissingValue("--slate-host"))?,
+                    };
+                    let host = value
+                        .to_str()
+                        .filter(|v| {
+                            v.rsplit_once(':')
+                                .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok())
+                        })
+                        .ok_or(ArgsError::InvalidValue("--slate-host"))?;
+                    slate_hosts.push(host.to_string());
+                }
                 "--listen" | "--peer" => {
                     let opt = if name == "--listen" {
                         "--listen"
@@ -303,6 +334,8 @@ impl Args {
             coin_maturity: coin_maturity.unwrap_or(DEFAULT_COIN_MATURITY),
             restore,
             debug_no_proofs,
+            no_automatic_receive,
+            slate_hosts,
         }))
     }
 }
@@ -338,6 +371,8 @@ mod tests {
             coin_maturity: DEFAULT_COIN_MATURITY,
             restore: false,
             debug_no_proofs: false,
+            no_automatic_receive: false,
+            slate_hosts: vec![],
         }))
     }
 
@@ -373,6 +408,8 @@ mod tests {
                 coin_maturity: DEFAULT_COIN_MATURITY,
                 restore: false,
                 debug_no_proofs: false,
+                no_automatic_receive: false,
+                slate_hosts: vec![],
             }))
         };
         assert_eq!(parse(&["--no-mine"]), want(true, false));
@@ -516,6 +553,8 @@ mod tests {
             coin_maturity: DEFAULT_COIN_MATURITY,
             restore: false,
             debug_no_proofs: false,
+            no_automatic_receive: false,
+            slate_hosts: vec![],
         }));
         assert_eq!(
             parse(&[
@@ -606,6 +645,8 @@ mod tests {
                 coin_maturity: DEFAULT_COIN_MATURITY,
                 restore: false,
                 debug_no_proofs: false,
+                no_automatic_receive: false,
+                slate_hosts: vec![],
             }))
         );
     }
