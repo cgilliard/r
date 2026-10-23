@@ -212,6 +212,13 @@ fn open(
         (None, None)
     };
     let env = db::open_env(&dir)?;
+    if db::map_size() < db::MAP_SIZE {
+        log.line(format!(
+            "database: reserved {} GiB of address space (the most this machine's processes \
+             can spare; the database can grow to that)",
+            db::map_size() >> 30
+        ));
+    }
     let tree = StateTree::open(&env)?;
     let store = ChainStore::open(&env)?;
     let genesis = crate::genesis::header();

@@ -5,21 +5,103 @@ use std::path::Path;
 use heed::types::Bytes;
 use heed::{Database, Env, EnvOpenOptions, PutFlags};
 
-/// Maximum database size. LMDB only reserves address space for this; the
-/// file grows as data is written.
+/// Maximum database size. LMDB only reserves address space for this (no
+/// memory); the file grows as data is written. Machines whose processes
+/// get less address space (RISC-V in Sv39 mode has 256 GiB in all) get
+/// what they can: [`map_size`].
 pub const MAP_SIZE: usize = 1 << 40;
+/// The least address space worth running with.
+pub const MIN_MAP_SIZE: usize = 16 << 30;
 /// Named databases the environment can hold.
 pub const MAX_DBS: u32 = 32;
 
-/// Opens (creating if needed) the environment in `path`.
+/// Whether `len` bytes of address space can be reserved now (reserved
+/// without memory or swap, and released at once).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn can_reserve(len: usize) -> bool {
+    use std::ffi::c_void;
+    unsafe extern "C" {
+        fn mmap(
+            addr: *mut c_void,
+            len: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            off: i64,
+        ) -> *mut c_void;
+        fn munmap(addr: *mut c_void, len: usize) -> i32;
+    }
+    // PROT_NONE; MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE.
+    #[cfg(target_os = "linux")]
+    const FLAGS: i32 = 0x02 | 0x20 | 0x4000;
+    #[cfg(target_os = "macos")]
+    const FLAGS: i32 = 0x02 | 0x1000 | 0x40;
+    // SAFETY: an anonymous, inaccessible mapping, unmapped before
+    // returning; nothing else refers to it.
+    unsafe {
+        let p = mmap(std::ptr::null_mut(), len, 0, FLAGS, -1, 0);
+        if p as isize == -1 {
+            return false;
+        }
+        munmap(p, len);
+    }
+    true
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn can_reserve(_len: usize) -> bool {
+    true
+}
+
+/// The address space LMDB reserves: [`MAP_SIZE`] where it can be had;
+/// else three quarters of the largest range that can (the rest is left
+/// for the heap, stacks and the PoW dataset), but not below
+/// [`MIN_MAP_SIZE`]. Found once, at the first call.
+pub fn map_size() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        if can_reserve(MAP_SIZE) {
+            return MAP_SIZE;
+        }
+        // Halve to a size that works, then search up toward twice it.
+        let mut good = MAP_SIZE / 2;
+        while good > MIN_MAP_SIZE && !can_reserve(good) {
+            good /= 2;
+        }
+        let mut bad = good * 2;
+        while bad - good > MIN_MAP_SIZE / 4 {
+            let mid = good + (bad - good) / 2;
+            if can_reserve(mid) {
+                good = mid;
+            } else {
+                bad = mid;
+            }
+        }
+        // Whole pages.
+        (good / 4 * 3).max(MIN_MAP_SIZE) & !0xfff_ffff
+    })
+}
+
+/// Opens (creating if needed) the environment in `path`, reserving
+/// [`map_size`].
 pub fn open_env(path: &Path) -> heed::Result<Env> {
     std::fs::create_dir_all(path)?;
+    let size = map_size();
+    let file = std::fs::metadata(path.join("data.mdb")).map_or(0, |m| m.len());
+    if file > size as u64 {
+        return Err(heed::Error::Io(std::io::Error::other(format!(
+            "the database is {} GiB, but this machine's processes can only reserve {} GiB of \
+             address space for it",
+            file >> 30,
+            size >> 30
+        ))));
+    }
     // SAFETY: LMDB files must not be modified other than through LMDB while
     // mapped. Only this process's environment touches files in the data
     // directory.
     unsafe {
         EnvOpenOptions::new()
-            .map_size(MAP_SIZE)
+            .map_size(size)
             .max_dbs(MAX_DBS)
             .open(path)
     }
@@ -76,6 +158,19 @@ pub fn compact(path: &Path) -> Result<(u64, u64), Box<dyn std::error::Error>> {
     std::fs::rename(dir.join("data.mdb"), &file)?;
     std::fs::remove_dir_all(&dir)?;
     Ok((before, std::fs::metadata(&file)?.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_reservation_fits_the_machine() {
+        let size = map_size();
+        assert!((MIN_MAP_SIZE..=MAP_SIZE).contains(&size), "{size}");
+        assert!(can_reserve(size));
+        assert_eq!(size % 4096, 0);
+    }
 }
 
 #[cfg(test)]
