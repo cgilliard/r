@@ -84,6 +84,11 @@ pub(super) struct Trees {
 }
 
 impl Trees {
+    /// Whether fetches are going on.
+    pub(super) fn busy(&self) -> bool {
+        !self.fetches.is_empty() || !self.queue.is_empty()
+    }
+
     /// Whether chunks under `id` are for a preimage.
     pub(super) fn has_id(&self, id: &Hash) -> bool {
         self.ids.contains_key(id)
@@ -418,7 +423,7 @@ impl<B: Backend> Node<B> {
         self.trees.failed.retain(|_, at| now - *at < RETRY_AFTER);
 
         // A new tip: walk the recent blocks' trees, and prune.
-        let tip = self.backend.tip();
+        let tip = self.tip();
         if self.trees.scanned != Some(tip.hash) && !self.chain_busy() {
             self.trees.scanned = Some(tip.hash);
             for height in tip.height.saturating_sub(SCAN - 1).max(1)..=tip.height {

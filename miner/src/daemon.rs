@@ -550,7 +550,7 @@ pub fn run(data_dir: &Path, net: &Net, opts: &Options) -> Result<(), Box<dyn Err
 
     let mut n = node(&log, &o, net, mempool.clone(), post, relay)?;
     let synced = n.synced();
-    let (events, rx) = channel();
+    let (events, rx) = n.events();
     let node_thread = {
         let stop = stop.clone();
         thread::spawn(move || n.run(&rx, &stop))

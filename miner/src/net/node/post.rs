@@ -164,6 +164,13 @@ pub(super) struct PostState {
     rebuild: HashMap<Relay, Instant>,
 }
 
+impl PostState {
+    /// Whether posts are being sent.
+    pub(super) fn busy(&self) -> bool {
+        !self.outgoing.is_empty()
+    }
+}
+
 impl<B: Backend> Node<B> {
     fn random_32(&mut self) -> [u8; 32] {
         let mut m = [0u8; 32];

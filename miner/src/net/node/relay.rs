@@ -126,6 +126,14 @@ pub(super) struct Circuits {
     next_id: u32,
 }
 
+impl Circuits {
+    /// Whether circuits are being built or extended.
+    pub(super) fn busy(&self) -> bool {
+        self.ours.values().any(|o| o.pending.is_some())
+            || self.relayed.values().any(|r| r.extending.is_some())
+    }
+}
+
 fn addr_bytes(a: &SocketAddr) -> Vec<u8> {
     let mut out = match a.ip() {
         IpAddr::V4(ip) => [&[4u8][..], &ip.octets()].concat(),

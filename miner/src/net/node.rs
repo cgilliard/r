@@ -366,6 +366,14 @@ const TX_BYTES_IN_FLIGHT: usize = 1 << 20;
 const TX_SIZE_GUESS: usize = 8 << 10;
 /// Times to ask for a transaction before trying another peer that has it.
 const TX_TRIES: u32 = 3;
+/// How long the node waits for packets between timer runs while something
+/// is in progress, and when idle ([`Node::run`]).
+const BUSY_WAIT: Duration = Duration::from_millis(10);
+const IDLE_WAIT: Duration = Duration::from_millis(250);
+/// Read the tip from the backend again after this, at least (blocks added
+/// elsewhere, such as by the miner, are also announced with
+/// [`Event::NewTip`]).
+const TIP_CACHE: Duration = Duration::from_secs(1);
 /// Packets handled between timer runs, at most, so a flood can't starve
 /// the timers.
 const PACKETS_PER_TICK: usize = 1024;
@@ -548,6 +556,9 @@ pub struct Node<B: Backend> {
     trees: tree::Trees,
     post: post::PostState,
     circuits: relay::Circuits,
+    /// The backend's tip as last read, and when: reading it takes database
+    /// transactions and header hashing, and timers ask for it often.
+    tip_cache: std::cell::Cell<Option<(Instant, Tip)>>,
 }
 
 fn now_secs() -> u64 {
@@ -691,7 +702,80 @@ impl<B: Backend> Node<B> {
             trees: tree::Trees::default(),
             post: post::PostState::default(),
             circuits: relay::Circuits::default(),
+            tip_cache: std::cell::Cell::new(None),
         }
+    }
+
+    /// The main chain's tip: [`Backend::tip`], read again after
+    /// [`TIP_CACHE`] or when we know it changed.
+    fn tip(&self) -> Tip {
+        if let Some((at, tip)) = self.tip_cache.get()
+            && at.elapsed() < TIP_CACHE
+        {
+            return tip;
+        }
+        let tip = self.backend.tip();
+        self.tip_cache.set(Some((Instant::now(), tip)));
+        tip
+    }
+
+    /// Whether anything is in progress that needs the timers often (chunk
+    /// re-requests are tens of milliseconds); otherwise they run every
+    /// [`IDLE_WAIT`].
+    fn busy(&self) -> bool {
+        self.download.is_some()
+            || self.fast.is_some()
+            || !self.pending.is_empty()
+            || self.header_request.is_some()
+            || !self.tx_fetches.is_empty()
+            || !self.tx_queue.is_empty()
+            || !self.tx_done.is_empty()
+            || !self.tx_to_announce.is_empty()
+            || self.trees.busy()
+            || self.post.busy()
+            || self.circuits.busy()
+    }
+
+    /// A sender of events to this node (for [`Node::run`]'s receiver) that
+    /// wakes it at once: each event is passed on by a small thread, which
+    /// then sends a byte to the node's own socket (the node ignores it, as
+    /// it has no header). Without the wake-up, an idle node would see an
+    /// event within [`IDLE_WAIT`].
+    pub fn events(&self) -> (std::sync::mpsc::Sender<Event>, Receiver<Event>) {
+        let (tx, from) = std::sync::mpsc::channel();
+        let (to, rx) = std::sync::mpsc::channel();
+        let mut target = self.local_addr();
+        if target.ip().is_unspecified() {
+            target.set_ip(match target {
+                SocketAddr::V4(_) => IpAddr::from([127, 0, 0, 1]),
+                SocketAddr::V6(_) => IpAddr::from(std::net::Ipv6Addr::LOCALHOST),
+            });
+        }
+        let waker = UdpSocket::bind(SocketAddr::new(
+            if target.is_ipv4() {
+                IpAddr::from([127, 0, 0, 1])
+            } else {
+                IpAddr::from(std::net::Ipv6Addr::LOCALHOST)
+            },
+            0,
+        ))
+        .or_else(|_| UdpSocket::bind("0.0.0.0:0"));
+        std::thread::spawn(move || {
+            for event in from {
+                if to.send(event).is_err() {
+                    break;
+                }
+                if let Ok(w) = &waker {
+                    let _ = w.send_to(&[0], target);
+                }
+            }
+        });
+        (tx, rx)
+    }
+
+    /// The tip may have changed: read it again when next asked.
+    fn tip_changed(&self) {
+        self.tip_cache.set(None);
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -717,19 +801,41 @@ impl<B: Backend> Node<B> {
     }
 
     /// Runs until `stop` is set, taking events from `events`.
+    /// Runs until `stop` is set, taking events from `events`. It waits for
+    /// packets up to [`BUSY_WAIT`] while something is in progress, else
+    /// [`IDLE_WAIT`] (every idle timer is in seconds); events sent through
+    /// [`Node::events`] wake it at once.
     pub fn run(&mut self, events: &Receiver<Event>, stop: &AtomicBool) {
         let mut buf = [0u8; MAX_PACKET + 1];
+        let mut waiting = BUSY_WAIT;
+        let mut set_wait = |socket: &UdpSocket, wait: Duration| {
+            if wait != waiting {
+                waiting = wait;
+                let _ = socket.set_read_timeout(Some(wait));
+            }
+        };
         while !stop.load(Ordering::Relaxed) {
-            // Take what has arrived, then do timed work.
+            // Wait for a packet (long when idle), then take packets while
+            // they keep coming (each within BUSY_WAIT: so a burst, such as
+            // handshakes with several peers, is handled together), then do
+            // timed work.
+            set_wait(
+                &self.socket,
+                if self.busy() { BUSY_WAIT } else { IDLE_WAIT },
+            );
             for _ in 0..PACKETS_PER_TICK {
                 let Ok((n, addr)) = self.socket.recv_from(&mut buf) else {
                     break;
                 };
                 self.receive(addr, &buf[..n]);
+                set_wait(&self.socket, BUSY_WAIT);
             }
             while let Ok(event) = events.try_recv() {
                 match event {
-                    Event::NewTip => self.announce_tip(None),
+                    Event::NewTip => {
+                        self.tip_changed();
+                        self.announce_tip(None)
+                    }
                     // Announced together at the tick.
                     Event::NewTx(id) => self.tx_to_announce.push((id, None)),
                     Event::Peers(reply) => {
@@ -799,7 +905,7 @@ impl<B: Backend> Node<B> {
             capabilities: self.cfg.capabilities,
             node_id: self.node_id,
             listen_port: self.local_addr().port(),
-            tip: self.backend.tip(),
+            tip: self.tip(),
             cookie,
         }
     }
@@ -963,7 +1069,7 @@ impl<B: Backend> Node<B> {
                 let welcome = Message::Welcome {
                     capabilities: self.cfg.capabilities,
                     node_id: self.node_id,
-                    tip: self.backend.tip(),
+                    tip: self.tip(),
                 };
                 self.send(addr, session, &welcome);
                 let listen = (capabilities & cap::LISTENING != 0)
@@ -1551,7 +1657,7 @@ impl<B: Backend> Node<B> {
     /// the main chain at its tip and 1, 2, 4, ... blocks back, and genesis.
     fn locator(&self) -> Vec<Hash> {
         let mut out: Vec<Hash> = self.pending.back().map(Header::hash).into_iter().collect();
-        let tip = self.backend.tip().height;
+        let tip = self.tip().height;
         let mut back = 0u64;
         loop {
             let h = tip.saturating_sub(back);
@@ -1587,7 +1693,7 @@ impl<B: Backend> Node<B> {
 
     /// Sessions that said they don't have the block after our tip.
     fn unhelpful(&self) -> HashSet<u32> {
-        let next = self.backend.tip().height + 1;
+        let next = self.tip().height + 1;
         self.lacks
             .iter()
             .filter(|&(_, &l)| l >= next)
@@ -1598,7 +1704,7 @@ impl<B: Backend> Node<B> {
     /// The peer with the most work, more than ours, whose tip we don't
     /// have.
     fn best_peer(&self, exclude: &HashSet<u32>) -> Option<(u32, SocketAddr, u64)> {
-        let ours = self.backend.tip().work;
+        let ours = self.tip().work;
         self.peers
             .iter()
             .filter(|(s, p)| {
@@ -1645,7 +1751,7 @@ impl<B: Backend> Node<B> {
         let Some(depth) = self.cfg.sync_depth else {
             return false;
         };
-        if self.backend.tip().height != 0 || self.download.is_some() || !self.pending.is_empty() {
+        if self.tip().height != 0 || self.download.is_some() || !self.pending.is_empty() {
             return false;
         }
         let exclude = self.no_snapshot.clone();
@@ -1790,7 +1896,7 @@ impl<B: Backend> Node<B> {
             self.header_request = None;
         }
         let full = headers.len() == MAX_HEADERS;
-        let ours = self.backend.tip();
+        let ours = self.tip();
         if headers.is_empty()
             && self
                 .peers
@@ -2176,10 +2282,11 @@ impl<B: Backend> Node<B> {
             return;
         };
         let t = Instant::now();
-        match self
-            .backend
-            .install(&s.info.parent, s.info.parent_work, &s.info.base, &s.body)
-        {
+        let installed =
+            self.backend
+                .install(&s.info.parent, s.info.parent_work, &s.info.base, &s.body);
+        self.tip_changed();
+        match installed {
             Ok(()) => {
                 (self.log)(format!(
                     "fast sync: state at height {} downloaded ({} tree nodes, {} bytes, from {} peer{} in \
@@ -2201,7 +2308,9 @@ impl<B: Backend> Node<B> {
 
     fn finish_block(&mut self, d: &Download, body: &[u8], chunks: usize, secs: f64, from: &str) {
         let t = Instant::now();
-        match self.backend.accept(&d.header, body) {
+        let accepted = self.backend.accept(&d.header, body);
+        self.tip_changed();
+        match accepted {
             Ok(added) => {
                 self.pending.pop_front();
                 let what = match added {
@@ -2241,7 +2350,7 @@ impl<B: Backend> Node<B> {
 
     /// Tells every peer (but `except`) about a new block, and our tip.
     fn announce(&mut self, header: &Header, except: Option<u32>) {
-        let tip = self.backend.tip();
+        let tip = self.tip();
         let sessions: Vec<u32> = self
             .peers
             .keys()
@@ -2256,7 +2365,7 @@ impl<B: Backend> Node<B> {
 
     /// Tells every peer (but `except`) about our tip.
     fn announce_tip(&mut self, except: Option<u32>) {
-        let tip = self.backend.tip();
+        let tip = self.tip();
         if let Some(header) = self.backend.header_at(tip.height) {
             self.announce(&header, except);
         }
@@ -2642,7 +2751,7 @@ impl<B: Backend> Node<B> {
             || !self.tx_done.is_empty();
         let alone = self.peers.is_empty() && now - self.started >= ALONE_AFTER;
         if (!self.peers.is_empty() && !busy) || alone {
-            let tip = self.backend.tip();
+            let tip = self.tip();
             (self.log)(if alone {
                 format!(
                     "no peers after {} s; carrying on alone at height {}",
@@ -3105,7 +3214,7 @@ mod tests {
         });
         let mut node = Node::new(socket, cfg, backend, log);
         let addr = node.local_addr();
-        let (events, rx) = channel();
+        let (events, rx) = node.events();
         let stop = Arc::new(AtomicBool::new(false));
         let s = stop.clone();
         let handle = thread::spawn(move || node.run(&rx, &s));

@@ -836,6 +836,21 @@ impl BlockProver {
 
     /// The slow part: proves a [`BlockProver::prepare`]d block.
     pub fn prove_prepared(&self, p: &Prepared) -> Result<Aggregated, BlockError> {
+        self.prove_prepared_timed(p, None)
+    }
+
+    /// [`BlockProver::prove_prepared`], recording how long each proof took
+    /// (what it was, and the time) in `timing` if given.
+    pub fn prove_prepared_timed(
+        &self,
+        p: &Prepared,
+        timing: Option<&std::sync::Mutex<Vec<(String, std::time::Duration)>>>,
+    ) -> Result<Aggregated, BlockError> {
+        let timed = |what: String, t: std::time::Instant| {
+            if let Some(timing) = timing {
+                timing.lock().expect("timing").push((what, t.elapsed()));
+            }
+        };
         let Prepared {
             txs,
             inputs,
@@ -915,36 +930,52 @@ impl BlockProver {
             (&self.params, &items, &sig_items, &cond_items);
         let mut tasks: Vec<Task<'_>> = Vec::new();
         for (start, inserts, spends) in segments {
+            let timed = &timed;
             tasks.push(Box::new(move || {
+                let t = std::time::Instant::now();
                 let (trace, public) = self.seg.trace(start, inserts, spends, height, lambda, r);
                 let pk = self.seg_key.proving_key(params, &self.seg);
                 let proof = stark::prove(params, pk, &self.seg, trace, &public);
-                self.agg.prove_segment(&public, &proof)
+                let node = self.agg.prove_segment(&public, &proof);
+                timed("segment".into(), t);
+                node
             }));
         }
         for (shape, range, entry, b) in &item_jobs {
+            let timed = &timed;
             tasks.push(Box::new(move || {
+                let t = std::time::Instant::now();
                 let (air, key) = &self.items[*shape];
                 let (trace, public) = air.trace(&items[range.clone()], entry, b, lambda, r);
                 let proof = stark::prove(params, key.proving_key(params, air), air, trace, &public);
-                self.agg.prove_items(*shape, &public, &proof, height)
+                let node = self.agg.prove_items(*shape, &public, &proof, height);
+                timed(format!("items {}", air.items), t);
+                node
             }));
         }
         for (shape, range, b) in &sig_jobs {
+            let timed = &timed;
             tasks.push(Box::new(move || {
+                let t = std::time::Instant::now();
                 let (air, key) = &self.sigs[*shape];
                 let mut rng = Rng::from_os().expect("OS randomness");
                 let (trace, public) = air.trace(&sig_items[range.clone()], b, lambda, r, &mut rng);
                 let proof = stark::prove(params, key.proving_key(params, air), air, trace, &public);
-                self.agg.prove_sigs(*shape, &public, &proof, height)
+                let node = self.agg.prove_sigs(*shape, &public, &proof, height);
+                timed(format!("sigs {}", air.slots), t);
+                node
             }));
         }
         for (shape, range, b) in &cond_jobs {
+            let timed = &timed;
             tasks.push(Box::new(move || {
+                let t = std::time::Instant::now();
                 let (air, key) = &self.conds[*shape];
                 let (trace, public) = air.trace(&cond_items[range.clone()], height, b, lambda, r);
                 let proof = stark::prove(params, key.proving_key(params, air), air, trace, &public);
-                self.agg.prove_conds(*shape, &public, &proof)
+                let node = self.agg.prove_conds(*shape, &public, &proof);
+                timed(format!("conds {}", air.slots), t);
+                node
             }));
         }
         let mut nodes = par::run_jobs(tasks)
@@ -953,9 +984,17 @@ impl BlockProver {
             .map_err(BlockError::Proof)?;
         while nodes.len() > 1 {
             let odd = (nodes.len() % 2 == 1).then(|| nodes.pop().expect("odd"));
+            let timed = &timed;
             let tasks: Vec<Task<'_>> = nodes
                 .chunks(2)
-                .map(|pair| Box::new(move || self.agg.merge(&pair[0], &pair[1])) as Task<'_>)
+                .map(|pair| {
+                    Box::new(move || {
+                        let t = std::time::Instant::now();
+                        let node = self.agg.merge(&pair[0], &pair[1]);
+                        timed("merge".into(), t);
+                        node
+                    }) as Task<'_>
+                })
                 .collect();
             let mut next = par::run_jobs(tasks)
                 .into_iter()
@@ -1090,6 +1129,99 @@ mod tests {
                 },
             },
         )
+    }
+
+    /// Proves a block of `R_BENCH_TXS` (default 60) payments, each 2 inputs
+    /// to 2 outputs, timing every proof, and extrapolates to a block of
+    /// 10,000 such payments.
+    #[test]
+    #[ignore = "benchmark: run in release, alone"]
+    fn bench_a_block_of_payments() {
+        use std::collections::BTreeMap;
+        use std::time::Duration;
+        let n: u32 = std::env::var("R_BENCH_TXS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60);
+        let t = std::time::Instant::now();
+        let prover = BlockProver::standard(FriParams::default(), &stark::KeyCache::none());
+        eprintln!("setup {:.1} s", t.elapsed().as_secs_f64());
+
+        // 2n outputs of 100 to spend, in slots 1 to 2n.
+        let env = TempEnv::new();
+        let tree = StateTree::open(env.env()).unwrap();
+        let mut txn = env.env().write_txn().unwrap();
+        for k in 0..2 * n {
+            tree.insert(&mut txn, &pay(10 + k, 100).record().unwrap(), 1)
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        let mut txs: Vec<Transaction> = (0..n)
+            .map(|i| {
+                let (a, b) = (10 + 2 * i, 11 + 2 * i);
+                let (ska, ia) = spend(a, 100, [a as u8; NONCE_LEN], (2 * i + 1) as u64);
+                let (skb, ib) = spend(b, 100, [b as u8; NONCE_LEN], (2 * i + 2) as u64);
+                let body = TxBody::new(
+                    vec![ia, ib],
+                    vec![pay(1_000_000 + 2 * i, 120), pay(1_000_001 + 2 * i, 79)],
+                );
+                Transaction::sign(body, vec![ska, skb]).unwrap()
+            })
+            .collect();
+        txs.push(
+            Transaction::sign(
+                TxBody::new(vec![], vec![pay(4, SUBSIDY + n as u64)]),
+                vec![],
+            )
+            .unwrap(),
+        );
+
+        let t = std::time::Instant::now();
+        let mut txn = env.env().write_txn().unwrap();
+        let prepared = prover.prepare(&tree, &mut txn, &txs, 2, SUBSIDY).unwrap();
+        txn.abort();
+        let prepare = t.elapsed();
+        let timing = std::sync::Mutex::new(Vec::new());
+        let t = std::time::Instant::now();
+        let agg = prover
+            .prove_prepared_timed(&prepared, Some(&timing))
+            .unwrap();
+        let total = t.elapsed();
+        assert_eq!(
+            prover
+                .aggregator()
+                .verify(&agg.node.statement, &agg.node.proof),
+            Ok(())
+        );
+
+        // Per kind of proof: how many, and their times.
+        let mut kinds: BTreeMap<String, Vec<Duration>> = BTreeMap::new();
+        for (what, d) in timing.into_inner().unwrap() {
+            kinds.entry(what).or_default().push(d);
+        }
+        eprintln!(
+            "{n} payments + reward: prepare {:.1} s, prove {:.1} s (one proof at a time, {} threads)",
+            prepare.as_secs_f64(),
+            total.as_secs_f64(),
+            par::threads()
+        );
+        let mean = |v: &[Duration]| v.iter().sum::<Duration>().as_secs_f64() / v.len() as f64;
+        for (what, v) in &kinds {
+            let max = v.iter().max().unwrap().as_secs_f64();
+            eprintln!(
+                "  {what:12} x{:5}: mean {:6.2} s, max {:6.2} s, total {:7.1} s",
+                v.len(),
+                mean(v),
+                max,
+                v.iter().sum::<Duration>().as_secs_f64()
+            );
+        }
+        let count = |k: &str| kinds.get(k).map_or(0, Vec::len) as f64;
+        eprintln!(
+            "per payment: {:.2} segments, {:.1} signatures",
+            count("segment") / n as f64,
+            2.0
+        );
     }
 
     /// A block with one transaction (1 input, 2 outputs, fee 10) and a
